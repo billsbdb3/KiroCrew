@@ -143,6 +143,23 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "passes are idempotent.",
     ),
     (
+        "Off-host backup uploads (opt-in)",
+        "snapshot_redact.py",
+        "The copy of a backup bundle that leaves the machine for object storage. What "
+        "protects that copy is the destination, not a rewrite: the bucket is created "
+        "private and every upload re-asserts the whole set -- all four public-access "
+        "blocks, default encryption, ACLs disabled, versioning, no bucket policy, and "
+        "the write pinned to the expected owner account -- and refuses if any of it is "
+        "missing or unreadable. On top of that an operator can opt IN to rewriting the "
+        "outbound copy through the credential + exfiltration-URL chain; it is OFF by "
+        "default because substituting a tag changes length, which invalidates any "
+        "format that depends on byte offsets. When it is on, databases are rewritten "
+        "value-by-value through SQL rather than over their bytes, and every outbound "
+        "database is rebuilt so no old value survives in page slack. The LOCAL archive "
+        "is never redacted either way: it does not cross the boundary, and rewriting it "
+        "would damage the only copy that restores complete.",
+    ),
+    (
         "Session intent summaries",
         "session_summary.py",
         "Intent-summary payloads persisted to the `.intents` sidecar and served by "
@@ -1070,6 +1087,12 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
 # catches an omission.
 NON_EGRESS_REDACTION_MODULES: frozenset[str] = frozenset(
     {
+        # Drives the backup redaction pass and reports what it did, but applies no
+        # redactor itself: the outbound bytes are rewritten in `snapshot_redact.py`,
+        # which is the registered sink. What matches the call-site scan here are the
+        # orchestration and reporting names (`_redacted_upload_copy`,
+        # `_report_redaction`, `_report_redacted_bundle`).
+        "snapshot.py",
         # Inbound / gate-side: redacts what comes IN or what a gate logs, not what
         # goes out to a human.
         "context.py",

@@ -99,6 +99,7 @@ COMMAND_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
             ("tailnet", "Publish this dashboard on your tailnet (Tailscale)"),
             ("snapshot", "Create a portable backup of Kiro Crew state"),
             ("restore", "Restore Kiro Crew state from a snapshot"),
+            ("backup", "Set up and inspect the off-host (S3) backup destination"),
         ),
     ),
     (
