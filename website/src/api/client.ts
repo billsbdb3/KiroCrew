@@ -1915,6 +1915,16 @@ export const api = {
   // means "temporarily unresolvable", never "zero".
   securityStats: () => get('/api/security/stats').then(j) as Promise<{ denied_commands: number | null; suspicious_patterns: number | null; tool_schemas: number | null; redaction_paths: number | null }>,
   securityPosture: () => get('/api/security/posture').then(j) as Promise<SecurityPostureData>,
+  // `sessionKey` MUST carry the active slot's key (`dashboard:<slot>`) when one
+  // is active: the server's restricted-session guard reads X-Session-Key, and
+  // the shared `dashboard:ui` default answers "not restricted" — which would
+  // let an incognito/temporary slot mint a durable any-device credential. Same
+  // cooperative-honesty contract as the tailnet mobile surface.
+  mobileLoginLink: (sessionKey?: string) =>
+    post('/api/auth/mobile-link', undefined, sessionKey).then(j) as Promise<{
+    url: string
+    expires_in: number
+  }>,
   // Tailnet origin (Settings → Security). READ ONLY here: the toggle writes
   // `dashboard.tailscale.enabled` through the generic config PATCH, because the
   // setting IS a config value and the status endpoint reports what the running

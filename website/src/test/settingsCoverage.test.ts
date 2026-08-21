@@ -68,6 +68,7 @@ const UNMAPPED_PANELS: Record<string, string> = {
   'ImportPanel.tsx': 'single action button launching the import wizard; no persistent settings',
   'InstanceFormFields.tsx': 'per-instance CRUD form fields (add/edit crew), not global settings',
   'McpManagement.tsx': 'mounted only on the standalone Developer page — a settings deep link would be dead',
+  'MobileLoginCard.tsx': 'mint-a-sign-in-link action card; the link it returns is a one-time credential, not a persistent setting',
   'PostureDisclosure.tsx': "read-only disclosure rows for SecurityPanel's posture section (manual entry security.live-security-posture)",
   'ReleasesPanel.tsx': 'read-only changelog viewer, zero persistent settings',
   'ReportProblemCard.tsx': 'feedback action card, no settings',
@@ -170,6 +171,10 @@ const WAIVED_BARE_CONTROLS: Record<string, { counts: BareCounts; reason: string 
   'McpManagement.tsx': {
     counts: { Switch: 2 },
     reason: 'Developer-page-only surface, deliberately outside settings search',
+  },
+  'MobileLoginCard.tsx': {
+    counts: { Input: 1 },
+    reason: 'read-only display of the freshly minted sign-in link (select-on-focus for manual copy) — transient, not a persistent setting',
   },
   'NotificationsPanel.tsx': {
     counts: { Toggle: 1, Select: 1, input: 1 },

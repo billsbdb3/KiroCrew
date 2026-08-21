@@ -44,12 +44,13 @@ function CopyBtn({ value, label }: { value: string; label: string }) {
     <Btn
       aria-label={label}
       onClick={async () => {
-        // `copyToClipboard` returns Promise<void>, so its resolution — not a
-        // return value — is the success signal; it also carries a textarea
-        // fallback for the non-secure-origin case, which is why it is used
-        // instead of touching `navigator.clipboard` here.
+        // `copyToClipboard` resolves a boolean (false = the legacy fallback
+        // reported failure) and still rejects on a genuine exception — both
+        // must suppress the tick. It carries a textarea fallback for the
+        // non-secure-origin case, which is why it is used instead of touching
+        // `navigator.clipboard` here.
         try {
-          await copyToClipboard(value)
+          if ((await copyToClipboard(value)) === false) return
         } catch {
           return
         }
