@@ -94,7 +94,11 @@ from kiro_crew.cron import (
 from kiro_crew.cron_script import run_command_sandboxed, run_script_sandboxed
 from kiro_crew.dashboard import cautious_boot, start_dashboard
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
-from kiro_crew.dashboard.chat_runner import _resolve_channel_target, _run_chat
+from kiro_crew.dashboard.chat_runner import (
+    _arm_queued_delivery_settlement,
+    _resolve_channel_target,
+    _run_chat,
+)
 from kiro_crew.dashboard.chat_utils import (
     CRON_NOTIFICATION_KIND,
     SUBAGENT_COMPLETION_KIND,
@@ -5818,14 +5822,14 @@ class GatewayOrchestrator:
     def _defer_queued_delivery(
         slot: Any, announce: str, info: SubagentInfo, *, flush_only: bool
     ) -> None:
-        """Owe a queued completion's delivery tombstones to the queue drain.
+        """Owe dashboard delivery state to the turn that consumes the event.
 
         The retention window for ``result.txt`` (``agent.subagent_result_ttl_secs``)
         exists so the parent can read the full transcript AFTER the completion
         event reaches it. Writing the ``delivered`` tombstone when the announce is
-        merely QUEUED starts that clock while the event is still waiting for a
-        turn, so a long-running turn ahead of it lets the reaper prune every file
-        the queued announce points at (issue #4839).
+        merely queued or scheduled starts that clock before the model consumes
+        the prompt. A long-running turn ahead of it can then let the reaper prune
+        every file the announce points at (issue #4839).
 
         So the ids are handed to the slot keyed on the announce ITSELF,
         ``_delivery_queued`` tells the run loop to skip its own ``mark_delivered``,
@@ -5842,13 +5846,14 @@ class GatewayOrchestrator:
         immediate-tombstone behaviour stands — better a short window than a
         folder no one ever tombstones.
         """
-        # A flush-only record is synthetic (no run, no folder of its own). Only a
-        # COMPLETED member owes a delivered mark: ``info.outcome`` is the codebase's
-        # canonical three-way classification precisely because the ``error``-
-        # nullability idiom reports a user-stopped agent as completed, and a
-        # stopped or failed run already carries its own tombstone whose 7-day
-        # post-mortem window a "delivered" write would shorten to the result TTL.
-        owed: list[str] = [] if (flush_only or info.outcome != "completed") else [info.id]
+        # A flush-only record is synthetic (no run or event of its own). Every
+        # durable event owes an outbox acknowledgement, while only a COMPLETED
+        # member also owes the legacy delivered tombstone; failed/stopped runs
+        # keep their longer post-mortem retention window.
+        durable_event = bool(info._delivery_event_id)
+        owed: list[str] = (
+            [] if flush_only or (info.outcome != "completed" and not durable_event) else [info.id]
+        )
         held = getattr(info, "_digest_settle_ids", None)
         if isinstance(held, list):
             owed.extend(str(h) for h in held)
@@ -6258,7 +6263,11 @@ class GatewayOrchestrator:
             _task.add_done_callback(self._background_tasks.discard)
             _task.add_done_callback(_done)
 
-        async def _subagent_done(info: SubagentInfo) -> None:
+        _batch_delivery_retry_owner: dict[str, str] = {}
+        _batch_delivery_locks: dict[str, asyncio.Lock] = {}
+        _batch_delivery_lock_refs: dict[str, int] = {}
+
+        async def _subagent_done_impl(info: SubagentInfo) -> None:
             async def _inject_with_retry(
                 client,
                 msg: str,
@@ -6346,7 +6355,8 @@ class GatewayOrchestrator:
             # bump would invent an agent that never ran.
             _flush_only = getattr(info, "_digest_flush_only", False) is True
 
-            if not _flush_only:
+            _delivery_retry = getattr(info, "_delivery_retry", False) is True
+            if not _flush_only and not _delivery_retry:
                 await _broadcast_subagent_status(info, "done")
             # Three-way outcome: a user stop is neutral — neither a success nor
             # a failure. The record contract keeps ``error`` unset for stops, so
@@ -6359,6 +6369,11 @@ class GatewayOrchestrator:
             else:
                 status, emoji, single_outcome = "completed", "✅", OUTCOME_OK
             title = f"Subagent `{info.id}` {emoji}"
+            raw_delivery_event_id = getattr(info, "_delivery_event_id", "")
+            delivery_event_id = (
+                raw_delivery_event_id if isinstance(raw_delivery_event_id, str) else ""
+            )
+            event_line = f"Event: `{delivery_event_id}`\n" if delivery_event_id else ""
 
             # ── Orchestration guard: track failures (only in orchestrator mode) ──
             parent_key = info.parent_session_key
@@ -6374,7 +6389,7 @@ class GatewayOrchestrator:
                     _is_orchestrator = (
                         _slot is not None and getattr(_slot, "mode", "") == "orchestrator"
                     )
-                if _slot is not None and _is_orchestrator:
+                if _slot is not None and _is_orchestrator and not _delivery_retry:
                     from kiro_crew.context_management import (
                         MAX_STAGE_ESCALATIONS,
                         MAX_STAGE_ROUNDS,
@@ -6464,6 +6479,7 @@ class GatewayOrchestrator:
 
             announce = (
                 f"{SUBAGENT_COMPLETION_PREFIX}\n"
+                f"{event_line}"
                 f"Agent `{info.id}`"
                 f"{f' ({info.agent})' if info.agent else ''}"
                 f" {status} {emoji}\n"
@@ -6484,6 +6500,8 @@ class GatewayOrchestrator:
                 requested_model=info.requested_model or info.model or "",
                 resolved_model=info.resolved_model or "",
             )
+            if delivery_event_id:
+                sub_meta["eventId"] = delivery_event_id
 
             parent_key = info.parent_session_key
 
@@ -6509,6 +6527,7 @@ class GatewayOrchestrator:
                 _batch_id = ""
             if not isinstance(_batch_total, int):
                 _batch_total = 0
+            _batch_retry = False
             if _flush_only and not _batch_id:
                 # A flush-only record without wave identity has nothing to
                 # release and MUST NOT fall through to the per-agent routing
@@ -6529,30 +6548,39 @@ class GatewayOrchestrator:
                     _last = False
                     _oc = ""
                 else:
-                    bp = self._batch_progress.setdefault(
-                        _batch_id,
-                        {
-                            "total": _batch_total,
-                            "done": 0,
-                            "ok": 0,
-                            "err": 0,
-                            "stopped": 0,
-                            "fail_lines": [],
-                            "ok_lines": [],
-                            "guard_msgs": [],
-                            "held_ok_ids": [],
-                            # Members whose delivery is currently held, so the
-                            # hold-deadline sweep's timestamps can be cleared
-                            # when their chunk finally fires.
-                            "held_infos": [],
-                            # Chunked delivery bookkeeping: "flushed" = members whose
-                            # results have already been delivered in a prior chunk;
-                            # "chunks" = digest chunks emitted so far.
-                            "flushed": 0,
-                            "chunks": 0,
-                        },
-                    )
-            if _batch_id and not _flush_only:
+                    _retry_progress = getattr(info, "_delivery_batch_progress", None)
+                    if isinstance(_retry_progress, dict):
+                        _batch_retry = True
+                        # Routing below clears per-chunk buffers after composing
+                        # a non-final digest. Work from a fresh mapping so a
+                        # second failed attempt cannot erase the retained
+                        # snapshot needed by later retries.
+                        bp = dict(_retry_progress)
+                    else:
+                        bp = self._batch_progress.setdefault(
+                            _batch_id,
+                            {
+                                "total": _batch_total,
+                                "done": 0,
+                                "ok": 0,
+                                "err": 0,
+                                "stopped": 0,
+                                "fail_lines": [],
+                                "ok_lines": [],
+                                "guard_msgs": [],
+                                "held_delivery_ids": [],
+                                "delivery_event_ids": [],
+                                # Members whose delivery is held, so the
+                                # deadline sweep can clear their timestamps
+                                # when the chunk finally fires.
+                                "held_infos": [],
+                                # "flushed" = members delivered in an earlier
+                                # chunk; "chunks" = chunks emitted so far.
+                                "flushed": 0,
+                                "chunks": 0,
+                            },
+                        )
+            if _batch_id and not _flush_only and not _batch_retry:
                 bp["done"] += 1
                 # Fold EVERY member's orchestration escalation into the wave
                 # digest — held members return before the announce is sent, so
@@ -6580,6 +6608,8 @@ class GatewayOrchestrator:
                         f"— `{info.id}` {status} {emoji} · {task_text[:80]}\n"
                         f"  {detail[:400]}{'…' if len(detail) > 400 else ''}"
                     )
+                if delivery_event_id:
+                    bp["delivery_event_ids"].append(delivery_event_id)
                 _last = bp["total"] > 0 and bp["done"] >= bp["total"]
                 if not _last:
                     # Robustness: a wave member that failed AT SPAWN never
@@ -6620,6 +6650,12 @@ class GatewayOrchestrator:
                             )
                     except Exception:
                         logger.debug("batch_finished broadcast failed", exc_info=True)
+            elif _batch_id and not _flush_only:
+                # The first attempt already composed and accounted this chunk
+                # before routing failed. Reuse its detached snapshot so a retry
+                # cannot mutate the live wave or broadcast completion twice.
+                _last = info._delivery_batch_final
+                _oc = info.outcome
             if _batch_id:
                 if _flush_only and bp["total"] <= 1:
                     # Single-member wave: nothing is ever held, and falling
@@ -6642,7 +6678,12 @@ class GatewayOrchestrator:
                     # lacks — the reaper's hold-deadline sweep forces the
                     # pending chunk out once results have been held too long.
                     _pending = bp["done"] - bp["flushed"]
-                    _flush = _last or _flush_only or _pending >= SUBAGENT_DIGEST_CHUNK_SIZE
+                    _flush = (
+                        _batch_retry
+                        or _last
+                        or _flush_only
+                        or _pending >= SUBAGENT_DIGEST_CHUNK_SIZE
+                    )
                     if not _flush:
                         # Held for the next chunk — the terminal WS event,
                         # tracker accounting, and stats above already ran;
@@ -6662,8 +6703,8 @@ class GatewayOrchestrator:
                         # contract; cleared when this member's chunk fires.
                         info._digest_held_at = time.time()
                         bp.setdefault("held_infos", []).append(info)
-                        if _oc == "completed":
-                            bp["held_ok_ids"].append(info.id)
+                        if _oc == "completed" or info._delivery_event_id:
+                            bp["held_delivery_ids"].append(info.id)
                         logger.info(
                             "Subagent %s: completion held for digest chunk (%d/%d done)",
                             info.id,
@@ -6678,7 +6719,13 @@ class GatewayOrchestrator:
                     # Stash the ids on the flushing member: the run loop
                     # settles them only after _on_done (which includes the
                     # routing below) returns without raising.
-                    info._digest_settle_ids = list(bp.get("held_ok_ids", []))
+                    info._digest_settle_ids = list(bp.get("held_delivery_ids", []))
+                    # A callback without a stable outbox event has no exact
+                    # replay source. Retain the live pre-composition state so
+                    # a failed route can put its chunk back into the wave for
+                    # the next durable member or deadline flush. Only durable
+                    # events may detach a chunk and own its retry position.
+                    _flush_rollback = dict(bp) if _flush_only or not delivery_event_id else None
                     # These members are no longer held: stop the hold clock so
                     # the reaper's deadline sweep does not force a second flush
                     # for results this chunk already carries.
@@ -6693,8 +6740,23 @@ class GatewayOrchestrator:
                     # Deduped union of this chunk's members' escalation
                     # guards — not just the flushing member's.
                     _guards = "".join(dict.fromkeys(bp.get("guard_msgs", [])))
-                    bp["chunks"] += 1
-                    bp["flushed"] = bp["done"]
+                    _chunk_event_ids = list(dict.fromkeys(bp.get("delivery_event_ids", [])))
+                    _chunk_event_lines = "".join(
+                        f"Event: `{event_id}`\n" for event_id in _chunk_event_ids
+                    )
+                    if not _batch_retry:
+                        bp["chunks"] += 1
+                        bp["flushed"] = bp["done"]
+                        # Preserve the exact composed chunk before the live
+                        # per-chunk buffers are replaced below. A failed
+                        # non-final route must retry this chunk without
+                        # recounting its flushing member or disturbing later
+                        # completions already accumulating in the wave.
+                        _delivery_progress = dict(bp)
+                        if _flush_rollback is not None:
+                            _delivery_progress["_flush_rollback"] = _flush_rollback
+                        info._delivery_batch_progress = _delivery_progress
+                        info._delivery_batch_final = _last
                     _chunk_k = bp["chunks"]
                     # Total chunks: full chunks + one final partial. Completion
                     # order fills chunks to exactly CHUNK_SIZE, so this is
@@ -6717,6 +6779,7 @@ class GatewayOrchestrator:
                         # Final chunk: release the spawn-discipline gate.
                         announce = (
                             f"{SUBAGENT_BATCH_COMPLETION_PREFIX}\n"
+                            f"{_chunk_event_lines}"
                             f"Batch results {_chunk_k}/{_chunk_j} — wave finished: "
                             f"{bp['ok']} ✅ · {bp['err']} ❌ · "
                             f"{bp['stopped']} ⏹ of {bp['total']} agents. "
@@ -6761,6 +6824,7 @@ class GatewayOrchestrator:
                         )
                         announce = (
                             f"{SUBAGENT_BATCH_COMPLETION_PREFIX}\n"
+                            f"{_chunk_event_lines}"
                             f"Batch results {_chunk_k}/{_chunk_j} — "
                             f"{bp['done']} of {bp['total']} delivered, "
                             f"{_remaining} still running.\n"
@@ -6786,7 +6850,13 @@ class GatewayOrchestrator:
                         bp["fail_lines"] = []
                         bp["ok_lines"] = []
                         bp["guard_msgs"] = []
-                        bp["held_ok_ids"] = []
+                        bp["held_delivery_ids"] = []
+                        bp["delivery_event_ids"] = []
+
+                    if delivery_event_id:
+                        sub_meta["eventId"] = delivery_event_id
+                    if _chunk_event_ids:
+                        sub_meta["eventIds"] = _chunk_event_ids
 
             # ── Route completion back to the originating session ──
             # Tab open        → that tab (a channel-born tab mirrors on to its channel)
@@ -6975,6 +7045,19 @@ class GatewayOrchestrator:
                             )
                             return
 
+                        # Dispatch is not consumption. Record the same durable
+                        # debt used by queued rows, then let the turn's
+                        # consumption signal settle it. A process crash after
+                        # create_task but before prompt persistence must leave
+                        # the outbox event recoverable.
+                        self._defer_queued_delivery(
+                            _injection_slot, announce, info, flush_only=_flush_only
+                        )
+                        _consumed: list[bool] = [False]
+
+                        def _note_consumed(consumed: bool = True) -> None:
+                            _consumed[0] = consumed
+
                         # Slot is idle — start _run_chat.
                         _task = asyncio.create_task(
                             bounded_chat_turn(
@@ -6983,12 +7066,20 @@ class GatewayOrchestrator:
                                     _injection_slot,
                                     announce,
                                     _directive_user_origin=False,
+                                    _on_consumed=_note_consumed,
                                 )
                             )
                         )
                         _injection_slot.task = _task
                         self.dashboard_state._background_tasks.add(_task)
                         _task.add_done_callback(self.dashboard_state._background_tasks.discard)
+                        _arm_queued_delivery_settlement(
+                            self.dashboard_state,
+                            _injection_slot,
+                            _task,
+                            [announce],
+                            _consumed,
+                        )
 
                         def _on_inject_done(t: asyncio.Task) -> None:  # type: ignore[type-arg]
                             if _injection_slot.task is t:
@@ -7320,6 +7411,11 @@ class GatewayOrchestrator:
                         )
                 except Exception:
                     logger.exception("Subagent %s cron injection failed", info.id)
+                    if self.subagent_mgr:
+                        self.subagent_mgr.notify_injection_failed(
+                            info,
+                            reason="cron injection failed",
+                        )
                 finally:
                     if acquired:
                         try:
@@ -7411,6 +7507,73 @@ class GatewayOrchestrator:
                 )
             if not parent_key.startswith("cron:"):
                 logger.info("Subagent %s → notification only (parent=%s)", info.id, parent_key)
+
+        async def _subagent_done(info: SubagentInfo) -> None:
+            """Keep later wave chunks behind a failed non-final chunk."""
+
+            batch_id = info.batch_id if isinstance(info.batch_id, str) else ""
+            if not batch_id:
+                await _subagent_done_impl(info)
+                return
+
+            lock = _batch_delivery_locks.setdefault(batch_id, asyncio.Lock())
+            _batch_delivery_lock_refs[batch_id] = _batch_delivery_lock_refs.get(batch_id, 0) + 1
+
+            def _retain_failed_position() -> None:
+                retry_progress = getattr(info, "_delivery_batch_progress", None)
+                if isinstance(retry_progress, dict):
+                    rollback = retry_progress.get("_flush_rollback")
+                    live_progress = self._batch_progress.get(batch_id)
+                    if isinstance(rollback, dict) and live_progress is not None:
+                        live_progress.clear()
+                        live_progress.update(rollback)
+                        held_at = time.time()
+                        for held in live_progress.get("held_infos", []):
+                            held._digest_held_at = held_at
+                        info._digest_settle_ids = []
+                        info._delivery_batch_progress = None
+                        info._delivery_batch_final = False
+                        return
+                if batch_id and isinstance(retry_progress, dict) and not info._delivery_batch_final:
+                    _batch_delivery_retry_owner[batch_id] = info.id
+
+            try:
+                async with lock:
+                    retry_owner = _batch_delivery_retry_owner.get(batch_id)
+                    if retry_owner and retry_owner != info.id:
+                        # The prior chunk is already composed and owns the
+                        # wave's next delivery position. Leave this member
+                        # unaccounted so its durable event can retry after that
+                        # chunk is accepted.
+                        info._delivery_failed = True
+                        logger.info(
+                            "Subagent %s: delivery waits for batch %s chunk owned by %s",
+                            info.id,
+                            batch_id,
+                            retry_owner,
+                        )
+                        return
+                    try:
+                        await _subagent_done_impl(info)
+                    except asyncio.CancelledError:
+                        _retain_failed_position()
+                        raise
+                    except Exception:
+                        _retain_failed_position()
+                        raise
+                    else:
+                        if info._delivery_failed:
+                            _retain_failed_position()
+                        elif retry_owner == info.id:
+                            _batch_delivery_retry_owner.pop(batch_id, None)
+            finally:
+                remaining = _batch_delivery_lock_refs[batch_id] - 1
+                if remaining:
+                    _batch_delivery_lock_refs[batch_id] = remaining
+                else:
+                    _batch_delivery_lock_refs.pop(batch_id, None)
+                    if batch_id not in _batch_delivery_retry_owner:
+                        _batch_delivery_locks.pop(batch_id, None)
 
         assert self.sessions is not None
         assert self.ctx_builder is not None
@@ -7609,7 +7772,6 @@ class GatewayOrchestrator:
             completion_keep=self._cfg.agent.completion_keep,
             completion_keep_chars=self._cfg.agent.completion_keep_chars,
         )
-        self.subagent_mgr.start_reaper()
 
     def _init_crew(self) -> None:
         """Attach the Crew Mode control plane (engineered pipeline;
@@ -9816,6 +9978,12 @@ class GatewayOrchestrator:
             self._init_crew()
         else:
             await self._init_api_server()
+        # Startup reconciliation can immediately claim and deliver durable
+        # completion events.  Arm it only after the destination registry is
+        # initialized, otherwise a dashboard parent can fall through to the
+        # generic session route and be acknowledged without reaching its slot.
+        if self.subagent_mgr:
+            self.subagent_mgr.start_reaper()
         # Record this gateway's own kirocrew launcher, keyed by the port it
         # serves, so a remote token-mint execs THIS install's venv instead of
         # a stale ~/.local/bin/kirocrew that may point at an uninstalled
