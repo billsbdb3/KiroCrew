@@ -226,12 +226,47 @@ def _rewrite_pid_file(path: Path, content: str) -> bool:
 # PIDs before a kill, and as a NEGATIVE gate in the work-orphan sweep: these
 # runtimes are reclaimed by their own tracked-PID sweep, never by the
 # marker-based work sweep (see _is_sweepable_orphan_work).
-_MANAGED_AGENT_MARKERS: tuple[str, ...] = ("kiro-cli", "claude")
+#
+# A backend absent from this tuple is never recognised as ours: its tracked
+# entries are pruned instead of reaped (a leaked process), and _kill_pid_tree
+# skips its children. Known gap: a CODEX_ACP_BIN pointing at a script wrapped as
+# ``[node, script]`` matches neither the basename gate nor the cmdline gate unless
+# the script path itself contains "codex". The consequence is a leaked tracking
+# entry, never a wrong kill, because the re-validation is a precondition for
+# killing rather than a licence to.
+_MANAGED_AGENT_MARKERS: tuple[str, ...] = (
+    "kiro-cli",
+    "claude-agent-acp",
+    "claude",
+    "codex-acp",
+    "codex",
+    "goose",
+    "opencode",
+    "pi-acp",
+    "pi",
+)
+
+# ``process_matches`` is deliberately substring-based. Short bare executable
+# names therefore need exact image-name checks: ``"pi"`` occurs in ``pytest``
+# and ``pid_lifecycle.py``, while ``"codex"`` occurs in every process launched
+# from a .codex worktree. Passing either to the substring matcher would turn the
+# PID-reuse guard into permission to kill an unrelated process. Keep the bare
+# names in the descriptor-derived marker catalog above so parity checks still
+# account for child processes, but never use them as substring needles.
+_MANAGED_AGENT_EXACT_MARKERS = frozenset({"claude", "codex", "goose", "opencode", "pi"})
+_MANAGED_AGENT_EXACT_IMAGE_NAMES = frozenset(
+    {name for marker in _MANAGED_AGENT_EXACT_MARKERS for name in (marker, f"{marker}.exe")}
+)
+_MANAGED_AGENT_SUBSTRING_MARKERS = tuple(
+    marker for marker in _MANAGED_AGENT_MARKERS if marker not in _MANAGED_AGENT_EXACT_MARKERS
+)
 
 
 def _is_managed_agent_process(pid: int) -> bool:
     """Check if a PID belongs to an agent process managed by KiroCrew (guards against PID recycling)."""
-    return platform_compat.process_matches(pid, _MANAGED_AGENT_MARKERS)
+    if platform_compat.process_matches(pid, _MANAGED_AGENT_SUBSTRING_MARKERS):
+        return True
+    return platform_compat.process_image_name(pid).casefold() in _MANAGED_AGENT_EXACT_IMAGE_NAMES
 
 
 def _pid_gone_or_unmanaged(pid: int) -> bool:

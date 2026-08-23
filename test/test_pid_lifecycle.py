@@ -972,6 +972,23 @@ class TestIsManagedAgentProcess:
 
         assert _is_managed_agent_process(os.getpid()) is False
 
+    @pytest.mark.parametrize("image_name", ["claude", "codex", "goose", "opencode", "pi"])
+    def test_short_adapter_names_are_exact_image_names(self, image_name: str) -> None:
+        """Short adapter names must not become cmdline substring kill gates."""
+        from kiro_crew.session_pid import _is_managed_agent_process
+
+        with (
+            patch("kiro_crew.session_pid.platform_compat.process_matches", return_value=False)
+            as matches,
+            patch(
+                "kiro_crew.session_pid.platform_compat.process_image_name",
+                return_value=image_name,
+            ),
+        ):
+            assert _is_managed_agent_process(12345) is True
+
+        assert image_name not in matches.call_args.args[1]
+
 
 class TestSyncKillProvider:
     def test_no_pid_returns_early(self) -> None:

@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from kiro_crew.acp import backends as acp_backends
 from kiro_crew.acp.client import (
     _NOT_LOGGED_IN_MESSAGE,
     DEFAULT_MODEL,
@@ -24,16 +25,18 @@ from kiro_crew.acp.session_handle import AcpSessionHandle
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KIRO_IDENTITY_STORE,
-    ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SESSION_SHARING,
     EVENT_COMPACTION_STATUS,
-    PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
-    PROVIDER_LABEL_KAS,
+    PROVIDER_LABELS_BY_BACKEND,
     STOP_REASON_CANCELLED,
     STOP_REASON_END_TURN,
 )
@@ -103,7 +106,9 @@ def _write_cli_overlay(work_dir: Path, model: str, effort: str) -> None:
             model_cfg.pop(other_key, None)
     model_defaults[model] = model_cfg
     existing["chat.modelDefaults"] = model_defaults
-    atomic_write(cli_json, json.dumps(existing, indent=2))  # atomic: readers never see a partial file (#426)
+    atomic_write(
+        cli_json, json.dumps(existing, indent=2)
+    )  # atomic: readers never see a partial file (#426)
 
 
 #: kiro-cli's own Tool Search activation thresholds. Mirrored as the defaults of
@@ -187,7 +192,9 @@ def _write_tool_search_overlay(
         # would take effect if a later build flips the global default on.
         existing.pop("toolSearch.minPct", None)
         existing.pop("toolSearch.minTokens", None)
-    atomic_write(cli_json, json.dumps(existing, indent=2))  # atomic: readers never see a partial file (#426)
+    atomic_write(
+        cli_json, json.dumps(existing, indent=2)
+    )  # atomic: readers never see a partial file (#426)
 
 
 def _clear_cli_overlay_effort(work_dir: Path, model: str) -> None:
@@ -295,15 +302,18 @@ class AcpProvider(LLMProvider):
         mcp_gateway_socket: str | Path | None = None,
         permission_mode: str | None = None,
         crew_agent: str | None = None,
+        allow_ungated_tools: bool = False,
     ) -> None:
         # An unrecognized backend would pass every ``_is_<backend>`` check and
         # spawn kiro-cli, so a typo'd config would drive the wrong agent with no
         # error. Fail at construction instead.
-        if acp_backend not in ACP_BACKENDS_KNOWN:
+        try:
+            acp_backends.descriptor_for(acp_backend)
+        except acp_backends.UnknownAcpBackend as exc:
             raise ValueError(
                 f"Unknown acp_backend {acp_backend!r}; "
-                f"expected one of {sorted(ACP_BACKENDS_KNOWN)}"
-            )
+                f"expected one of {sorted(acp_backends.selectable_ids())}"
+            ) from exc
         kwargs: dict[str, Any] = {
             "work_dir": work_dir,
             "model": model,
@@ -319,6 +329,7 @@ class AcpProvider(LLMProvider):
             # kiro-cli path — fully inert; a companion-registered backend threads
             # it.
             "permission_mode": permission_mode,
+            "allow_ungated_tools": allow_ungated_tools,
         }
         if agent:
             kwargs["agent"] = agent
@@ -451,6 +462,54 @@ class AcpProvider(LLMProvider):
     def is_kas_backend(self) -> bool:
         """True when this ACP provider talks to KAS (kiro-agent)."""
         return self._client.backend == ACP_BACKEND_KAS
+
+    @property
+    def is_codex_backend(self) -> bool:
+        """True when this ACP provider talks to the codex-acp adapter."""
+        return self._client.backend == ACP_BACKEND_CODEX
+
+    @property
+    def is_goose_backend(self) -> bool:
+        """True when this ACP provider talks to goose's own `goose acp` server.
+
+        Positive identity per harness parity H5. goose differs from the other spec
+        adapters in a way worth being able to name: it delegates filesystem and
+        terminal work back to the client instead of performing it in-process.
+        """
+        return self._client.backend == ACP_BACKEND_GOOSE
+
+    @property
+    def is_opencode_backend(self) -> bool:
+        """True when this ACP provider talks to OpenCode's `opencode acp` server.
+
+        Positive identity per harness parity H5. OpenCode is SEEDED_SETTINGS:
+        Crew writes ``permission: ask`` into the session work_dir when nothing
+        is configured, then reads the file back. That is a different trust
+        path from goose's permission-request pin and from Claude's settings
+        seed, so it needs a name of its own.
+        """
+        return self._client.backend == ACP_BACKEND_OPENCODE
+
+    @property
+    def is_pi_backend(self) -> bool:
+        """True when this ACP provider talks to the ``pi-acp`` adapter.
+
+        Positive identity per harness parity H5. Persist ``pi``; the registry
+        spelling ``pi-acp`` canonicalises onto it. Routing is
+        PERMISSION_REQUEST without goose's session-mode pin.
+        """
+        return self._client.backend == ACP_BACKEND_PI
+
+    @property
+    def is_spec_adapter(self) -> bool:
+        """True when the backend speaks the public ACP spec rather than kiro's.
+
+        Covers every spec-dialect adapter (claude, codex, goose, OpenCode, pi).
+        Use this for dialect-level behaviour (integer ``protocolVersion``,
+        ``mcpServers`` on session params) rather than vendor-specific routing.
+        Per-adapter methods stay on the named predicate.
+        """
+        return acp_backends.is_spec_dialect(self._client.backend)
 
     @property
     def is_kiro_backend(self) -> bool:
@@ -950,11 +1009,11 @@ class AcpProvider(LLMProvider):
     def _apply_effort_overlay(self) -> None:
         """Write the kiro workspace cli.json overlay for (current model, effort).
 
-        No-op for the claude backend (it uses live set_config_option) and when
-        the model is not effort-capable or no level resolves. Called before
-        every (re)spawn so resume/restart keeps the same level.
+        No-op for public-spec adapters (their settings are session config
+        options) and when the model is not effort-capable or no level resolves.
+        Called before every (re)spawn so resume/restart keeps the same level.
         """
-        if self.is_claude_backend:
+        if self.is_spec_adapter:
             return
         model = self._client._model
         level = self._resolve_effort()
@@ -969,11 +1028,11 @@ class AcpProvider(LLMProvider):
     def _apply_tool_search_overlay(self) -> None:
         """Write the kiro Tool Search setting into the workspace cli.json overlay.
 
-        No-op for the claude backend (Tool Search is a kiro-cli feature) and
+        No-op for spec adapters (Tool Search is a kiro-cli feature) and
         when no toggle value was supplied (``self._tool_search is None``).
         Called before every (re)spawn so resume/restart keeps the same setting.
         """
-        if self.is_claude_backend or self._tool_search is None:
+        if self.is_spec_adapter or self._tool_search is None:
             return
         try:
             _write_tool_search_overlay(
@@ -1058,19 +1117,21 @@ class AcpProvider(LLMProvider):
 
         Persists the slot override and (kiro) rewrites the overlay so a later
         respawn keeps the level, then pushes the change to the running session:
-        kiro via the ``/effort`` slash command, claude via
-        ``session/set_config_option``. Returns False when the current model
-        does not support effort.
+        kiro via the ``/effort`` slash command, spec adapters via their
+        advertised ``session/set_config_option`` selector. Returns False when
+        the current model does not support effort.
         """
         model = self._client._model
         if not model_supports_effort(model):
             logger.info("change_effort skipped — model %s does not support effort", model)
             return False
-        # Older claude-agent-acp builds advertise no 'effort' config option;
-        # attempting to push would fail with 'Unknown config option' and reset
-        # the session. Report unsupported so the dashboard leaves the UI as-is.
-        if self.is_claude_backend and not self._client.supports_config_option("effort"):
-            logger.info("change_effort skipped — claude-agent-acp build exposes no 'effort' option")
+        config_id = (
+            "reasoning_effort"
+            if self.is_codex_backend
+            else "effort" if self.is_claude_backend else ""
+        )
+        if config_id and not self._client.supports_config_option(config_id):
+            logger.info("change_effort skipped — backend exposes no %r option", config_id)
             return False
         # Accept any level the dynamic validation set knows about — ACP backends
         # can report levels beyond the canonical five (effort.py), and those are
@@ -1092,6 +1153,8 @@ class AcpProvider(LLMProvider):
         try:
             if self.is_claude_backend:
                 await self._set_claude_effort(level)
+            elif config_id:
+                await self._client.set_config_option(config_id, level)
             else:
                 await self._client.send_command("/effort", args={"level": level})
         except Exception:
@@ -1111,7 +1174,7 @@ class AcpProvider(LLMProvider):
             "ACP effort live-changed: model=%s effort=%s backend=%s",
             model,
             level,
-            "claude" if self.is_claude_backend else "kiro",
+            self._client.backend or "kiro",
         )
         return True
 
@@ -1136,9 +1199,9 @@ class AcpProvider(LLMProvider):
         if not model_supports_effort(model):
             return False
         self._effort_per_model.pop(model, None)
-        if self.is_claude_backend:
+        if self.is_spec_adapter:
             # No live "reset to default" — caller must reset the session.
-            logger.info("ACP effort cleared (claude); session reset needed for default")
+            logger.info("ACP effort cleared (spec adapter); session reset needed for default")
             return False
         # kiro: clear/rewrite the overlay so a respawn doesn't re-apply it.
         level = self._resolve_effort()  # workspace default, or None
@@ -1172,27 +1235,34 @@ class AcpProvider(LLMProvider):
         await self._apply_initial_effort()
 
     async def _apply_initial_effort(self) -> None:
-        """Apply the resolved effort to a fresh claude-agent-acp session.
+        """Apply resolved effort to a fresh spec-adapter session.
 
-        claude-agent-acp does NOT read ``CLAUDE_CODE_EFFORT_LEVEL`` from the
-        environment — effort only takes hold via settings.json files or a live
-        ``session/set_config_option``. So for the claude backend we push the
-        resolved level once after the session is ready. Best-effort: a model
-        that does not support effort, or an adapter that rejects the value,
-        must not break session start. The kiro backend already gets effort
-        from the cli.json overlay at spawn, so this is a no-op there.
+        Claude exposes ``effort`` and Codex exposes ``reasoning_effort``. Both
+        take effect through ``session/set_config_option`` after the session is
+        ready. Best-effort: an unsupported model/option must not break startup.
+        The kiro dialect gets effort from the cli.json overlay at spawn.
         """
-        if self.is_acp_runtime_backend:
+        config_id = (
+            "reasoning_effort"
+            if self.is_codex_backend
+            else "effort" if self.is_claude_backend else ""
+        )
+        if not config_id:
             return
         level = self._resolve_effort()
-        if not level:
+        if not level or not self._client.supports_config_option(config_id):
             return
         try:
-            await self._set_claude_effort(level)
-            logger.info("CC initial effort applied: model=%s effort=%s", self._client._model, level)
+            if self.is_claude_backend:
+                await self._set_claude_effort(level)
+            else:
+                await self._client.set_config_option(config_id, level)
+            logger.info(
+                "ACP initial effort applied: model=%s effort=%s", self._client._model, level
+            )
         except Exception:
             logger.warning(
-                "CC initial effort apply failed (model=%s effort=%s)",
+                "ACP initial effort apply failed (model=%s effort=%s)",
                 self._client._model,
                 level,
                 exc_info=True,
@@ -1256,7 +1326,7 @@ class AcpProvider(LLMProvider):
         # /experiment, /hooks) flow through as conversational prompt text;
         # this is a softer failure mode than the previous -32601
         # "Method not found" hard error.
-        if self.is_claude_backend:
+        if self.is_spec_adapter:
             async for e in self._client.stream_events(command):
                 yield self._to_llm_event(e)
             return
@@ -1280,6 +1350,10 @@ class AcpProvider(LLMProvider):
 
     def context_used_tokens(self) -> int:
         return self._client.last_prompt_stats.context_used_tokens
+
+    def rate_limit_payload(self) -> dict[str, Any] | None:
+        rate_limit = self._client.last_prompt_stats.rate_limit
+        return rate_limit.to_payload() if rate_limit is not None else None
 
     async def compact(self, context: str = "") -> None:
         """Trigger native /compact with optional context-preserving prompt."""
@@ -1503,8 +1577,13 @@ def provider_label(provider: Any) -> str:
         backend = getattr(getattr(provider, "client", None), "backend", "")
     else:
         return PROVIDER_LABEL_DEFAULT
-    if backend == ACP_BACKEND_CLAUDE:
-        return PROVIDER_LABEL_CLAUDE
-    if backend == ACP_BACKEND_KAS:
-        return PROVIDER_LABEL_KAS
-    return PROVIDER_LABEL_DEFAULT
+    # Table lookup rather than a branch per backend, so an added adapter cannot
+    # silently fall through to the kiro label and lose its transcript. A
+    # non-string ``backend`` is a mock (``MagicMock.backend`` is another
+    # MagicMock, which is truthy): inventing ``acp:<MagicMock>`` makes
+    # ``detect_provider_switch`` fire and clear a real resume sid.
+    if not isinstance(backend, str) or not backend:
+        return PROVIDER_LABEL_DEFAULT
+    if backend in PROVIDER_LABELS_BY_BACKEND:
+        return PROVIDER_LABELS_BY_BACKEND[backend]
+    return f"acp:{backend}"

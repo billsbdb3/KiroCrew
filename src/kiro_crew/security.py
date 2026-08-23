@@ -5147,6 +5147,27 @@ _SENSITIVE_HOME_DIRS += [
     f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in _CREW_SECRET_LEAVES
 ]
 
+# ── ACP backend credential stores ──
+# An experimental ACP backend authenticates with its own vendor CLI, which
+# persists a live OAuth token under the user's home. The agent must not be able
+# to read the credential that authorises its own backend.
+#
+# Each entry names the FILE, not the directory: $CODEX_HOME also holds
+# config.toml, and an operator diagnosing a tool-gate routing verdict has to be
+# able to read it — the refusal message tells them to.
+#
+# Listed literally rather than imported from ``acp.backends``. That import is a
+# CYCLE: security sits below the acp package, so importing it here runs
+# acp/__init__ -> acp.client -> acp._dispatch, which imports back into this
+# half-initialised module and raises. A defensive try/except around it is worse
+# than useless — it swallows the failure and silently protects nothing.
+# ``test_acp_backend_credentials_are_protected`` asserts every registered
+# backend's ``credential_leaves`` appears below, so adding a backend without its
+# credential path fails a test instead of shipping an unprotected token.
+_SENSITIVE_HOME_DIRS += [
+    ".codex/auth.json",
+]
+
 # ── Write-protected paths (block modification, allow reads) ──
 # Runtime config files carry security-relevant resource ceilings (concurrent
 # subagents, per-agent turn budget, warm-pool size). A prompt-injected agent

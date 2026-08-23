@@ -5,7 +5,7 @@ import { useAppSelector, useAppDispatch } from '../../store'
 import { clearFocusToolCallId, mcpAppKey } from '../../store/chatSlice'
 import { useSimplifiedToolNames } from '../../hooks/useSimplifiedToolNames'
 import { useLanguage } from '../../i18n/LanguageProvider'
-import { pickToolLabel } from '../../utils/toolLabel'
+import { pickCompactToolLabel, shellToolLabelNeedsCompaction } from '../../utils/toolLabel'
 import { LoaderCircle, CircleSlash, CircleAlert, CircleDot, Lock, PanelRight } from 'lucide-react'
 import { PanelRightSolid } from '../../components/icons/panels'
 import { motion, AnimatePresence, useReducedMotion } from 'framer-motion'
@@ -616,11 +616,13 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
   // active UI language so a purpose written in another language (e.g. a Chinese
   // label persisted before the user switched to English) falls back to the
   // language-neutral raw tool label instead of showing foreign-script text.
-  const toolLabel = pickToolLabel({
+  const toolLabel = pickCompactToolLabel({
     simplified,
     purpose: purpose || (message.meta?.purpose as string | undefined),
     rawLabel: label,
     uiLang,
+    isShell,
+    input,
   })
 
   // Design C: surface the file basename as a chip that hugs the open-in-pane
@@ -637,6 +639,10 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
     const stripped = toolLabel.split(filePath).join('').replace(/\s+/g, ' ').trim()
     return stripped || toolLabel
   }, [showFileOpen, filePath, toolLabel])
+  // Preserve the existing raw-tool announcement for ordinary rows. Only the
+  // transcript-sized shell titles use the compact label in accessibility text;
+  // otherwise a hidden giant command remains just as noisy as a visible one.
+  const ariaToolLabel = isShell && shellToolLabelNeedsCompaction(label) ? displayLabel : label
   // Both running and pending-approval pills shimmer — the highlight color
   // tracks the status so pending shimmers warn-yellow (matching the approval
   // bar) and running shimmers accent.
@@ -783,10 +789,10 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
         className={`inline-flex ${ROW_PILL_BUTTON_CLASS} focus-visible:ring-2 focus-visible:ring-accent/50 focus-visible:outline-none ${hasPendingPerm ? 'cursor-default' : 'cursor-pointer hover:brightness-110'}`}
         aria-expanded={effectivelyExpanded}
         aria-label={hasPendingPerm
-          ? i18nT('pages.chat.toolCallLine.aria_awaiting_approval', { label })
+          ? i18nT('pages.chat.toolCallLine.aria_awaiting_approval', { label: ariaToolLabel })
           : effectivelyExpanded
-            ? i18nT('pages.chat.toolCallLine.aria_hide_details', { label })
-            : i18nT('pages.chat.toolCallLine.aria_show_details', { label })}
+            ? i18nT('pages.chat.toolCallLine.aria_hide_details', { label: ariaToolLabel })
+            : i18nT('pages.chat.toolCallLine.aria_show_details', { label: ariaToolLabel })}
         onClick={onToggle}
       >
         {/* Deterministic vertical centering: the label spans pin leading-5
@@ -939,7 +945,7 @@ export default memo(function ToolCallLine({ message, running: _running, slot, on
             transition={{ duration: 0.35, ease: [0.4, 0.0, 0.2, 1] /* Material standard */ }}
             style={{ overflow: 'hidden' }}
           >
-            <ToolDetails purpose={purpose} pillLabel={toolLabel} toolName={label} input={input} output={isAutoDenied ? denyOutput : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
+            <ToolDetails purpose={purpose} pillLabel={displayLabel} toolName={label} input={input} output={isAutoDenied ? denyOutput : output} auto={auto} pending={hasPendingPerm} ts={ts} hasEntry={hasEntry} fmtTime={fmtTime} barColor={barStyle} layoutId={`tool-detail-${effectiveId || toolCallId || fallbackId}`} flush />
           </motion.div>
         )}
       </AnimatePresence>

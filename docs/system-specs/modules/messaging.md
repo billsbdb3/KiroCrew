@@ -746,6 +746,10 @@ steer/queue/drain machinery — `telegram/transport_dispatch.py`,
 same `messaging.queue_mode` (`config/loader.py`, `"steer"` | `"queue"`, anything
 else normalized to `steer`) and all implement the same three primitives
 (`_handle_busy`, `_enqueue_with_receipt` + `_drain_queue`, `_handle_stop`).
+Slack uses `slack.handler.inject_busy_followup`: when `supports_steer` is
+true (kiro + KAS) it folds immediately; when it is not (spec adapters) it
+enqueues a follow-up and returns without waiting on the session semaphore.
+Spec adapters stay out of `ACP_BACKENDS_STEER`.
 
 The **channel-neutral half of the queue receipt is shared**, not duplicated:
 `messaging/queue_receipt.py` owns the receipt registry, the lock, the three

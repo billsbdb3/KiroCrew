@@ -28,9 +28,7 @@ class TestAcpPerAgentModel:
 
     def test_custom_agent_threads_its_declared_model(self):
         cfg = self._acp_cfg()
-        with patch.object(
-            KiroCrewConfig, "_resolve_named_agent_model", return_value="gpt-5.6-sol"
-        ):
+        with patch.object(KiroCrewConfig, "_resolve_named_agent_model", return_value="gpt-5.6-sol"):
             provider = cfg.create_provider_factory()(
                 session_key="cron:job:run", agent="smle-triage-canary"
             )
@@ -41,9 +39,7 @@ class TestAcpPerAgentModel:
 
     def test_model_override_wins_over_agent_model(self):
         cfg = self._acp_cfg()
-        with patch.object(
-            KiroCrewConfig, "_resolve_named_agent_model", return_value="gpt-5.6-sol"
-        ):
+        with patch.object(KiroCrewConfig, "_resolve_named_agent_model", return_value="gpt-5.6-sol"):
             provider = cfg.create_provider_factory()(
                 session_key="cron:job:run",
                 agent="smle-triage-canary",
@@ -86,9 +82,7 @@ class TestAcpPerAgentModel:
         # The new global fallback must not overtake an agent that pins a model.
         cfg = self._acp_cfg()
         cfg.agent.model = "claude-sonnet-4.6"
-        with patch.object(
-            KiroCrewConfig, "_resolve_named_agent_model", return_value="gpt-5.6-sol"
-        ):
+        with patch.object(KiroCrewConfig, "_resolve_named_agent_model", return_value="gpt-5.6-sol"):
             provider = cfg.create_provider_factory()(
                 session_key="cron:job:run", agent="pinned-agent"
             )
@@ -100,9 +94,66 @@ class TestAcpPerAgentModel:
         # also carries a cc_model still runs its kiro model. Asserted on the real
         # resolver via its agents_dir seam, locking the resolver's contract.
         (tmp_path / "kiro-cc.json").write_text(
-            json.dumps({"name": "kiro-cc", "model": "gpt-5.6-sol",
-                        "cc_model": "claude-opus-4.6"})
+            json.dumps({"name": "kiro-cc", "model": "gpt-5.6-sol", "cc_model": "claude-opus-4.6"})
         )
-        assert KiroCrewConfig._resolve_named_agent_model(
-            "kiro-cc", agents_dir=tmp_path
-        ) == "gpt-5.6-sol"
+        assert (
+            KiroCrewConfig._resolve_named_agent_model("kiro-cc", agents_dir=tmp_path)
+            == "gpt-5.6-sol"
+        )
+
+
+class TestAcpBackendOverride:
+    """Dedicated children pin the live parent harness on the factory call."""
+
+    def test_override_wins_over_the_factory_snapshot(self) -> None:
+        from kiro_crew.acp.types import ACP_BACKEND_GOOSE
+
+        cfg = KiroCrewConfig()
+        cfg.agent.acp_backend = ""
+        provider = cfg.create_provider_factory()(
+            session_key="subagent:child", acp_backend=ACP_BACKEND_GOOSE
+        )
+        assert provider.client.backend == ACP_BACKEND_GOOSE
+
+    def test_omitted_override_keeps_the_snapshot(self) -> None:
+        from kiro_crew.acp.types import ACP_BACKEND_GOOSE
+
+        cfg = KiroCrewConfig()
+        cfg.agent.acp_backend = ACP_BACKEND_GOOSE
+        provider = cfg.create_provider_factory()(session_key="subagent:child")
+        assert provider.client.backend == ACP_BACKEND_GOOSE
+
+    def test_empty_override_pins_kiro(self) -> None:
+        from kiro_crew.acp.types import ACP_BACKEND_GOOSE, ACP_BACKEND_KIRO
+
+        cfg = KiroCrewConfig()
+        cfg.agent.acp_backend = ACP_BACKEND_GOOSE
+        provider = cfg.create_provider_factory()(
+            session_key="subagent:child", acp_backend=ACP_BACKEND_KIRO
+        )
+        assert provider.client.backend == ACP_BACKEND_KIRO
+
+    def test_spec_override_does_not_translate_registry_keys(self) -> None:
+        """goose ids are not model_registry keys; translating would invent one."""
+        from kiro_crew.acp.types import ACP_BACKEND_GOOSE
+
+        cfg = KiroCrewConfig()
+        provider = cfg.create_provider_factory()(
+            session_key="subagent:child",
+            acp_backend=ACP_BACKEND_GOOSE,
+            model_override="opus-4.8-1m",
+        )
+        assert provider.client._model == "opus-4.8-1m"
+
+    def test_kiro_path_still_translates_registry_keys(self) -> None:
+        from kiro_crew import model_registry
+        from kiro_crew.acp.types import ACP_BACKEND_KIRO
+
+        cfg = KiroCrewConfig()
+        provider = cfg.create_provider_factory()(
+            session_key="subagent:child",
+            acp_backend=ACP_BACKEND_KIRO,
+            model_override="opus-4.8-1m",
+        )
+        assert provider.client._model == model_registry.to_acp_id("opus-4.8-1m")
+        assert provider.client._model != "opus-4.8-1m"

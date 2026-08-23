@@ -54,6 +54,9 @@ from kiro_crew.dashboard.handlers._shared import (  # noqa: E402, F401
 )
 
 # ── Agents (extracted to handlers/agents.py) ──
+from kiro_crew.dashboard.handlers.acp_backends import (  # noqa: E402, F401
+    api_acp_backends,
+)
 from kiro_crew.dashboard.handlers.agents import (  # noqa: E402, F401
     _auto_install_agent,
     _find_agent_config,

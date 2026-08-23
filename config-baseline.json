@@ -24,6 +24,7 @@
         "provider": "acp",
         "mcp_registry_mode": false,
         "acp_backend": "",
+        "acp_backend_allow_ungated_tools": false,
         "default_agent": "",
         "sweep_agents_backups": false,
         "sandbox": "auto",
@@ -250,13 +251,32 @@
       "sensitive": false,
       "tags": [],
       "label": "ACP Backend",
-      "help": "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent. KAS runs chat but has no native subagent progress reporting yet.",
+      "help": "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent, or an operator-installed registry adapter ('claude', 'codex', 'goose', 'opencode', 'pi'). An adapter whose tool calls cannot be shown to reach Kiro Crew's gate is refused at session start unless acp_backend_allow_ungated_tools.",
       "hasChildren": false,
       "enumValues": [
         "",
-        "kas"
+        "claude",
+        "codex",
+        "goose",
+        "kas",
+        "opencode",
+        "pi"
       ],
       "defaultValue": ""
+    },
+    {
+      "path": "agent.acp_backend_allow_ungated_tools",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Allow Ungated Tools",
+      "help": "Start a session on an experimental ACP backend even when its tool decisions cannot be shown to reach Kiro Crew's PreToolUse gate. OFF by default, and leaving it off is the safe choice: with it on, the bundled denied-command rules, the sensitive-path block and the governance ceiling are not consulted for tool calls the backend auto-approves on its own.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "agent.default_agent",

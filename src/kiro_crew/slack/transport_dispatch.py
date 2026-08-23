@@ -47,6 +47,7 @@ from kiro_crew.slack.handler import (
     _thread_agents,
     get_dashboard_state,
     get_orch_cfg,
+    inject_busy_followup,
     is_slack_session_trusted,
     is_thread_temporary,
     maybe_apply_privacy_modifiers,
@@ -386,7 +387,6 @@ async def handle_message_transport(
             # this True while nothing passed it meant the ceiling did not exist.
             uploads_allowed=not _is_slack_restricted(session_key),
         )
-        await renderer.on_turn_start()
 
         # ── Session acquisition (same as handle_message) ──
         # Durable thread overrides + conv flags were already hydrated at the top
@@ -427,6 +427,25 @@ async def handle_message_transport(
             or _get_default_agent()
             or _DEFAULT_KIROCREW_AGENT
         )
+        _mid_turn = await inject_busy_followup(
+            sessions,
+            session_key,
+            text,
+            msg_ts,
+            slack=slack,
+            channel=channel,
+            thread_ts=reply_ts,
+            enqueue_kwargs={
+                "channel": channel,
+                "thread_ts": thread_ts,
+                "sender_id": user_id,
+                "agent_override": agent_override,
+                "user_display_name": user_display_name,
+            },
+        )
+        if _mid_turn != "idle":
+            return
+        await renderer.on_turn_start()
         client, is_new, resumed = await sessions.get_or_create(
             session_key, agent=_agent, channel_id=channel
         )

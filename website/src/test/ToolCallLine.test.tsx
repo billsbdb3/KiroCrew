@@ -66,6 +66,39 @@ describe('ToolCallLine simplifiedToolNames', () => {
     renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
     expect(screen.getByText('Running: echo hello')).toBeTruthy()
   })
+
+  it('renders an oversized shell command as a compact stable activity label', () => {
+    const command = [
+      "perl -0pi -e 's/old/new/' src/kiro_crew/acp/backends.py",
+      "perl -0pi -e 's/old/new/' src/kiro_crew/acp/types.py",
+      'git diff --check',
+    ].join('; ')
+    const rawLabel = `/bin/zsh -lc "${command}${' '.repeat(140)}"`
+    const msg = toolMsg({ content: `🔧 ${rawLabel}`, meta: { tool_call_id: 'tc_compact' } })
+    const store = createTestStore({
+      chat: {
+        messages: [msg],
+        toolLog: [{
+          type: 'tool',
+          text: rawLabel,
+          tool_call_id: 'tc_compact',
+          input: JSON.stringify({ command }),
+          output: 'ok',
+          is_shell: true,
+          ts: 1,
+        }],
+        slotRunning: false,
+      } as unknown as ChatState,
+    })
+    renderWithProviders(<ToolCallLine message={msg} running={false} />, { store })
+
+    expect(screen.getByText('perl + git diff ×3')).toBeTruthy()
+    expect(screen.queryByText(rawLabel)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /Show details for tool: perl \+ git diff ×3/i }))
+    // The exact command remains available in expanded details.
+    expect(screen.getByTitle(/^\/bin\/zsh -lc/)).toBeTruthy()
+  })
 })
 
 describe('ToolCallLine inline expansion', () => {

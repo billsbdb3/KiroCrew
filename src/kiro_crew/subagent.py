@@ -15,7 +15,7 @@ import math
 import os
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Protocol
@@ -484,6 +484,99 @@ def _resolved_model_of(client: object) -> str:
     except Exception:
         return ""
     return "" if model == DEFAULT_MODEL else model
+
+
+def parent_live_harness(sessions: object, session_key: str) -> tuple[str | None, list[str]]:
+    """Read ``live_harness`` only when the store returns a real ``(backend, ids)``.
+
+    Unit-test stubs pass a ``MagicMock`` SessionManager. Calling the auto-
+    generated ``live_harness`` returns another mock, which unpacks as an
+    empty iterable. Treat that as no parent so cron / test stubs keep the
+    factory snapshot instead of crashing the spawn.
+    """
+    reader = getattr(sessions, "live_harness", None)
+    if not callable(reader):
+        return None, []
+    result = reader(session_key)
+    if not isinstance(result, tuple) or len(result) != 2:
+        return None, []
+    backend, advertised = result
+    if backend is not None and not isinstance(backend, str):
+        return None, []
+    if not isinstance(advertised, (list, tuple)):
+        return backend, []
+    return backend, [item for item in advertised if isinstance(item, str)]
+
+
+def _harness_label(provider: Any) -> str:
+    """Operator-facing harness name for a typed refusal, or ``this harness``."""
+    client = getattr(provider, "client", None) or getattr(provider, "_client", None)
+    backend = getattr(client, "backend", None) if client is not None else None
+    if not isinstance(backend, str):
+        backend = getattr(provider, "backend", None)
+    if not isinstance(backend, str):
+        return "this harness"
+    try:
+        from kiro_crew.acp.backends import descriptor_for
+
+        return descriptor_for(backend).label
+    except Exception:
+        return backend or "this harness"
+
+
+def _resume_failed_message(client: Any, conversation_key: str) -> str:
+    """Fail-closed spawn_continue text; names a harness with no native resume."""
+    inner = getattr(client, "client", None) or getattr(client, "_client", None)
+    backend = getattr(inner, "backend", None) if inner is not None else None
+    if not isinstance(backend, str):
+        backend = getattr(client, "backend", None)
+    reason = (
+        "session/load did not restore conversation "
+        f"{conversation_key} — refusing to execute the follow-up without "
+        "its prior context. The conversation may be locked by a live "
+        "process or its files corrupt; re-spawn with a fresh task "
+        "carrying a summary."
+    )
+    if isinstance(backend, str):
+        try:
+            from kiro_crew.acp.backends import CAP_NATIVE_RESUME, descriptor_for, supports
+
+            if not supports(backend, CAP_NATIVE_RESUME):
+                label = descriptor_for(backend).label
+                reason = (
+                    f"{label} does not support native resume (session/load) "
+                    f"for conversation {conversation_key} — refusing to "
+                    "execute the follow-up without its prior context. "
+                    "Re-spawn with a fresh task carrying a summary."
+                )
+        except Exception:
+            pass
+    return f"resume_failed: {reason}"
+
+
+def dedicated_child_factory_kwargs(
+    *,
+    parent_backend: str | None,
+    advertised: Sequence[str],
+    preferred_model: str,
+) -> dict[str, Any]:
+    """Factory kwargs that keep a dedicated child on the parent's harness.
+
+    When there is no live parent, returns ``{}`` so cron / parentless spawns
+    keep using the factory snapshot. When there is a parent, ``acp_backend``
+    is always set (including ``""`` for kiro). A preferred model is sent only
+    when ``resolve_usable_model`` says the parent advertised it — otherwise
+    the child inherits the session default rather than a kiro id or ``"auto"``.
+    """
+    if parent_backend is None:
+        return {}
+    from kiro_crew.acp.client import resolve_usable_model
+
+    kwargs: dict[str, Any] = {"acp_backend": parent_backend}
+    resolved = resolve_usable_model(preferred_model, advertised)
+    if resolved:
+        kwargs["model"] = resolved
+    return kwargs
 
 
 def _subagent_default_model() -> str:
@@ -4071,6 +4164,19 @@ class SubagentManager:
                     f"not registered within {_STEER_STARTUP_WAIT_SECS}s — "
                     "retry in a few seconds"
                 )
+        if not getattr(provider, "supports_steer", False):
+            # Spec adapters (and any harness not in ACP_BACKENDS_STEER) have
+            # no ``_session/steer``. Sending the method looks like success
+            # (fire-and-forget) and then hangs or no-ops. Queue as follow_up
+            # so the correction is not dropped and the reason names the
+            # harness.
+            label = _harness_label(provider)
+            ok, detail = await self.follow_up_run(agent_id, message)
+            if ok:
+                return True, (
+                    f"follow_up: {label} does not implement mid-turn steer " "(_session/steer)"
+                )
+            return ok, detail
         try:
             ok = await provider.steer(message)
         except Exception as exc:  # pragma: no cover - provider-specific
@@ -5461,7 +5567,15 @@ class SubagentManager:
         # off the bare per-spawn ``model`` would miss a config-pinned run served a
         # different model (Design review on #3582).
         info.requested_model = eff_model
-        if eff_model:
+        parent_backend, advertised = parent_live_harness(self._sessions, info.parent_session_key)
+        child_kw = dedicated_child_factory_kwargs(
+            parent_backend=parent_backend,
+            advertised=advertised,
+            preferred_model=eff_model,
+        )
+        if parent_backend is not None:
+            extra_kwargs.update(child_kw)
+        elif eff_model:
             extra_kwargs["model"] = eff_model
         # Sub-agent reasoning effort (per-call override -> role_efforts['subagent']
         # -> chat default). Passed as an override so it wins over the factory's
@@ -5499,7 +5613,7 @@ class SubagentManager:
         # dedicated process path so the override in extra_kwargs actually reaches
         # get_or_create -> the provider factory; otherwise a configured sub-agent
         # model/effort would silently no-op on the default (session-sharing) path.
-        if eff_model or eff_effort:
+        if extra_kwargs.get("model") or extra_kwargs.get("reasoning_effort_override"):
             use_session_sharing = False
         if use_session_sharing:
             try:
@@ -5541,13 +5655,7 @@ class SubagentManager:
             # to (re-spawn with a summary). conversation_key is only set by
             # continue_conversation, so first spawns are unaffected.
             if info.conversation_key and not _resumed:
-                raise RuntimeError(
-                    "resume_failed: session/load did not restore conversation "
-                    f"{info.conversation_key} — refusing to execute the "
-                    "follow-up without its prior context. The conversation "
-                    "may be locked by a live process or its files corrupt; "
-                    "re-spawn with a fresh task carrying a summary."
-                )
+                raise RuntimeError(_resume_failed_message(client, info.conversation_key))
             # Detect CC provider to skip permission event loop
             is_cc = self._is_cc_provider(client)
         # Intentionally check info.agent (not resolved `agent`) so only

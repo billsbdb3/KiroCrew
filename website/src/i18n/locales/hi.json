@@ -45,7 +45,6 @@
     "iam_identity_center": "IAM Identity Center",
     "installing_packages": "पैकेज इंस्टॉल हो रहे हैं",
     "k_search_for_anything": "⌘K — कुछ भी खोजें…",
-    "kiro_credit_usage_api_key": "Kiro क्रेडिट उपयोग — API कुंजी प्रमाणीकरण के साथ अनुपलब्ध",
     "kiro_credit_usage_checking": "Kiro क्रेडिट उपयोग — जाँचा जा रहा है…",
     "kiro_credit_usage_checking_2": "Kiro क्रेडिट उपयोग — जाँचा जा रहा है",
     "kiro_credit_usage_unavailable": "Kiro क्रेडिट उपयोग — अनुपलब्ध",
@@ -109,7 +108,11 @@
     "open_command_bar": "Command Bar खोलें",
     "focus_mode": "फ़ोकस मोड",
     "focus_mode_title": "फ़ोकस मोड · Alt+Shift+M",
-    "focus_mode_title_mac": "फ़ोकस मोड · ⌥⇧M"
+    "focus_mode_title_mac": "फ़ोकस मोड · ⌥⇧M",
+    "kiro_credit_usage_api_key": "Kiro क्रेडिट उपयोग — API कुंजी प्रमाणीकरण के साथ अनुपलब्ध",
+    "active_harness": "एजेंट हार्नेस: {{label}}",
+    "active_harness_open_settings": "एजेंट हार्नेस: {{label}} — ACP अडैप्टर सेटिंग्स खोलें",
+    "harness_new_sessions": "नए सत्र"
   },
   "appSdk": {
     "chatEmbed": {
@@ -4767,6 +4770,11 @@
       "all_tools_will_get_auto_approved_across_all_sess": "सभी सेशन में सभी टूल स्वतः स्वीकृत हो जाएँगे।",
       "approval_mode": "स्वीकृति मोड",
       "approval_mode_aria": "स्वीकृति मोड: {{mode}}",
+      "auto_confirm_body": "{{productName}} उन टूल कॉल को नहीं देखेगा। वे अनुमोदन गेट को छोड़ देते हैं।",
+      "auto_confirm_title": "यह अडैप्टर टूल खुद स्वीकृत करेगा",
+      "auto_desc": "यह अडैप्टर टूल कॉल खुद स्वीकृत करता है। {{productName}} उनकी समीक्षा नहीं कर सकता।",
+      "auto_label": "Auto",
+      "auto_tooltip": "यह अडैप्टर टूल कॉल खुद स्वीकृत करता है — {{productName}} उन्हें कभी नहीं देखता",
       "cancel": "रद्द करें",
       "configure_duration": "Configure duration",
       "don_t_show_again": "फिर न दिखाएँ",
@@ -5001,13 +5009,6 @@
       "more_actions": "और कार्रवाइयां"
     },
     "chatInput": {
-      "send_a_message_or_tap_the_mic_for_voice": "संदेश भेजें, या वॉइस के लिए माइक टैप करें",
-      "release_to_transcribe": "लिखने के लिए छोड़ें",
-      "hold_to_talk": "बोलने के लिए दबाए रखें",
-      "release_to_cancel": "रद्द करने के लिए छोड़ें",
-      "slide_up_to_cancel": "रद्द करने के लिए ऊपर स्वाइप करें",
-      "switch_to_keyboard": "कीबोर्ड पर जाएँ",
-      "switch_to_voice": "वॉइस पर जाएँ",
       "drop_to_attach": "छोड़कर अटैच करें",
       "add_files_options": "फ़ाइलें और विकल्प जोड़ें",
       "agent": "एजेंट: {{name}}",
@@ -5098,8 +5099,21 @@
       "use_a_skill": "स्किल का उपयोग करें",
       "used": "उपयोग",
       "voice_input": "वॉइस इनपुट",
+      "send_a_message_or_tap_the_mic_for_voice": "संदेश भेजें, या वॉइस के लिए माइक टैप करें",
+      "release_to_transcribe": "लिखने के लिए छोड़ें",
+      "hold_to_talk": "बोलने के लिए दबाए रखें",
+      "release_to_cancel": "रद्द करने के लिए छोड़ें",
+      "slide_up_to_cancel": "रद्द करने के लिए ऊपर स्वाइप करें",
+      "switch_to_keyboard": "कीबोर्ड पर जाएँ",
+      "switch_to_voice": "वॉइस पर जाएँ",
       "finishing": "पूरा हो रहा है…",
-      "keep_holding_to_record": "रिकॉर्ड करने के लिए दबाए रखें"
+      "keep_holding_to_record": "रिकॉर्ड करने के लिए दबाए रखें",
+      "plan_limit": "प्लान सीमा",
+      "limit_type": "सीमा प्रकार",
+      "resets": "रीसेट",
+      "rate_limit_allowed": "ठीक",
+      "rate_limit_warning": "सीमा के करीब",
+      "rate_limit_rejected": "सीमित"
     },
     "chatPane": {
       "agent_list": "एजेंट सूची",
@@ -6595,25 +6609,6 @@
       "triggers": "ट्रिगर",
       "what_this_skill_does_and_when_the_agent_should_u": "यह स्किल क्या करती है और एजेंट को इसका उपयोग कब करना चाहिए"
     },
-    "projectSkillsTrust": {
-      "body": "${{skill}} इस प्रोजेक्ट के अपने .kiro/skills फ़ोल्डर से आती है।",
-      "confirm": "इस फ़ोल्डर पर भरोसा करो",
-      "consequence": "इस फ़ोल्डर पर भरोसा करने से इसकी स्किल फ़ाइलें इस चैट के कॉन्टेक्स्ट में आ जाती हैं, जहाँ वे एजेंट को कमांड चलाने का निर्देश दे सकती हैं। सिर्फ़ उस प्रोजेक्ट पर भरोसा करो जिसे तुम पहचानते हो।",
-      "decline": "अभी नहीं",
-      "decline_consequence": "मना करने पर कुछ भी लोड नहीं होता और तुम्हारा संदेश वैसा ही रहता है जैसा तुमने लिखा था।",
-      "grant_failed": "इस फ़ोल्डर के लिए भरोसा दर्ज नहीं हो सका।",
-      "title": "इस प्रोजेक्ट की स्किल पर भरोसा करना है?",
-      "withdraw_hint": "इसे बाद में स्किल सेटिंग्स पेज से वापस ले सकते हो।",
-      "working": "भरोसा दर्ज हो रहा है…"
-    },
-    "projectSkillsTrustList": {
-      "folder_missing": "यह फ़ोल्डर अब मौजूद नहीं है।",
-      "hint": "ये प्रोजेक्ट फ़ोल्डर अपनी स्किल चैट में लोड कर सकते हैं। किसी फ़ोल्डर का भरोसा हटा दो, तो उसकी स्किल लोड नहीं होंगी।",
-      "revoke": "भरोसा हटाओ",
-      "revoke_failed": "इस फ़ोल्डर का भरोसा हटाया नहीं जा सका।",
-      "revoking": "हटा रहे हैं…",
-      "title": "भरोसेमंद प्रोजेक्ट फ़ोल्डर"
-    },
     "skillPickerMenu": {
       "loading_skills": "स्किल लोड हो रही हैं…",
       "no_matching_skills": "कोई मेल खाती स्किल नहीं",
@@ -6798,23 +6793,6 @@
       "no_matches_for": "कोई मिलान नहीं",
       "no_noun_match": "कोई {{noun}} मेल नहीं"
     },
-    "updateFoundModal": {
-      "copied": "कॉपी हो गया",
-      "copy_command": "कमांड कॉपी करें",
-      "could_not_save_choice": "तुम्हारी पसंद सहेजी नहीं जा सकी — पुनः लोड के बाद फिर पूछा जा सकता है।",
-      "dismiss": "खारिज करें",
-      "download": "डाउनलोड करें",
-      "nothing_downloads_until_you_choose_to": "तुम्हारी अनुमति के बिना कुछ भी डाउनलोड नहीं होगा।",
-      "remind_me_tomorrow": "कल याद दिलाएँ",
-      "skip_this_version": "यह संस्करण छोड़ें",
-      "update_available": "अपडेट उपलब्ध है",
-      "update_failed": "अपडेट विफल। सेटिंग्स → परिचय से फिर कोशिश करें।",
-      "update_now": "अभी अपडेट करें",
-      "updating": "अपडेट हो रहा है…",
-      "updating_and_restarting": "अपडेट और पुनःआरंभ हो रहा है…",
-      "version_is_available": "{{productName}} <0>{{version}}</0> उपलब्ध है।",
-      "you_can_update_anytime_from_settings_about": "कभी भी सेटिंग्स → परिचय से अपडेट करें।"
-    },
     "updateModal": {
       "back_to_dashboard": "डैशबोर्ड पर वापस जाएँ",
       "dismiss": "खारिज करें",
@@ -6830,13 +6808,6 @@
       "restarting": "रीस्टार्ट हो रहा है...",
       "the_app_will_stop_the_local_gateway_install_the": "ऐप स्थानीय गेटवे रोकेगा, अपडेट इंस्टॉल करेगा और फिर से शुरू होगा।",
       "update_ready": "अपडेट तैयार"
-    },
-    "updatePill": {
-      "downloading": "डाउनलोड हो रहा है…",
-      "downloading_percent": "डाउनलोड हो रहा है {{percent}}%",
-      "open_update_settings": "अपडेट सेटिंग्स खोलें",
-      "update_available": "अपडेट उपलब्ध",
-      "update_ready": "अपडेट तैयार है"
     },
     "voiceDictationPanel": {
       "esc_to_cancel_click_mic_to_finish": "रद्द करने के लिए Esc, समाप्त करने के लिए माइक पर क्लिक करें",
@@ -7106,6 +7077,49 @@
       "billing_notice": "यह एक सशुल्क AWS सेवा है। पुष्टि होने तक कोई अनुरोध नहीं भेजा जाता।",
       "confirm_button": "पुष्टि करें और चालू करें",
       "withdraw": "पुष्टि वापस लें"
+    },
+    "projectSkillsTrust": {
+      "body": "${{skill}} इस प्रोजेक्ट के अपने .kiro/skills फ़ोल्डर से आती है।",
+      "confirm": "इस फ़ोल्डर पर भरोसा करो",
+      "consequence": "इस फ़ोल्डर पर भरोसा करने से इसकी स्किल फ़ाइलें इस चैट के कॉन्टेक्स्ट में आ जाती हैं, जहाँ वे एजेंट को कमांड चलाने का निर्देश दे सकती हैं। सिर्फ़ उस प्रोजेक्ट पर भरोसा करो जिसे तुम पहचानते हो।",
+      "decline": "अभी नहीं",
+      "decline_consequence": "मना करने पर कुछ भी लोड नहीं होता और तुम्हारा संदेश वैसा ही रहता है जैसा तुमने लिखा था।",
+      "grant_failed": "इस फ़ोल्डर के लिए भरोसा दर्ज नहीं हो सका।",
+      "title": "इस प्रोजेक्ट की स्किल पर भरोसा करना है?",
+      "withdraw_hint": "इसे बाद में स्किल सेटिंग्स पेज से वापस ले सकते हो।",
+      "working": "भरोसा दर्ज हो रहा है…"
+    },
+    "projectSkillsTrustList": {
+      "folder_missing": "यह फ़ोल्डर अब मौजूद नहीं है।",
+      "hint": "ये प्रोजेक्ट फ़ोल्डर अपनी स्किल चैट में लोड कर सकते हैं। किसी फ़ोल्डर का भरोसा हटा दो, तो उसकी स्किल लोड नहीं होंगी।",
+      "revoke": "भरोसा हटाओ",
+      "revoke_failed": "इस फ़ोल्डर का भरोसा हटाया नहीं जा सका।",
+      "revoking": "हटा रहे हैं…",
+      "title": "भरोसेमंद प्रोजेक्ट फ़ोल्डर"
+    },
+    "updateFoundModal": {
+      "copied": "कॉपी हो गया",
+      "copy_command": "कमांड कॉपी करें",
+      "could_not_save_choice": "तुम्हारी पसंद सहेजी नहीं जा सकी — पुनः लोड के बाद फिर पूछा जा सकता है।",
+      "dismiss": "खारिज करें",
+      "download": "डाउनलोड करें",
+      "nothing_downloads_until_you_choose_to": "तुम्हारी अनुमति के बिना कुछ भी डाउनलोड नहीं होगा।",
+      "remind_me_tomorrow": "कल याद दिलाएँ",
+      "skip_this_version": "यह संस्करण छोड़ें",
+      "update_available": "अपडेट उपलब्ध है",
+      "update_failed": "अपडेट विफल। सेटिंग्स → परिचय से फिर कोशिश करें।",
+      "update_now": "अभी अपडेट करें",
+      "updating": "अपडेट हो रहा है…",
+      "updating_and_restarting": "अपडेट और पुनःआरंभ हो रहा है…",
+      "version_is_available": "{{productName}} <0>{{version}}</0> उपलब्ध है।",
+      "you_can_update_anytime_from_settings_about": "कभी भी सेटिंग्स → परिचय से अपडेट करें।"
+    },
+    "updatePill": {
+      "downloading": "डाउनलोड हो रहा है…",
+      "downloading_percent": "डाउनलोड हो रहा है {{percent}}%",
+      "open_update_settings": "अपडेट सेटिंग्स खोलें",
+      "update_available": "अपडेट उपलब्ध",
+      "update_ready": "अपडेट तैयार है"
     },
     "confirmDialog": {
       "cancel": "रद्द करें"
@@ -9214,7 +9228,9 @@
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "इनबाउंड वेबहुक टोकन, पंजीकृत संदर्भ और रन इतिहास. API काम करता है, पेज अभी पूरा नहीं हुआ है.",
         "open_webhooks": "वेबहुक खोलें",
-        "webhooks": "वेबहुक"
+        "webhooks": "वेबहुक",
+        "acp_backends": "ACP अडैप्टर",
+        "experimental_acp_backends_claude_code_and_openai": "Kiro CLI के विकल्प के रूप में Claude Code और OpenAI Codex। अस्वीकृति पथ परीक्षित हैं; कोई सफल सत्र नहीं देखा गया है।"
       }
     },
     "developerPage": {
@@ -10351,6 +10367,41 @@
         "vector_memory": "वेक्टर मेमोरी",
         "vector_memory_is_initializing_the_embedding_mode": "वेक्टर मेमोरी शुरू हो रही है। एम्बेडिंग मॉडल (~610MB) बैकग्राउंड में स्वतः डाउनलोड होता है, और पुरानी मेमोरी अपने आप माइग्रेट हो जाती है — किसी कार्रवाई की ज़रूरत नहीं।",
         "verifying_model_integrity": "मॉडल की अखंडता जाँची जा रही है…"
+      },
+      "acpBackend": {
+        "title": "ACP अडैप्टर",
+        "experimental": "प्रयोगात्मक",
+        "all_features_supported": "डिफ़ॉल्ट। सभी सुविधाएँ समर्थित हैं।",
+        "features_differ": "{{total}} में से {{count}} सुविधाएँ अलग तरह से काम करती हैं, अनुपलब्ध हैं या सत्यापित नहीं हैं।",
+        "show_what_changes": "दिखाएँ क्या बदलता है",
+        "applies_to_new_sessions": "अब से शुरू होने वाले सत्रों पर लागू होता है। खुले सत्र अपना मूल अडैप्टर बनाए रखते हैं।",
+        "not_enabled_in_this_build": "इस बिल्ड में सक्षम नहीं: {{backends}}। प्रयोगात्मक ACP अडैप्टर दस्तावेज़ देखें।",
+        "level_supported": "समर्थित",
+        "level_degraded": "भिन्न रूप से काम करता है",
+        "level_unavailable": "अनुपलब्ध",
+        "cap_session_sharing": "साझा सबएजेंट रनटाइम",
+        "cap_reasoning_effort": "तर्क प्रयास",
+        "cap_mcp_tool_search": "MCP टूल खोज",
+        "cap_agent_profiles": "एजेंट प्रोफ़ाइल",
+        "cap_slash_commands": "स्लैश कमांड",
+        "cap_turn_usage": "प्रति-टर्न उपयोग",
+        "cap_billing": "लागत और सीमाएँ",
+        "cap_native_resume": "सत्र पुनरारंभ",
+        "cap_registry_model_ids": "Kiro मॉडल कैटलॉग का उपयोग",
+        "cap_mid_turn_steer": "टर्न के बीच मार्गदर्शन",
+        "confirm_title": "{{backend}} पर स्विच करें?",
+        "confirm_body": "यह एडाप्टर प्रयोगात्मक है। {{total}} में से {{count}} Kiro Crew सुविधाएँ अलग तरह से काम करती हैं, अनुपलब्ध हैं या सत्यापित नहीं हैं।",
+        "confirm_open_sessions": "खुले सत्र प्रभावित नहीं होते और अपना वर्तमान अडैप्टर बनाए रखते हैं।",
+        "cancel": "रद्द करें",
+        "confirm_switch": "अडैप्टर बदलें",
+        "confirm_prerequisites": "पहले गेटवे होस्ट पर इन्हें क्रम से चलाएँ।",
+        "not_installed": "एडाप्टर इंस्टॉल नहीं है",
+        "level_unverified": "सत्यापित नहीं",
+        "routing_routed": "टूल कॉल {{productName}} के सुरक्षा गेट तक पहुँचते हैं",
+        "routing_indeterminate": "टूल-कॉल रूटिंग सत्यापित नहीं है — नए सत्र अस्वीकार किए जाएंगे",
+        "routing_bypassed": "टूल कॉल {{productName}} के सुरक्षा गेट को दरकिनार कर देंगे — नए सत्र अस्वीकार किए जाएंगे",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "अनियंत्रित टूल अनुमत हैं। अस्वीकृत-कमांड नियम, संवेदनशील-पथ अवरोधन और गवर्नेंस सीमा इस बैकएंड की स्व-अनुमोदित कॉल के लिए नहीं देखी जाती।"
       }
     },
     "overviewPage": {
@@ -10700,11 +10751,8 @@
       "owning_session": "स्वामी सत्र"
     },
     "servicesTab": {
-      "channels": "चैनल",
-      "connect_error": "कनेक्शन त्रुटि",
       "connected": "कनेक्टेड",
       "cpu": "CPU %",
-      "discord": "Discord",
       "embeddings": "Embeddings",
       "gateway_process": "गेटवे प्रोसेस",
       "governance": "गवर्नेंस",
@@ -10712,7 +10760,6 @@
       "governance_tip_degraded": "कोई गवर्नेंस जाँच फ़ेल-क्लोज़्ड हुई, अखंडता में बेमेल मिला, या प्रवेश नीति असत्यापित है (अनुपलब्ध/अपठनीय)। SEL ऑडिट लॉग की जाँच करें।",
       "governance_tip_disabled": "कोई लागू होने वाली प्रवेश नीति कॉन्फ़िगर नहीं है (अनुमतिपूर्ण डिफ़ॉल्ट)। जब तक स्पष्ट रूप से प्रतिबंधित न हो, प्लगिन को अनुमति मिल जाती है।",
       "governance_tip_unknown": "इस सत्र में गवर्नेंस स्थिति अभी तय नहीं हुई।",
-      "imessage": "iMessage",
       "mcp_process_breakdown": "{{total}} ({{sandbox}} सैंडबॉक्स · {{provider}} {{providerLabel}} · {{mcp}} mcp)",
       "mcp_process_breakdown_unique": "{{total}} अद्वितीय ({{sandbox}} सैंडबॉक्स · {{provider}} {{providerLabel}} · {{mcp}} mcp)",
       "mcp_processes": "MCP प्रोसेस",
@@ -10729,16 +10776,22 @@
       "status_disabled": "अक्षम",
       "status_unknown": "अज्ञात",
       "stopped": "रुका हुआ",
-      "teams": "Microsoft Teams",
-      "telegram": "Telegram",
       "threads": "थ्रेड",
       "uptime": "अपटाइम",
+      "working_directory": "कार्य डायरेक्टरी",
+      "channels": "चैनल",
+      "connect_error": "कनेक्शन त्रुटि",
+      "discord": "Discord",
+      "imessage": "iMessage",
+      "teams": "Microsoft Teams",
+      "telegram": "Telegram",
       "webex": "Webex",
       "wecom": "WeCom",
       "weixin": "WeChat",
       "whatsapp": "WhatsApp",
       "feishu": "Feishu",
-      "working_directory": "कार्य डायरेक्टरी"
+      "acp_backend": "ACP अडैप्टर",
+      "acp_backend_experimental": "{{label}} (प्रयोगात्मक)"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "फ़ज़ी फ़िल्टर (सबस्ट्रिंग मैच)",

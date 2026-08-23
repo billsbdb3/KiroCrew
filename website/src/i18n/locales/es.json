@@ -45,7 +45,6 @@
     "iam_identity_center": "IAM Identity Center",
     "installing_packages": "Instalando paquetes",
     "k_search_for_anything": "⌘K — Busca cualquier cosa…",
-    "kiro_credit_usage_api_key": "Uso de créditos de Kiro — no disponible con autenticación por clave de API",
     "kiro_credit_usage_checking": "Uso de créditos de Kiro — comprobando…",
     "kiro_credit_usage_checking_2": "Uso de créditos de Kiro — comprobando",
     "kiro_credit_usage_unavailable": "Uso de créditos de Kiro — no disponible",
@@ -109,7 +108,11 @@
     "open_command_bar": "Abrir Command Bar",
     "focus_mode": "Modo de concentración",
     "focus_mode_title": "Modo de concentración · Alt+Mayús+M",
-    "focus_mode_title_mac": "Modo de concentración · ⌥⇧M"
+    "focus_mode_title_mac": "Modo de concentración · ⌥⇧M",
+    "kiro_credit_usage_api_key": "Uso de créditos de Kiro — no disponible con autenticación por clave de API",
+    "active_harness": "Harness del agente: {{label}}",
+    "active_harness_open_settings": "Harness del agente: {{label}} — abrir la configuración del Adaptador de ACP",
+    "harness_new_sessions": "Sesiones nuevas"
   },
   "appSdk": {
     "chatEmbed": {
@@ -4832,6 +4835,11 @@
       "all_tools_will_get_auto_approved_across_all_sess": "Todas las herramientas se aprobarán automáticamente en todas las sesiones.",
       "approval_mode": "Modo de aprobación",
       "approval_mode_aria": "Modo de aprobación: {{mode}}",
+      "auto_confirm_body": "{{productName}} no verá esas llamadas a herramientas. Saltan la puerta de aprobación.",
+      "auto_confirm_title": "Este adaptador aprobará las herramientas por sí mismo",
+      "auto_desc": "Este adaptador aprueba las llamadas a herramientas por sí mismo. {{productName}} no puede revisarlas.",
+      "auto_label": "Auto",
+      "auto_tooltip": "Este adaptador aprueba las llamadas a herramientas por sí mismo — {{productName}} nunca las ve",
       "cancel": "Cancelar",
       "configure_duration": "Configure duration",
       "don_t_show_again": "No volver a mostrar",
@@ -5075,13 +5083,6 @@
       "more_actions": "Más acciones"
     },
     "chatInput": {
-      "send_a_message_or_tap_the_mic_for_voice": "Envía un mensaje o toca el micrófono para usar voz",
-      "release_to_transcribe": "Suelta para transcribir",
-      "hold_to_talk": "Mantén pulsado para hablar",
-      "release_to_cancel": "Suelta para cancelar",
-      "slide_up_to_cancel": "Desliza hacia arriba para cancelar",
-      "switch_to_keyboard": "Cambiar al teclado",
-      "switch_to_voice": "Cambiar a voz",
       "drop_to_attach": "Suelta para adjuntar",
       "add_files_options": "Añadir archivos y opciones",
       "agent": "Agente: {{name}}",
@@ -5172,8 +5173,21 @@
       "use_a_skill": "Usar una skill",
       "used": "Usado",
       "voice_input": "Entrada de voz",
+      "send_a_message_or_tap_the_mic_for_voice": "Envía un mensaje o toca el micrófono para usar voz",
+      "release_to_transcribe": "Suelta para transcribir",
+      "hold_to_talk": "Mantén pulsado para hablar",
+      "release_to_cancel": "Suelta para cancelar",
+      "slide_up_to_cancel": "Desliza hacia arriba para cancelar",
+      "switch_to_keyboard": "Cambiar al teclado",
+      "switch_to_voice": "Cambiar a voz",
       "finishing": "Finalizando…",
-      "keep_holding_to_record": "Mantén pulsado para grabar"
+      "keep_holding_to_record": "Mantén pulsado para grabar",
+      "plan_limit": "Límite del plan",
+      "limit_type": "Tipo de límite",
+      "resets": "Se restablece",
+      "rate_limit_allowed": "Correcto",
+      "rate_limit_warning": "Cerca del límite",
+      "rate_limit_rejected": "Limitado"
     },
     "chatPane": {
       "agent_list": "Lista de agentes",
@@ -6685,25 +6699,6 @@
       "triggers": "Activadores",
       "what_this_skill_does_and_when_the_agent_should_u": "Qué hace esta skill y cuándo debería usarla el agente"
     },
-    "projectSkillsTrust": {
-      "body": "${{skill}} viene de la carpeta .kiro/skills propia de este proyecto.",
-      "confirm": "Confiar en esta carpeta",
-      "consequence": "Confiar en esta carpeta permite que sus archivos de habilidad entren en el contexto de este chat, donde pueden indicarle al agente que ejecute comandos. Confía solo en un proyecto que reconozcas.",
-      "decline": "Ahora no",
-      "decline_consequence": "Si rechazas, no se carga nada y tu mensaje queda tal como lo escribiste.",
-      "grant_failed": "No se pudo registrar la confianza en esta carpeta.",
-      "title": "¿Confiar en las habilidades de este proyecto?",
-      "withdraw_hint": "Puedes retirar esto más adelante desde la página de ajustes Habilidades.",
-      "working": "Confiando…"
-    },
-    "projectSkillsTrustList": {
-      "folder_missing": "Esta carpeta ya no existe.",
-      "hint": "Estas carpetas de proyecto pueden cargar sus propios skills en un chat. Retira una carpeta para que sus skills dejen de cargarse.",
-      "revoke": "Retirar",
-      "revoke_failed": "No se pudo retirar la confianza de esta carpeta.",
-      "revoking": "Retirando…",
-      "title": "Carpetas de proyecto de confianza"
-    },
     "skillPickerMenu": {
       "loading_skills": "Cargando skills…",
       "no_matching_skills": "No hay skills coincidentes",
@@ -6888,23 +6883,6 @@
       "no_matches_for": "Sin coincidencias para",
       "no_noun_match": "No hay {{noun}} que coincidan"
     },
-    "updateFoundModal": {
-      "copied": "Copiado",
-      "copy_command": "Copiar comando",
-      "could_not_save_choice": "No se pudo guardar tu elección; puede volver a preguntar tras recargar.",
-      "dismiss": "Descartar",
-      "download": "Descargar",
-      "nothing_downloads_until_you_choose_to": "No se descarga nada hasta que tú lo decidas.",
-      "remind_me_tomorrow": "Recordármelo mañana",
-      "skip_this_version": "Omitir esta versión",
-      "update_available": "Actualización disponible",
-      "update_failed": "Error al actualizar. Vuelve a intentarlo desde Ajustes → Acerca de.",
-      "update_now": "Actualizar ahora",
-      "updating": "Actualizando…",
-      "updating_and_restarting": "Actualizando y reiniciando…",
-      "version_is_available": "{{productName}} <0>{{version}}</0> está disponible.",
-      "you_can_update_anytime_from_settings_about": "Actualiza en cualquier momento desde Ajustes → Acerca de."
-    },
     "updateModal": {
       "back_to_dashboard": "Volver al panel",
       "dismiss": "Descartar",
@@ -6919,13 +6897,6 @@
       "restart_update": "Reiniciar y actualizar",
       "restarting": "Reiniciando…",
       "the_app_will_stop_the_local_gateway_install_the": "La app detendrá el gateway local, instalará la actualización y se reiniciará.",
-      "update_ready": "Actualización lista"
-    },
-    "updatePill": {
-      "downloading": "Descargando…",
-      "downloading_percent": "Descargando {{percent}}%",
-      "open_update_settings": "Abrir ajustes de actualización",
-      "update_available": "Actualización disponible",
       "update_ready": "Actualización lista"
     },
     "voiceDictationPanel": {
@@ -7196,6 +7167,49 @@
       "billing_notice": "Este es un servicio de AWS de pago. Hasta que lo confirmes, no se envia ninguna solicitud.",
       "confirm_button": "Confirmar y activar",
       "withdraw": "Retirar la confirmacion"
+    },
+    "projectSkillsTrust": {
+      "body": "${{skill}} viene de la carpeta .kiro/skills propia de este proyecto.",
+      "confirm": "Confiar en esta carpeta",
+      "consequence": "Confiar en esta carpeta permite que sus archivos de habilidad entren en el contexto de este chat, donde pueden indicarle al agente que ejecute comandos. Confía solo en un proyecto que reconozcas.",
+      "decline": "Ahora no",
+      "decline_consequence": "Si rechazas, no se carga nada y tu mensaje queda tal como lo escribiste.",
+      "grant_failed": "No se pudo registrar la confianza en esta carpeta.",
+      "title": "¿Confiar en las habilidades de este proyecto?",
+      "withdraw_hint": "Puedes retirar esto más adelante desde la página de ajustes Habilidades.",
+      "working": "Confiando…"
+    },
+    "projectSkillsTrustList": {
+      "folder_missing": "Esta carpeta ya no existe.",
+      "hint": "Estas carpetas de proyecto pueden cargar sus propios skills en un chat. Retira una carpeta para que sus skills dejen de cargarse.",
+      "revoke": "Retirar",
+      "revoke_failed": "No se pudo retirar la confianza de esta carpeta.",
+      "revoking": "Retirando…",
+      "title": "Carpetas de proyecto de confianza"
+    },
+    "updateFoundModal": {
+      "copied": "Copiado",
+      "copy_command": "Copiar comando",
+      "could_not_save_choice": "No se pudo guardar tu elección; puede volver a preguntar tras recargar.",
+      "dismiss": "Descartar",
+      "download": "Descargar",
+      "nothing_downloads_until_you_choose_to": "No se descarga nada hasta que tú lo decidas.",
+      "remind_me_tomorrow": "Recordármelo mañana",
+      "skip_this_version": "Omitir esta versión",
+      "update_available": "Actualización disponible",
+      "update_failed": "Error al actualizar. Vuelve a intentarlo desde Ajustes → Acerca de.",
+      "update_now": "Actualizar ahora",
+      "updating": "Actualizando…",
+      "updating_and_restarting": "Actualizando y reiniciando…",
+      "version_is_available": "{{productName}} <0>{{version}}</0> está disponible.",
+      "you_can_update_anytime_from_settings_about": "Actualiza en cualquier momento desde Ajustes → Acerca de."
+    },
+    "updatePill": {
+      "downloading": "Descargando…",
+      "downloading_percent": "Descargando {{percent}}%",
+      "open_update_settings": "Abrir ajustes de actualización",
+      "update_available": "Actualización disponible",
+      "update_ready": "Actualización lista"
     },
     "confirmDialog": {
       "cancel": "Cancelar"
@@ -9342,7 +9356,9 @@
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "Tokens de webhooks entrantes, contextos registrados e historial de ejecuciones. La API funciona; la página no está terminada.",
         "open_webhooks": "Abrir Webhooks",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "acp_backends": "Adaptadores de ACP",
+        "experimental_acp_backends_claude_code_and_openai": "Claude Code y OpenAI Codex como alternativas a Kiro CLI. Las rutas de rechazo están probadas; no se ha observado ninguna sesión correcta."
       }
     },
     "developerPage": {
@@ -10487,6 +10503,41 @@
         "vector_memory": "Memoria vectorial",
         "vector_memory_is_initializing_the_embedding_mode": "La memoria vectorial está inicializándose. El modelo de embeddings (~610MB) se descarga automáticamente en segundo plano y la memoria antigua se migra por sí sola — no hace falta hacer nada.",
         "verifying_model_integrity": "Verificando la integridad del modelo…"
+      },
+      "acpBackend": {
+        "title": "Adaptador de ACP",
+        "experimental": "Experimental",
+        "all_features_supported": "Predeterminado. Todas las funciones son compatibles.",
+        "features_differ": "{{count}} de {{total}} funciones se comportan de forma diferente, no están disponibles o no se han verificado.",
+        "show_what_changes": "Mostrar qué cambia",
+        "applies_to_new_sessions": "Se aplica a las sesiones iniciadas a partir de ahora. Las sesiones abiertas conservan el adaptador con el que empezaron.",
+        "not_enabled_in_this_build": "No habilitado en esta compilación: {{backends}}. Consulta la documentación sobre adaptadores de ACP experimentales.",
+        "level_supported": "Compatible",
+        "level_degraded": "Funciona de forma diferente",
+        "level_unavailable": "No disponible",
+        "cap_session_sharing": "Entorno compartido de subagentes",
+        "cap_reasoning_effort": "Esfuerzo de razonamiento",
+        "cap_mcp_tool_search": "Búsqueda de herramientas MCP",
+        "cap_agent_profiles": "Perfiles de agente",
+        "cap_slash_commands": "Comandos de barra",
+        "cap_turn_usage": "Uso por turno",
+        "cap_billing": "Costes y límites",
+        "cap_native_resume": "Reanudar sesión",
+        "cap_registry_model_ids": "Usa el catálogo de modelos de Kiro",
+        "cap_mid_turn_steer": "Redirección a mitad de turno",
+        "confirm_title": "¿Cambiar a {{backend}}?",
+        "confirm_body": "Este adaptador es experimental. {{count}} de {{total}} funciones de Kiro Crew se comportan de forma diferente, no están disponibles o no se han verificado.",
+        "confirm_open_sessions": "Las sesiones abiertas no se ven afectadas y conservan su adaptador actual.",
+        "cancel": "Cancelar",
+        "confirm_switch": "Cambiar adaptador",
+        "confirm_prerequisites": "Ejecute esto primero en el host de la puerta de enlace, en orden.",
+        "not_installed": "Adaptador no instalado",
+        "level_unverified": "Sin verificar",
+        "routing_routed": "Las llamadas a herramientas llegan a la puerta de seguridad de {{productName}}",
+        "routing_indeterminate": "El enrutamiento de llamadas a herramientas no está verificado — las sesiones nuevas se rechazarán",
+        "routing_bypassed": "Las llamadas a herramientas eludirían la puerta de seguridad de {{productName}} — las sesiones nuevas se rechazarán",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "Se permiten herramientas sin control. Las reglas de comandos denegados, el bloqueo de rutas sensibles y el techo de gobernanza no se consultan para las llamadas autoaprobadas de este backend."
       }
     },
     "overviewPage": {
@@ -10841,11 +10892,8 @@
       "owning_session": "Sesión propietaria"
     },
     "servicesTab": {
-      "channels": "Canales",
-      "connect_error": "Error de conexión",
       "connected": "Conectado",
       "cpu": "CPU %",
-      "discord": "Discord",
       "embeddings": "Embeddings",
       "gateway_process": "Proceso del gateway",
       "governance": "Gobernanza",
@@ -10853,7 +10901,6 @@
       "governance_tip_degraded": "Una comprobación de gobernanza falló de forma restrictiva, se detectó una discrepancia de integridad o la política de admisión no está verificada (ausente o ilegible). Revisa el registro de auditoría SEL.",
       "governance_tip_disabled": "No hay ninguna política de admisión en modo de aplicación configurada (valor predeterminado permisivo). Los plugins se admiten a menos que se prohíban explícitamente.",
       "governance_tip_unknown": "El estado de gobernanza aún no se ha determinado en esta sesión.",
-      "imessage": "iMessage",
       "mcp_process_breakdown": "{{total}} ({{sandbox}} en sandbox · {{provider}} {{providerLabel}} · {{mcp}} mcp)",
       "mcp_process_breakdown_unique": "{{total}} únicos ({{sandbox}} en sandbox · {{provider}} {{providerLabel}} · {{mcp}} mcp)",
       "mcp_processes": "Procesos MCP",
@@ -10870,16 +10917,22 @@
       "status_disabled": "Desactivado",
       "status_unknown": "Desconocido",
       "stopped": "Detenido",
-      "teams": "Microsoft Teams",
-      "telegram": "Telegram",
       "threads": "Hilos",
       "uptime": "Tiempo activo",
+      "working_directory": "Directorio de trabajo",
+      "channels": "Canales",
+      "connect_error": "Error de conexión",
+      "discord": "Discord",
+      "imessage": "iMessage",
+      "teams": "Microsoft Teams",
+      "telegram": "Telegram",
       "webex": "Webex",
       "wecom": "WeCom",
       "weixin": "WeChat",
       "whatsapp": "WhatsApp",
       "feishu": "Feishu",
-      "working_directory": "Directorio de trabajo"
+      "acp_backend": "Adaptador de ACP",
+      "acp_backend_experimental": "{{label}} (experimental)"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "Filtro aproximado (coincidencia parcial)",

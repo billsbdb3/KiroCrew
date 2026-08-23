@@ -21,6 +21,7 @@ latched value can be arbitrarily stale. That splits the callers in two:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -245,10 +246,38 @@ async def reject_if_kiro_unverified(request: web.Request) -> web.Response | None
     :func:`kiro_verified_ready` — a stale ``ready=True`` is as dangerous as a
     stale ``ready=False`` here (it authorizes the history rewrite or the
     browser-opening spawn), and only these paths pay for the re-probe.
-    """
 
+    **Backend scope.** Every probe behind this latch asks about ``kiro-cli``:
+    whether it is installed, and whether it is signed in. On a host running
+    another ACP backend those questions are not merely irrelevant, they are
+    unanswerable — ``kiro-cli`` may not exist — so the latch would sit at
+    not-ready forever and refuse resume, regenerate, rewind and
+    ``/v1/chat/completions`` permanently while ordinary sends (deliberately
+    ungated) kept working. That asymmetry is worse than either extreme, so the
+    gate opens.
+
+    Checked BEFORE ``kiro_verified_ready`` on purpose: the point is to skip the
+    probe, not to run it and ignore the answer. The probe spawns a subprocess.
+    """
+    if await asyncio.to_thread(_configured_acp_backend):
+        return None
     if await kiro_verified_ready(_service(request)):
         _clear_refusal_warning()
         return None
     _warn_refused_once(_log_safe_path(request))
     return web.json_response(_KIRO_NOT_READY_RESPONSE, status=503)
+
+
+def _configured_acp_backend() -> str:
+    """The configured non-default ACP backend, or ``""`` for kiro-cli.
+
+    Fails closed to ``""`` — an unreadable config keeps the kiro gate in force
+    rather than opening it, since opening it is the permissive direction.
+    """
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return KiroCrewConfig.load().agent.acp_backend or ""
+    except Exception:
+        logger.debug("Could not read agent.acp_backend for the readiness gate", exc_info=True)
+        return ""

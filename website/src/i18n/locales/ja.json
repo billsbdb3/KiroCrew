@@ -45,7 +45,6 @@
     "iam_identity_center": "IAM Identity Center",
     "installing_packages": "パッケージをインストール中",
     "k_search_for_anything": "⌘K — 何かを検索…",
-    "kiro_credit_usage_api_key": "Kiro クレジット使用状況 — API キー認証では利用不可",
     "kiro_credit_usage_checking": "Kiro クレジット使用状況 — 確認中…",
     "kiro_credit_usage_checking_2": "Kiro クレジット使用状況 — 確認中",
     "kiro_credit_usage_unavailable": "Kiro クレジット使用状況 — 利用不可",
@@ -109,7 +108,11 @@
     "open_command_bar": "Command Bar を開く",
     "focus_mode": "フォーカスモード",
     "focus_mode_title": "フォーカスモード · Alt+Shift+M",
-    "focus_mode_title_mac": "フォーカスモード · ⌥⇧M"
+    "focus_mode_title_mac": "フォーカスモード · ⌥⇧M",
+    "kiro_credit_usage_api_key": "Kiro クレジット使用状況 — API キー認証では利用不可",
+    "active_harness": "エージェントハーネス: {{label}}",
+    "active_harness_open_settings": "エージェントハーネス: {{label}} — ACP アダプターの設定を開く",
+    "harness_new_sessions": "新しいセッション"
   },
   "appSdk": {
     "chatEmbed": {
@@ -4685,6 +4688,11 @@
       "all_tools_will_get_auto_approved_across_all_sess": "すべてのツールはすべてのセッション全体で自動承認されます。",
       "approval_mode": "承認モード",
       "approval_mode_aria": "承認モード: {{mode}}",
+      "auto_confirm_body": "{{productName}} にはそれらのツール呼び出しは見えません。承認ゲートをスキップします。",
+      "auto_confirm_title": "このアダプターはツールを自身で承認します",
+      "auto_desc": "このアダプターはツール呼び出しを自身で承認します。{{productName}} は確認できません。",
+      "auto_label": "Auto",
+      "auto_tooltip": "このアダプターはツール呼び出しを自身で承認します — {{productName}} には見えません",
       "cancel": "キャンセル",
       "configure_duration": "期間を設定",
       "don_t_show_again": "二度と表示しない",
@@ -4927,13 +4935,6 @@
       "more_actions": "その他の操作"
     },
     "chatInput": {
-      "send_a_message_or_tap_the_mic_for_voice": "メッセージを送信、またはマイクをタップして音声入力",
-      "release_to_transcribe": "離して文字起こし",
-      "hold_to_talk": "押して話す",
-      "release_to_cancel": "離してキャンセル",
-      "slide_up_to_cancel": "上にスワイプでキャンセル",
-      "switch_to_keyboard": "キーボードに切り替え",
-      "switch_to_voice": "音声に切り替え",
       "drop_to_attach": "ドロップして添付",
       "add_files_options": "ファイルとオプションを追加",
       "agent": "エージェント：{{name}}",
@@ -5024,8 +5025,21 @@
       "use_a_skill": "スキルを使用",
       "used": "使用済み",
       "voice_input": "音声入力",
+      "send_a_message_or_tap_the_mic_for_voice": "メッセージを送信、またはマイクをタップして音声入力",
+      "release_to_transcribe": "離して文字起こし",
+      "hold_to_talk": "押して話す",
+      "release_to_cancel": "離してキャンセル",
+      "slide_up_to_cancel": "上にスワイプでキャンセル",
+      "switch_to_keyboard": "キーボードに切り替え",
+      "switch_to_voice": "音声に切り替え",
       "finishing": "処理中…",
-      "keep_holding_to_record": "押したままで録音"
+      "keep_holding_to_record": "押したままで録音",
+      "plan_limit": "プラン上限",
+      "limit_type": "上限の種類",
+      "resets": "リセット",
+      "rate_limit_allowed": "正常",
+      "rate_limit_warning": "上限に近い",
+      "rate_limit_rejected": "制限中"
     },
     "chatPane": {
       "agent_list": "エージェントリスト",
@@ -6505,25 +6519,6 @@
       "triggers": "トリガー",
       "what_this_skill_does_and_when_the_agent_should_u": "このスキルが何をするか、およびエージェントがいつそれを使用すべきかの説明"
     },
-    "projectSkillsTrust": {
-      "body": "${{skill}} はこのプロジェクト自身の .kiro/skills フォルダーにあります。",
-      "confirm": "このフォルダーを信頼",
-      "consequence": "このフォルダーを信頼すると、その中のスキルファイルがこのチャットのコンテキストに読み込まれ、エージェントにコマンドの実行を指示できるようになります。信頼していいのは、心当たりのあるプロジェクトだけです。",
-      "decline": "今はしない",
-      "decline_consequence": "拒否した場合、何も読み込まれず、メッセージは入力したままになります。",
-      "grant_failed": "このフォルダーの信頼を記録できませんでした。",
-      "title": "このプロジェクトのスキルを信頼しますか？",
-      "withdraw_hint": "これは後でスキル設定ページから取り消せます。",
-      "working": "信頼中…"
-    },
-    "projectSkillsTrustList": {
-      "folder_missing": "このフォルダーはもう存在しません。",
-      "hint": "これらのプロジェクトフォルダーは、独自のスキルをチャットに読み込めます。フォルダーの信頼を取り消すと、そのスキルは読み込まれなくなります。",
-      "revoke": "取り消す",
-      "revoke_failed": "このフォルダーの信頼を取り消せませんでした。",
-      "revoking": "取り消し中…",
-      "title": "信頼済みのプロジェクトフォルダー"
-    },
     "skillPickerMenu": {
       "loading_skills": "スキルを読み込み中…",
       "no_matching_skills": "一致するスキルがありません",
@@ -6708,23 +6703,6 @@
       "no_matches_for": "一致しません:",
       "no_noun_match": "{{noun}}に一致しません"
     },
-    "updateFoundModal": {
-      "copied": "コピーしました",
-      "copy_command": "コマンドをコピー",
-      "could_not_save_choice": "選択を保存できませんでした。再読み込み後に再度表示される場合があります。",
-      "dismiss": "閉じる",
-      "download": "ダウンロード",
-      "nothing_downloads_until_you_choose_to": "同意するまで何もダウンロードされません。",
-      "remind_me_tomorrow": "明日もう一度知らせる",
-      "skip_this_version": "このバージョンをスキップ",
-      "update_available": "アップデートがあります",
-      "update_failed": "アップデートに失敗しました。「設定 → 概要」からもう一度お試しください。",
-      "update_now": "今すぐアップデート",
-      "updating": "アップデート中…",
-      "updating_and_restarting": "アップデートして再起動しています…",
-      "version_is_available": "{{productName}} <0>{{version}}</0> が利用可能です。",
-      "you_can_update_anytime_from_settings_about": "「設定 → 概要」からいつでもアップデートできます。"
-    },
     "updateModal": {
       "back_to_dashboard": "ダッシュボードに戻る",
       "dismiss": "閉じる",
@@ -6740,13 +6718,6 @@
       "restarting": "再起動中…",
       "the_app_will_stop_the_local_gateway_install_the": "アプリはローカルゲートウェイを停止し、更新をインストールして再起動します。",
       "update_ready": "更新準備完了"
-    },
-    "updatePill": {
-      "downloading": "ダウンロード中…",
-      "downloading_percent": "ダウンロード中 {{percent}}%",
-      "open_update_settings": "アップデート設定を開く",
-      "update_available": "アップデートあり",
-      "update_ready": "アップデート準備完了"
     },
     "voiceDictationPanel": {
       "esc_to_cancel_click_mic_to_finish": "Escキーでキャンセル、マイクをクリックして終了",
@@ -7016,6 +6987,49 @@
       "billing_notice": "これは有料の AWS サービスです。確認するまでリクエストは送信されません。",
       "confirm_button": "確認して有効化",
       "withdraw": "確認を取り消す"
+    },
+    "projectSkillsTrust": {
+      "body": "${{skill}} はこのプロジェクト自身の .kiro/skills フォルダーにあります。",
+      "confirm": "このフォルダーを信頼",
+      "consequence": "このフォルダーを信頼すると、その中のスキルファイルがこのチャットのコンテキストに読み込まれ、エージェントにコマンドの実行を指示できるようになります。信頼していいのは、心当たりのあるプロジェクトだけです。",
+      "decline": "今はしない",
+      "decline_consequence": "拒否した場合、何も読み込まれず、メッセージは入力したままになります。",
+      "grant_failed": "このフォルダーの信頼を記録できませんでした。",
+      "title": "このプロジェクトのスキルを信頼しますか？",
+      "withdraw_hint": "これは後でスキル設定ページから取り消せます。",
+      "working": "信頼中…"
+    },
+    "projectSkillsTrustList": {
+      "folder_missing": "このフォルダーはもう存在しません。",
+      "hint": "これらのプロジェクトフォルダーは、独自のスキルをチャットに読み込めます。フォルダーの信頼を取り消すと、そのスキルは読み込まれなくなります。",
+      "revoke": "取り消す",
+      "revoke_failed": "このフォルダーの信頼を取り消せませんでした。",
+      "revoking": "取り消し中…",
+      "title": "信頼済みのプロジェクトフォルダー"
+    },
+    "updateFoundModal": {
+      "copied": "コピーしました",
+      "copy_command": "コマンドをコピー",
+      "could_not_save_choice": "選択を保存できませんでした。再読み込み後に再度表示される場合があります。",
+      "dismiss": "閉じる",
+      "download": "ダウンロード",
+      "nothing_downloads_until_you_choose_to": "同意するまで何もダウンロードされません。",
+      "remind_me_tomorrow": "明日もう一度知らせる",
+      "skip_this_version": "このバージョンをスキップ",
+      "update_available": "アップデートがあります",
+      "update_failed": "アップデートに失敗しました。「設定 → 概要」からもう一度お試しください。",
+      "update_now": "今すぐアップデート",
+      "updating": "アップデート中…",
+      "updating_and_restarting": "アップデートして再起動しています…",
+      "version_is_available": "{{productName}} <0>{{version}}</0> が利用可能です。",
+      "you_can_update_anytime_from_settings_about": "「設定 → 概要」からいつでもアップデートできます。"
+    },
+    "updatePill": {
+      "downloading": "ダウンロード中…",
+      "downloading_percent": "ダウンロード中 {{percent}}%",
+      "open_update_settings": "アップデート設定を開く",
+      "update_available": "アップデートあり",
+      "update_ready": "アップデート準備完了"
     },
     "confirmDialog": {
       "cancel": "キャンセル"
@@ -9086,7 +9100,9 @@
       "featurePreviewsTab": {
         "inbound_webhook_tokens_registered_contexts_and_r": "受信 Webhook のトークン、登録済みコンテキスト、実行履歴。API は動作しますが、ページは未完成です。",
         "open_webhooks": "Webhooks を開く",
-        "webhooks": "Webhooks"
+        "webhooks": "Webhooks",
+        "acp_backends": "ACP アダプター",
+        "experimental_acp_backends_claude_code_and_openai": "Kiro CLI の代わりとなる Claude Code と OpenAI Codex。拒否パスはテスト済みですが、セッションの成功は確認されていません。"
       }
     },
     "developerPage": {
@@ -10215,6 +10231,41 @@
         "vector_memory": "ベクトルメモリ",
         "vector_memory_is_initializing_the_embedding_mode": "ベクトルメモリが初期化中です。埋め込みモデル（約610MB）はバックグラウンドで自動的にダウンロードされ、レガシーメモリは自動的に移行します — 操作は不要です。",
         "verifying_model_integrity": "モデルの整合性を確認中…"
+      },
+      "acpBackend": {
+        "title": "ACP アダプター",
+        "experimental": "実験的",
+        "all_features_supported": "デフォルト。すべての機能がサポートされています。",
+        "features_differ": "{{total}} 個中 {{count}} 個の機能は動作が異なるか、利用不可、または未検証です。",
+        "show_what_changes": "変更点を表示",
+        "applies_to_new_sessions": "今後開始するセッションに適用されます。開いているセッションは開始時のアダプターを維持します。",
+        "not_enabled_in_this_build": "このビルドでは有効化されていません: {{backends}}。実験的な ACP アダプターのドキュメントを参照してください。",
+        "level_supported": "サポート済み",
+        "level_degraded": "動作が異なる",
+        "level_unavailable": "利用不可",
+        "cap_session_sharing": "共有サブエージェントランタイム",
+        "cap_reasoning_effort": "推論の深さ",
+        "cap_mcp_tool_search": "MCP ツール検索",
+        "cap_agent_profiles": "エージェントプロファイル",
+        "cap_slash_commands": "スラッシュコマンド",
+        "cap_turn_usage": "ターンごとの使用量",
+        "cap_billing": "コストと制限",
+        "cap_native_resume": "セッションの再開",
+        "cap_registry_model_ids": "Kiro モデルカタログを使用",
+        "cap_mid_turn_steer": "ターン中の軌道修正",
+        "confirm_title": "{{backend}} に切り替えますか？",
+        "confirm_body": "このアダプターは実験的です。{{total}} 個中 {{count}} 個の Kiro Crew 機能は動作が異なるか、利用不可、または未検証です。",
+        "confirm_open_sessions": "開いているセッションは影響を受けず、現在のアダプターを維持します。",
+        "cancel": "キャンセル",
+        "confirm_switch": "アダプターを切り替える",
+        "confirm_prerequisites": "最初にゲートウェイホストで次のコマンドを順番に実行してください。",
+        "not_installed": "アダプター未インストール",
+        "level_unverified": "未検証",
+        "routing_routed": "ツール呼び出しは {{productName}} のセキュリティゲートに到達します",
+        "routing_indeterminate": "ツール呼び出しのルーティングは未検証です — 新しいセッションは拒否されます",
+        "routing_bypassed": "ツール呼び出しは {{productName}} のセキュリティゲートを迂回します — 新しいセッションは拒否されます",
+        "routing_reason": "{{reason}}",
+        "ungated_opt_out": "ゲートなしのツールが許可されています。拒否コマンド規則、機密パスのブロック、ガバナンス上限は、このバックエンドの自己承認呼び出しでは参照されません。"
       }
     },
     "overviewPage": {
@@ -10559,11 +10610,8 @@
       "owning_session": "所有セッション"
     },
     "servicesTab": {
-      "channels": "チャネル",
-      "connect_error": "接続エラー",
       "connected": "接続済み",
       "cpu": "CPU %",
-      "discord": "Discord",
       "embeddings": "エンベディング",
       "gateway_process": "ゲートウェイプロセス",
       "governance": "ガバナンス",
@@ -10571,7 +10619,6 @@
       "governance_tip_degraded": "ガバナンスチェックがフェイルクローズで失敗したか、整合性の不一致が検出されたか、受け入れポリシーを検証できませんでした（未設定または読み取り不可）。SEL 監査ログを確認してください。",
       "governance_tip_disabled": "強制適用する受け入れポリシーは設定されていません（許可が既定）。プラグインは明示的に禁止されていない限り受け入れられます。",
       "governance_tip_unknown": "ガバナンスステータスはこのセッションではまだ決定されていません。",
-      "imessage": "iMessage",
       "mcp_process_breakdown": "{{total}}（サンドボックス {{sandbox}} · {{providerLabel}} {{provider}} · MCP {{mcp}}）",
       "mcp_process_breakdown_unique": "一意 {{total}}（サンドボックス {{sandbox}} · {{providerLabel}} {{provider}} · MCP {{mcp}}）",
       "mcp_processes": "MCP プロセス",
@@ -10588,16 +10635,22 @@
       "status_disabled": "無効",
       "status_unknown": "不明",
       "stopped": "停止",
-      "teams": "Microsoft Teams",
-      "telegram": "Telegram",
       "threads": "スレッド",
       "uptime": "稼働時間",
+      "working_directory": "作業ディレクトリ",
+      "channels": "チャネル",
+      "connect_error": "接続エラー",
+      "discord": "Discord",
+      "imessage": "iMessage",
+      "teams": "Microsoft Teams",
+      "telegram": "Telegram",
       "webex": "Webex",
       "wecom": "WeCom",
       "weixin": "WeChat",
       "whatsapp": "WhatsApp",
       "feishu": "Feishu",
-      "working_directory": "作業ディレクトリ"
+      "acp_backend": "ACP アダプター",
+      "acp_backend_experimental": "{{label}}（実験的）"
     },
     "sessionArchive": {
       "fuzzy_filter_substring_match": "ファジィフィルタ（部分文字列マッチ）",

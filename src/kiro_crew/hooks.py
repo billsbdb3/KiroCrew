@@ -23,6 +23,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any
 
 from kiro_crew import platform_compat, security, webhooks
 from kiro_crew.config import paths as _config_paths
@@ -2119,10 +2120,13 @@ def safe_write_file_nolink(
     # nothing on the source to lose. Any OTHER failure means we cannot know what
     # we would be dropping, so it refuses.
     src_xattrs: list[tuple[str, bytes]] = []
-    if all(hasattr(os, a) for a in ("listxattr", "getxattr", "setxattr")):
+    list_xattr: Any = getattr(os, "listxattr", None)
+    get_xattr: Any = getattr(os, "getxattr", None)
+    set_xattr: Any = getattr(os, "setxattr", None)
+    if all(callable(fn) for fn in (list_xattr, get_xattr, set_xattr)):
         try:
-            for _attr in os.listxattr(fd):
-                src_xattrs.append((_attr, os.getxattr(fd, _attr)))
+            for _attr in list_xattr(fd):
+                src_xattrs.append((_attr, get_xattr(fd, _attr)))
         except OSError as exc:
             if exc.errno not in _XATTR_UNSUPPORTED_ERRNOS:
                 logger.warning(
@@ -2243,7 +2247,7 @@ def safe_write_file_nolink(
             # loop cannot be affected by a path that moved since.
             for attr, value in src_xattrs:
                 try:
-                    os.setxattr(tfd, attr, value)
+                    set_xattr(tfd, attr, value)
                 except OSError:
                     if _is_access_control_xattr(attr):
                         logger.warning(

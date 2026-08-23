@@ -3,7 +3,7 @@ import { ArrowRight } from 'lucide-react'
 
 import { SettingsCard, SettingsToggle } from '../../components/settings'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
+import { PREVIEW_ACP_BACKENDS, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
 import { i18nT } from '../../i18n/t'
 
 /**
@@ -38,8 +38,10 @@ import { i18nT } from '../../i18n/t'
 export function FeaturePreviewsTab() {
   const navigate = useNavigate()
   const webhooks = usePreviewFlag(PREVIEW_WEBHOOKS)
+  const acpAdapters = usePreviewFlag(PREVIEW_ACP_BACKENDS)
 
   return (
+    <>
     <SettingsCard>
       <SettingsToggle
         label={i18nT('pages.developer.featurePreviewsTab.webhooks')}
@@ -64,5 +66,18 @@ export function FeaturePreviewsTab() {
         </div>
       )}
     </SettingsCard>
+    {/* Its own card, per this page's one-card-per-feature rule. No ingress
+        button: unlike Webhooks this flag reveals a CONTROL on pages the operator
+        is already looking at (Developer > Config, and a row on System >
+        Services) rather than unlocking a page to navigate to. */}
+    <SettingsCard>
+      <SettingsToggle
+        label={i18nT('pages.developer.featurePreviewsTab.acp_backends')}
+        description={i18nT('pages.developer.featurePreviewsTab.experimental_acp_backends_claude_code_and_openai')}
+        checked={acpAdapters}
+        onChange={v => setPreviewFlag(PREVIEW_ACP_BACKENDS, v)}
+      />
+    </SettingsCard>
+    </>
   )
 }

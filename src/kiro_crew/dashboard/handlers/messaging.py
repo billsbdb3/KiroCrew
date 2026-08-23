@@ -342,9 +342,14 @@ async def api_spawn_steer(request: web.Request) -> web.Response:
                 headers={"Retry-After": "5"},
             )
         return web.json_response({"error": detail, "code": "steer_failed"}, status=502)
-    return web.json_response(
-        {"id": agent_id, "status": "follow_up_queued" if mode == "follow_up" else "steered"}
-    )
+    queued = mode == "follow_up" or detail.startswith("follow_up")
+    payload: dict[str, str] = {
+        "id": agent_id,
+        "status": "follow_up_queued" if queued else "steered",
+    }
+    if queued and detail.startswith("follow_up"):
+        payload["reason"] = detail
+    return web.json_response(payload)
 
 
 async def api_spawn_release(request: web.Request) -> web.Response:

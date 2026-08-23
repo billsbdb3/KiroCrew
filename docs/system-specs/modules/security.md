@@ -1566,6 +1566,129 @@ imported function-locally to avoid the `kiro_crew.dashboard` package cycle.
 - **No regex URL linkification in HTML strings** — use React elements via `.split()`
 - **Shell injection prevention** — `/etc/hosts` update uses `sudo tee -a` (not `sh -c echo`)
 
+## ACP backend tool-gate routing
+
+Kiro Crew's PreToolUse gate — the bundled denied-command rules, the sensitive-path
+block, the governance ceiling — runs from exactly one place,
+`HookManager.on_tool_call`, reached only from the `EVENT_PERMISSION_REQUEST` branch
+of the dispatch parser. **A backend that does not send
+`session/request_permission` per tool call is a backend where none of those
+controls execute.** How each backend is made to ask is therefore a security
+property, recorded as `Routing` on its descriptor:
+
+| Routing | Backend | Established by |
+|---|---|---|
+| `AGENT_SPEC` | kiro-cli, KAS | the spawn names an agent — true by construction, nothing to probe |
+| `SEEDED_SETTINGS` | claude-agent-acp | Kiro Crew writes `permissions.defaultMode: "default"` and reads it back |
+| `SESSION_CONFIG` | codex-acp | the ACP v1 session advertises a config option (`mode`) whose enforced value (`read-only`) makes privileged tools ask; applied and verified per session |
+| `EXTERNAL_POLICY` | — | the decision lives in the adapter's own config file, which Kiro Crew does not own and must probe |
+| `CLIENT_DELEGATED` | — | the adapter performs no privileged operation itself and delegates to client callbacks |
+| `UNVERIFIED` | unknown registry adapters | no verified mechanism — fails closed |
+
+**Why codex-acp is `SESSION_CONFIG` and not `EXTERNAL_POLICY`.** Probing
+`approval_policy` in `$CODEX_HOME/config.toml` reads a file the ACP session does
+not honour: codex-acp starts these sessions in its own default **agent** mode,
+which permits commands and file writes *inside the workspace* without emitting
+`session/request_permission` at all. A host-side probe of that file therefore
+resolved `ROUTED` for a session that was ungated in practice — measured as 166
+execute/edit operations with zero permission frames, detected only by Layer 2
+after the writes had already landed. The enforceable boundary is the session's own
+advertised `mode` selector, so the descriptor carries
+`permission_config_id`/`permission_config_value` and the client applies it before
+the first prompt rather than trusting an out-of-band file. `read-only` still
+permits passive reads; commands and changes request approval. ACP v1 offers no way
+to make an adapter ask for passive reads, so the **Reads** approval mode's promise
+holds and **Normal** is honest about changes, which is the contract that matters.
+
+`acp/tool_gate.py` resolves one of three verdicts and enforces it in two layers.
+
+**Verdicts.** `ROUTED`, `BYPASSED`, or `INDETERMINATE`. INDETERMINATE is not a
+synonym for "probably fine": a guarantee that lapses whenever a file is unreadable
+is not a guarantee, so it is enforced exactly like BYPASSED. It is a distinct value
+only so the operator-facing message can say "could not determine" rather than
+asserting a policy the file never contained.
+
+**A `SESSION_CONFIG` verdict is a contract, not a probe.** `resolve_verdict`
+returns `ROUTED` with the reason "the client enforces `<id>=<value>` before the
+first prompt", because there is nothing on disk to read — the option lives on the
+session, which does not exist yet. The claim is discharged in
+`AcpClient._apply_session_permission_routing`, inside the `session/new` /
+`session/load` handshake and **before** `session/prompt` can run:
+`tool_gate.session_config_issue` requires this session to have advertised that
+exact option id carrying that exact value, and `set_config_option` must be
+accepted. A missing option, a missing value, a malformed `configOptions`, or a
+rejected write routes to `tool_gate.enforce_runtime_routing`, which raises
+`AcpToolGateUnroutable` under the same opt-out rule as Layer 1. Absence is not
+read as lazy advertising the way an optional model/effort option is: the
+difference is that the first prompt would otherwise run ungated. Because it runs
+inside the handshake, a **resumed** session re-verifies rather than inheriting a
+mode the previous process set.
+
+The leftover Codex file probe (`acp/codex.py` `routing_verdict`) still resolves
+the **effective** `approval_policy`, preferring `[profiles.<name>].approval_policy`
+over the top-level key when a `profile` is selected. Reading only the top level is
+wrong in BOTH directions — a profile can bypass a routed top-level value, or
+tighten a bypassing one — and that is why the historical probe answered ROUTED
+for an ungated session. It is diagnosis only: `SESSION_CONFIG` Layer 1 does not
+call it, and a missing TOML parser is no longer a start refusal.
+
+**Layer 1, pre-flight.** `AcpClient._spawn` enforces before the subprocess exists,
+so a session that cannot be governed never gets a process to run tools in. A
+non-`ROUTED` verdict raises `AcpToolGateUnroutable` (an `AcpError` subclass so
+branch-less callers degrade to generic handling), which the `ensure_ready` retry
+ladder treats as non-retryable. File-backed routing (`SEEDED_SETTINGS`) is a
+configuration fact on disk, so respawning re-reads the same file.
+`SESSION_CONFIG` has nothing on disk to read: Layer 1 is the contract that the
+handshake will apply the advertised option before the first prompt.
+
+**Layer 2, in band.** An execute-kind tool completing on any backend whose routing
+is not `AGENT_SPEC`, with no `session/request_permission` ever seen, records a
+`log_governance_degraded` SEL event and warns, once per process. This is
+**detection, not prevention**: by the time the frame arrives the adapter has
+already run the command. Its purpose is to catch a config that claimed the backend
+asks while it does not. `AGENT_SPEC` backends are exempt — they auto-approve
+read-only tools without a permission frame by design, so including them would emit
+a false positive every session.
+
+**The opt-out.** `agent.acp_backend_allow_ungated_tools`, default off, is the one
+named way to start a session anyway. When on: a warning naming the unenforced
+controls at every session start, a SEL event, and a `kirocrew doctor` issue — the
+doctor reports it even when the current verdict is ROUTED, because it disarms the
+refusal for future sessions too. It is also required before a live goose session
+may enter permission mode `auto`; the mode picker is withheld and the mode-change
+endpoint refuses while the opt-out is off. Auto cannot become a second bypass.
+
+**The claude seed is conservative.** Kiro Crew writes `defaultMode` only when
+nothing is configured, and never overwrites a configured mode — not even to
+strengthen it. An explicitly configured `auto` is somebody's decision; the session
+refuses instead, with the opt-out as the documented way through. The probe reads
+the file back after seeding, so a silently failed write surfaces as INDETERMINATE
+rather than passing.
+
+**Credential stores.** Each backend's credential leaf is on
+`_SENSITIVE_HOME_DIRS`; Codex contributes `.codex/auth.json` — the leaf, not the
+directory, because blocking it would hide `config.toml`. The list is written
+**literally**, not derived from the registry at runtime: importing `acp.backends`
+from `security.py` is an import cycle, and a `try/except` around it swallows the
+failure and silently protects nothing. `test_acp_backend_credentials_are_protected`
+is the contract that keeps the two in step.
+
+Measured coverage, correcting a claim inherited from the reference fork: one leaf
+entry arms the `fs_read`/`fs_write` gate and the absolute-path bash matcher, and
+does **not** arm relative-path traversal. `cd ~/.codex && cat auth.json` is not
+blocked — nor is `cd ~/.docker && cat config.json` or `cd ~/.kube && cat config`,
+so the gap is general to file-shaped entries rather than specific to this backend.
+Directory entries (`.ssh`, `.aws`) are blocked. Recorded for its own reviewed
+change rather than patched here.
+
+**Agent profiles.** A spec adapter sends no `session/set_mode`, so a custom agent
+whose spec withholds shell would silently gain the adapter's unrestricted shell —
+a privilege escalation for exactly the restricted app and subagent agents whose
+narrowed tool set IS their boundary. `acp/spec_agent_guard.py` refuses that
+combination. An unreadable spec is treated as unverifiable rather than permissive,
+since otherwise making a spec unreadable would convert a refusal into an approval.
+Agents Kiro Crew itself authors are exempt.
+
 ## Security Rules for Development
 
 When writing new code, these rules MUST be followed:

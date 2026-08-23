@@ -26,11 +26,9 @@ there is exactly one concrete provider — `agent.provider` is fixed to `acp`.
 
 **Note:** the removed Bedrock provider and the removed standalone provider were
 **deleted** during de-Amazoning, along with their config fields and the
-multi-provider dispatch factory. `acp/client.py` keeps a dormant
-`ACP_BACKEND_CLAUDE` seam (`AcpProvider` can in principle drive
-`claude-agent-acp`) so an internal companion can re-register a Claude backend,
-but the public provider factory never selects it — `kiro-cli` is the only
-backend.
+multi-provider dispatch factory. `agent.provider` stays `acp`. `AcpProvider` can
+drive a registry adapter (`claude-agent-acp`, `codex-acp`, …) selected at
+`agent.acp_backend`. There is no second `LLMProvider` and no provider selector.
 See [`../features/claude-code-provider.md`](../features/claude-code-provider.md).
 
 ### LLMProvider ABC (`providers/base.py`)
@@ -44,6 +42,7 @@ class LLMProvider(ABC):
     async def reject_tool(request_id) -> None
     def context_usage_pct() -> float
     # Optional (have defaults):
+    def rate_limit_payload() -> dict | None
     async def stream_command(command: str) -> AsyncIterator[LLMEvent]
     async def compact(context: str = "") -> None
     async def wait_for_compaction(timeout: float = COMPACT_WAIT_TIMEOUT_SECS) -> dict
@@ -76,13 +75,14 @@ Provider-agnostic event dataclass (aliased from `AcpEvent`):
 The sole provider. Spawns a long-lived `kiro-cli acp --agent <name>` subprocess
 and speaks JSON-RPC 2.0 over stdio.
 
-**Dormant backend seam:** `AcpProvider`/`AcpClient` retain an `acp_backend`
-parameter (`"" ` → kiro-cli; `"claude"` / `ACP_BACKEND_CLAUDE` → `claude-agent-acp`)
-so an internal companion can re-register a Claude backend over the same
-client. **The public provider factory only ever selects kiro-cli** — the claude
-branch is unreachable in this build. Its binary-resolution + config-isolation
-details live in [`acp-client.md`](acp-client.md); do not re-add the registration
-glue or a provider selector (see the repo-root `CLAUDE.md`).
+**Backend selection:** `AcpProvider`/`AcpClient` take an `acp_backend`
+parameter (`""` → kiro-cli; `"claude"` / `"codex"` / `"goose"` / `"opencode"` /
+`"pi"` / `"kas"`). OpenCode and pi persist those ids; the registry spelling
+`pi-acp` canonicalises onto `pi`.
+The public factory still exposes one `LLMProvider`; `agent.acp_backend` selects
+which adapter that provider drives. Binary-resolution and config-isolation
+details live in [`acp-client.md`](acp-client.md). Do not re-add a second
+`agent.provider` value, an API-key path, or a provider selector.
 
 **Key APIs:**
 - `start()` → `AcpClient.ensure_ready()` (spawns process, handshake, session/new)
@@ -91,6 +91,7 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 - `approve_tool()`/`reject_tool()` → JSON-RPC response
 - `context_usage_pct()` → reads `last_prompt_stats.context_pct`
 - `context_window_tokens()` → reads `last_prompt_stats.context_window_tokens` (the real served window from `usage_update.size`, 0 if unknown). Used by the dashboard token text instead of re-deriving the window from the model id. A mid-session `set_model` (live switch on both `AcpClient` and `AcpSessionHandle`) rebases these stats via `AcpPromptStats.rebase_to_window`: the window is re-derived from `model_registry.model_window` (0 on a registry miss), `context_used_tokens` is kept, `context_pct` is recomputed and clamped, and `context_tokens_from_usage` is cleared so the next metadata `contextUsagePercentage` can backfill against the NEW model instead of being gated forever by the old model's `usage_update`. The dashboard model-switch endpoint then broadcasts one `context_usage` WS event with `reset: true` (both live-switch and session-reset paths, single and bulk), which lets the frontend reducer replace or delete its stored per-slot token counts — per-turn events without `reset` never delete. The post-compaction pct-0 broadcast carries the same flag.
+- `rate_limit_payload()` → `last_prompt_stats.rate_limit.to_payload()`, or `None` when the harness reports no plan quota (the ABC default, which is most of them). A capability on the ABC with a safe default rather than a `hasattr` probe at the call site (H8): `_context_usage_payload` gates on `isinstance(client, LLMProvider)` and attaches the dict to the existing `context_usage` WS frame under `rate_limit`. The KEY'S PRESENCE is the frontend's "this harness has a quota" signal, so an empty reading is omitted rather than sent as `{}`; a `reset` on the same frame does not clear it (compaction changes the transcript, not the account). The dashboard renders it as a section of the context popover. One known gap: the reading is held only in the live provider's stats, so a page reload shows no quota row until the next turn's frame restores it — the slot-detail context seed does not carry it.
 - `compact()` → sends `/compact` via `send_command()`
 - `cancel()` → sends `session/cancel` notification
 - `supports_effort()` / `change_effort(level)` / `clear_effort()` → reasoning-effort control (see below)
@@ -108,6 +109,182 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 - **Resume guard:** `session/load` (resume) is only attempted when the prior session transcript exists on disk (`~/.kiro/sessions/cli/<sid>.json`). A stale persisted sid with no transcript falls back to `session/new`, preventing a fresh conversation from replaying old turns (which inflated base context).
 - **Working dir:** `AcpProvider.cwd` overrides the `LLMProvider` ABC default so `session_map` persists the real workspace path. AcpProvider's work_dir lives on the inner client (`_client._work_dir`), so the prior `getattr(provider, "_work_dir", "")` persisted `""` for all ACP sessions — `provider.cwd` fixes resume-cwd-override.
 
+### Backend registry (`acp/backends.py`)
+
+ACP adapters selected at `agent.acp_backend` are a shipped goal. `agent.provider`
+stays fixed to `acp`; there is no API-key path and no provider selector. An
+adapter whose tool calls Kiro Crew cannot govern is refused unless the operator
+names the opt-out. The conditions that remain, and what is still gone, are in
+[`docs/task-specs/2026/08/pluggable-acp-backends/README.md`](../../task-specs/2026/08/pluggable-acp-backends/README.md).
+
+`acp/types.py` owns the backend *vocabulary* — the id constants,
+`ACP_BACKENDS_KNOWN` (what the code understands), `ACP_BACKENDS_SELECTABLE` (what
+an operator may persist), and the `PROVIDER_LABEL_*` values. `acp/backends.py`
+adds the layer above it: one frozen `BackendDescriptor` per backend carrying its
+label, `experimental` flag, protocol `Dialect`, tool-gate `Routing`, sign-in
+command, credential leaves, process markers, and a capability map.
+
+| Field | Purpose |
+|---|---|
+| `dialect` | `KIRO` (date `protocolVersion`, `set_mode`, `set_model`, empty `mcpServers`) or `SPEC` (integer version, `mcpServers` in session params). Spec adapters do not share one config surface: Claude uses `set_config_option`; goose uses `session/set_mode` for its permission pin. |
+| `routing` | How the backend is made to ask before running a tool: `AGENT_SPEC`, `SEEDED_SETTINGS` (Claude `permissions.defaultMode`; OpenCode project `permission: ask`), `SESSION_CONFIG`, `EXTERNAL_POLICY`, `CLIENT_DELEGATED`, `PERMISSION_REQUEST` (pi: privileged tools arrive as `session/request_permission`; goose: same, but only after the client pins session mode `approve` — goose defaults to `auto`, which auto-approves tools; Auto is an explicit picker opt-in on a live goose session that advertised it), or fail-closed `UNVERIFIED` |
+| `permission_config_id` / `permission_config_value` | The ACP v1 session config option and the exact value a `SESSION_CONFIG` backend must accept before its first prompt (codex-acp: `mode` = `read-only`); empty for every other routing |
+| `capabilities` | Per-capability `SUPPORTED` / `DEGRADED` / `UNAVAILABLE` / `UNVERIFIED` |
+
+`supports()` answers `False` for `DEGRADED`, `UNAVAILABLE`, and `UNVERIFIED`, so a
+code gate never treats partial or unmeasured behavior as working. Disclosure
+surfaces read `level()` to preserve the distinction.
+
+`create_provider_factory` accepts a per-call `acp_backend` override
+(`None` = the factory snapshot, `""` = kiro-cli). Dedicated subagent children
+use it to stay on the live parent harness. Capability lookups (registry model
+ids, tool search) follow the effective backend of that call, not the snapshot. The
+warm pool is bypassed when the override differs from `SessionManager.acp_backend`.
+
+**A descriptor records evidence, not inheritance.** KAS uses the Kiro dialect,
+but capabilities not independently measured against KAS are `UNVERIFIED` rather
+than copied from kiro-cli. Known absences remain `UNAVAILABLE`; both states stay
+fail-closed in code while the Settings page and doctor report why.
+
+Selectability is deliberately NOT in the descriptor. It stays in
+`ACP_BACKENDS_SELECTABLE` so there is exactly one answer to "may an operator
+persist this value", and a descriptor cannot drift from it. KAS is fully
+described and is selectable (cli-fronted via `kiro-cli`). Mid-turn steer is
+measured and granted (`ACP_BACKENDS_STEER`); session sharing stays fail-closed
+until keep-aware teardown lands. Spec-adapter steer degrades to follow-up.
+
+Call sites outside a backend's own dialect adapter ask `supports(backend, CAP_X)`
+or `dialect_of(backend)`; they do not compare ids. The module also exports
+`bills_kiro_credits(backend)`, which is a membership question rather than a
+capability level — see § "Credit-billing surface" for why the two cannot be
+collapsed. The eleven `not is_claude`
+inferences that previously meant "kiro" are converted — see
+[`acp-client.md`](acp-client.md) § "Backend Selection".
+
+Shipped modules: `acp/codex.py` (paths, resolution ladder, approval-policy probe,
+MCP shaping, model-id translation), `acp/claude.py` (permission-mode probe and
+seeding), `acp/goose.py` / `acp/pi.py` (owned resolution ladders;
+`PERMISSION_REQUEST` routing; goose pins `session/set_mode` to
+`approve` by default because its own `auto` auto-approves tools;
+the dashboard offers Auto only when that live session advertised it),
+`acp/opencode.py` (owned resolution plus
+`SEEDED_SETTINGS` `permission: ask` seed), `acp/tool_gate.py` (routing verdicts
+and enforcement), `acp/spec_agent_guard.py` (agent-profile fail-closed guard),
+`acp/doctor.py` (doctor rows). Selectable spec adapters that resolve ROUTED
+(goose, OpenCode, pi) start without the ungated-tools opt-out and receive Crew
+MCP on `session/new`. OpenCode is seeded in the session `work_dir` the same
+shape as Claude: write only when nothing is configured, never overwrite
+`allow`, never write `~/.config/opencode`. Pi may leave delivered Crew servers
+inert until `pi-acp` forwards MCP.
+
+### Model list surface (`GET /api/models`)
+
+Every model picker in the dashboard reads one list, through
+`useAvailableModels` → `AcpAdapter.fetchAvailableModels` → this endpoint. The
+backend branch is checked BEFORE the `kiro-cli --list-models` spawn, because on
+another backend that subprocess is both impossible (the binary may be absent) and
+wrong (its ids are kiro-namespace and the other backend rejects them). The
+advertised list from a live session (`session/new`'s `models`) is the only correct
+source there, newest session wins, and lists are never merged across sessions — a
+merge would offer ids the active backend rejects.
+
+Three response shapes, and the shape itself is the discriminator:
+
+| Backend | Shape |
+|---|---|
+| kiro | a **bare JSON array** |
+| non-kiro, advertised | `{"models": [...], "backend": "<id>", "serves_auto": <bool>}` |
+| non-kiro, nothing advertised yet | 503 with `code: "acp_backend_models_unavailable"`, plus the same `backend` and `serves_auto` |
+
+`backend` and `serves_auto` ride the **failure** as well as the success, because
+that 503 is the steady state of an adapter with no live session — it is precisely
+when the client has the least information and has to decide what to render. A
+degraded answer still identifies the namespace, so the client can refuse a cached
+list written for a different one.
+
+**`"auto"` is a kiro-namespace model id, not a protocol concept.** The kiro-agent
+family advertises it as a row of its own list; a spec adapter has no such id
+(claude-agent-acp advertises `default`, codex-acp advertises `openai.*` ids) and
+rejects it at the wire as `-32603`. So `serves_auto` is reported from
+`ACP_BACKENDS_AUTO_MODEL` (harness-parity H6) rather than left for the dashboard
+to infer from the id: "is `backend` non-empty" reads as a kiro test only because
+`ACP_BACKEND_KIRO` is `""`, and it withheld the row from KAS, which speaks kiro's
+dialect and does serve the id. The set is kept separate from
+`ACP_BACKENDS_ACP_RUNTIME` because running on the shared runtime and serving a
+model id are independent claims.
+
+Membership governs only the surfaces that must name a model BEFORE any live list
+exists — the picker's cold-start placeholder and its degraded fallbacks. Once a
+session has advertised, `resolve_usable_model` / `model_is_unusable` gate `"auto"`
+on the advertised set instead, which needs no per-backend knowledge (H12).
+
+Client side (`website/src/providers/adapters/acp.ts`,
+`hooks/useAvailableModels.ts`): the flag is remembered in `localStorage` under
+`kc.acp.servesAuto.v1`, and **absence resolves to "serves it"** — `agent.acp_backend`
+defaults to kiro and kiro is the floor (H1/H4), so a browser that has never seen a
+response must paint what it painted before any adapter existed. The one place that
+default does *not* apply is the namespace-unavailable branch itself: reaching it
+proves the backend is not kiro, so only an explicit `serves_auto: true` in that very
+body keeps the row, and a gateway too old to send the field withholds it. A picker
+offering an unusable `auto` fails in the direction that costs a turn — it renders
+as the only row, so it gets picked, and the failure surfaces as a bare wire error
+with no hint that the row was never real. Showing nothing is the honest degraded
+state; `withAutoFirst` orders an Auto row first but never invents one.
+
+### Credit-billing surface (`bills_kiro_credits`)
+
+`acp/backends.py::bills_kiro_credits(backend)` answers one question: **does a turn
+on this harness draw down the signed-in Kiro account's credit plan?** Membership in
+`ACP_BACKENDS_KIRO_CREDITS` (`{kiro, kas}`, harness-parity H6), not a descriptor
+lookup — an id with no cached descriptor answers `False` instead of raising, because
+both callers are readouts and hiding a number is a correct degraded state where
+showing another account's balance is not.
+
+**`CAP_BILLING` is not a substitute and must not be reused as one.** That level says
+whether Kiro Crew can READ a cost signal at all; claude-agent-acp sits at DEGRADED
+there because it reports a real cumulative dollar figure — from Anthropic's account.
+Whose balance moved is a property of the account a harness authenticates to, not of
+the wire dialect, which is also why KAS is a member while its billing capability is
+UNVERIFIED.
+
+Two consumers, both gated by the gateway so no frontend carries a copy of the set:
+
+| Surface | Behaviour |
+|---|---|
+| `GET /api/status` → `harness` | `{backend, label, kiro_credits}`, or `null` when the configured backend cannot be read. `label` comes from the descriptor, falling back to the raw id. Owner-only: `ws.py` strips it from the Tier-0 frame alongside `branch` and `commit`. |
+| `GET /api/sessions/usage` | Answers `{"usage": {"available": false}}` immediately for a non-member, ahead of the kiro-readiness check, and does **not** schedule the background refresh. The cache is left intact so switching back to Kiro still serves the last good value. |
+
+The endpoint gate is the one that matters for cost: populating the pill can spend a
+**billed** `kiro-cli chat --no-interactive --agent kirocrew-lite /usage` turn, on a
+30s timer. The pre-existing `available: false` marker does not cover this — it is
+set when kiro-cli is absent from the HOST, which is a host-presence test, so an
+operator with kiro-cli installed and an adapter selected kept paying for a balance
+no turn was drawing down.
+
+The dashboard gates the pill on `harness.kiro_credits !== false` *as well*, which is
+not redundant: the usage cache can still hold a Kiro reading for up to one refresh
+interval after a harness switch. An **absent or null** block means UNKNOWN — an older
+gateway, or an unreadable config — and both sides then behave exactly as they did
+before the field existed, per H4 (kiro is the floor) and H12's "unknown means allow".
+
+The readout itself is a link to the adapter selector — `ACP_BACKEND_ROUTE`
+(`/developer?tab=config#acp-adapter`), exported by `AcpBackendCard` so the anchor and
+the route move with the card. Two conditions shape it:
+
+- It links **only** while the `mc-preview-acp-backends` preview flag is on, because
+  that flag is what renders the selector. Kiro is the default and the flag is off by
+  default, so the common case is the plain readout it was; a link into a tab with no
+  such card would teach the reader the setting does not exist.
+- The scroll lives in `AcpBackendCard`, not in `useSettingHighlight`. That hook
+  resolves its target synchronously on its first effect, and the card renders `null`
+  until `GET /api/acp-backends` answers — a registry refresh — so a
+  `highlight=key:agent.acp_backend` link would strip its own param and scroll
+  nowhere. The card scrolls on hash arrival once its payload has landed, and only
+  then, so opening Developer > Config directly leaves the reader where they are.
+  The dashboard client sends `?probe=1` only from that Settings card
+  (`AcpBackendCard`); Services and other callers omit it so they do not walk
+  every owned resolver for a label they already have.
+
 ### Config (`config/loader.py`)
 
 ```json
@@ -120,7 +297,27 @@ glue or a provider selector (see the repo-root `CLAUDE.md`).
 ```
 
 - `agent.provider` is fixed to `"acp"` (enum `["acp"]`); there is no provider to choose.
-- `create_provider_factory()` returns a `Callable` that creates the kiro-cli `AcpProvider`.
+- `agent.acp_backend` selects WHICH ACP backend the `acp` provider drives.
+- A dashboard change to `agent.acp_backend` refreshes the captured provider
+  factory and drains prewarmed providers immediately. Existing sessions keep
+  their original backend; sessions created after the change use the new one.
+  Validated against `ACP_BACKENDS_SELECTABLE`; an unknown or unselectable
+  persisted value degrades to Kiro with a logged reason at startup (H3), so the
+  refusal lands where a human is looking rather than on the operator's first
+  message.
+- `agent.acp_backend_allow_ungated_tools` (default `false`) is the single named
+  opt-out that lets a session start when its tool calls would not reach the
+  PreToolUse gate, and the same opt-out is required before goose permission Auto
+  can be selected on a live session. See [`security.md`](security.md) § "ACP
+  backend tool-gate routing".
+- The factory resolves capability once per build, not per session:
+  `to_acp_id` model normalisation runs only under `CAP_REGISTRY_MODEL_IDS`, and
+  `tool_search` is passed as `None` (write no overlay) rather than `False` (write
+  an explicit disable) for a backend that reads no `cli.json`.
+- `create_provider_factory()` returns a `Callable` that creates the `AcpProvider`.
+  Factory construction resolves the configured backend descriptor immediately,
+  so a programmatic unknown value fails before any session starts; persisted
+  unknown or unselectable values are normalized to kiro-cli during config load.
 
 An agent spec's model is consumed by kiro-cli before Kiro Crew reaches
 `session/new`, so the live-session entitlement guard cannot diagnose a wrong

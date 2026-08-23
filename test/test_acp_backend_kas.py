@@ -73,21 +73,34 @@ class TestBackendPredicates:
 
     @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
     def test_exactly_one_predicate_holds_for_every_known_backend(self, backend):
+        # Every known backend needs its own POSITIVE predicate (H5). A backend with
+        # none makes this sum 0, which is how goose's arrival was caught: without a
+        # predicate it is identifiable only as "not the others", the negation the
+        # harness-parity rules exist to forbid.
         provider = _build_provider(backend)
         held = [
             provider.is_kiro_backend,
             provider.is_claude_backend,
             provider.is_kas_backend,
+            provider.is_codex_backend,
+            provider.is_goose_backend,
+            provider.is_opencode_backend,
+            provider.is_pi_backend,
         ]
         assert sum(held) == 1
 
     @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))
-    def test_acp_runtime_backend_is_the_positive_form_of_not_claude(self, backend):
-        # The four provider sites that used to read ``not is_claude_backend``
-        # now read ``is_acp_runtime_backend``; the two must stay equivalent for
-        # every known backend so the conversion is behavior-preserving.
+    def test_acp_runtime_backend_is_named_set_membership(self, backend):
+        # Was asserted as `is_acp_runtime_backend is (not is_claude_backend)`,
+        # which held only while claude was the ONLY non-runtime backend. A second
+        # non-runtime backend (codex, on AcpClient) falsifies the equivalence
+        # without changing any behaviour — and an equivalence-to-a-negation is
+        # what harness parity H5 forbids in the first place. The durable
+        # invariant is membership in the named set.
+        from kiro_crew.acp.types import ACP_BACKENDS_ACP_RUNTIME
+
         provider = _build_provider(backend)
-        assert provider.is_acp_runtime_backend is (not provider.is_claude_backend)
+        assert provider.is_acp_runtime_backend is (backend in ACP_BACKENDS_ACP_RUNTIME)
 
 
 class TestUnknownBackendRejected:
@@ -214,9 +227,7 @@ class TestConfigRoundTrip:
         Asserted through a selectable value, since an unselectable one degrades
         and so cannot distinguish 'consumed' from 'dropped'.
         """
-        cfg = _load_agent_config(
-            {"acp_backend": ACP_BACKEND_KIRO, "streaming": False}, tmp_path
-        )
+        cfg = _load_agent_config({"acp_backend": ACP_BACKEND_KIRO, "streaming": False}, tmp_path)
         assert cfg.agent.acp_backend == ACP_BACKEND_KIRO
         assert cfg.agent.streaming is False
 

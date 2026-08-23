@@ -124,3 +124,150 @@ export function pickToolLabel(opts: {
   if (!simplified || !trimmed) return rawLabel
   return labelMatchesLanguage(trimmed, uiLang) ? trimmed : rawLabel
 }
+
+/** Raw shell titles stay readable until they become transcript-sized payloads.
+ *  Beyond that point, show a stable technical summary and leave the exact
+ *  command in ToolDetails. The summary deliberately uses executable names and
+ *  symbols rather than generated prose: it stays language-neutral and cannot
+ *  claim intent the command itself does not prove. */
+const MAX_INLINE_SHELL_LABEL = 120
+const MAX_SUMMARY_TOOLS = 2
+const SHELL_WRAPPER_RE = /^(?:Running:\s*)?(?:\/[^\s]+\/)?(?:ba|z|fi)?sh\s+-lc\s+/
+const PATH_RE = /(?:[A-Za-z]:[\\/]|\/|(?:\.{1,2}[\\/])?)(?:[\w@.+-]+[\\/])+[\w@.+-]+\.[A-Za-z0-9]+/g
+const MULTIWORD_TOOLS = new Set(['cargo', 'git', 'go', 'npm', 'pnpm', 'yarn'])
+const SHELL_BUILTINS = new Set(['cd', 'command', 'env', 'export', 'sudo'])
+
+function commandFromInput(input: string, rawLabel: string): string {
+  if (input) {
+    try {
+      const parsed = JSON.parse(input) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const obj = parsed as Record<string, unknown>
+        for (const key of ['command', 'cmd', 'script']) {
+          if (typeof obj[key] === 'string' && obj[key]) return obj[key]
+        }
+      }
+    } catch {
+      // Plain-text tool inputs are already commands.
+      return input
+    }
+  }
+
+  const withoutWrapper = rawLabel.replace(SHELL_WRAPPER_RE, '').trim()
+  if (
+    withoutWrapper.length >= 2 &&
+    ((withoutWrapper.startsWith('"') && withoutWrapper.endsWith('"')) ||
+      (withoutWrapper.startsWith("'") && withoutWrapper.endsWith("'")))
+  ) {
+    return withoutWrapper.slice(1, -1)
+  }
+  return withoutWrapper
+}
+
+/** Split only at top-level command boundaries. Pipes stay inside a step because
+ *  a pipeline is one operation in the activity stream, while `;`, newlines,
+ *  `&&`, and `||` start the next operation. */
+function splitShellSteps(command: string): string[] {
+  const steps: string[] = []
+  let start = 0
+  let quote = ''
+  let escaped = false
+
+  const push = (end: number) => {
+    const step = command.slice(start, end).trim()
+    if (step) steps.push(step)
+  }
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (ch === '\\' && quote !== "'") {
+      escaped = true
+      continue
+    }
+    if (quote) {
+      if (ch === quote) quote = ''
+      continue
+    }
+    if (ch === "'" || ch === '"' || ch === '`') {
+      quote = ch
+      continue
+    }
+
+    const pair = command.slice(i, i + 2)
+    if (ch === ';' || ch === '\n' || pair === '&&' || pair === '||') {
+      push(i)
+      i += pair === '&&' || pair === '||' ? 1 : 0
+      start = i + 1
+    }
+  }
+  push(command.length)
+  return steps
+}
+
+function shellWords(step: string): string[] {
+  return step.match(/(?:[^\s"'`]+|"[^"]*"|'[^']*'|`[^`]*`)+/g) ?? []
+}
+
+function toolName(step: string): string {
+  const words = shellWords(step)
+  let i = 0
+  while (i < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]) || SHELL_BUILTINS.has(words[i]))) i++
+  if (i >= words.length) return ''
+
+  const executable = words[i].replace(/^['"]|['"]$/g, '').split(/[\\/]/).pop() ?? ''
+  if (!executable) return ''
+  if (!MULTIWORD_TOOLS.has(executable)) return executable
+
+  const subcommand = words.slice(i + 1).find(word => !word.startsWith('-'))
+  return subcommand ? `${executable} ${subcommand.replace(/^['"]|['"]$/g, '')}` : executable
+}
+
+function singleTarget(command: string): string {
+  const matches = command.match(PATH_RE) ?? []
+  const basenames = new Set(
+    matches.map(path => path.split(/[\\/]/).pop()).filter((name): name is string => !!name),
+  )
+  return basenames.size === 1 ? [...basenames][0] : ''
+}
+
+export function shellToolLabelNeedsCompaction(rawLabel: string): boolean {
+  return rawLabel.includes('\n') || rawLabel.length > MAX_INLINE_SHELL_LABEL
+}
+
+export function compactShellToolLabel(rawLabel: string, input = ''): string {
+  if (!shellToolLabelNeedsCompaction(rawLabel)) return rawLabel
+
+  const command = commandFromInput(input, rawLabel)
+  const steps = splitShellSteps(command)
+  const tools = [...new Set(steps.map(toolName).filter(Boolean))]
+  if (!tools.length) return `${rawLabel.slice(0, MAX_INLINE_SHELL_LABEL - 1).trimEnd()}…`
+
+  const shownTools = tools.slice(0, MAX_SUMMARY_TOOLS)
+  let summary = shownTools.join(' + ')
+  if (tools.length > shownTools.length) summary += ` +${tools.length - shownTools.length}`
+  if (steps.length > 1) summary += ` ×${steps.length}`
+
+  const target = singleTarget(command)
+  if (target) summary += ` · ${target}`
+  return summary.length > MAX_INLINE_SHELL_LABEL
+    ? `${summary.slice(0, MAX_INLINE_SHELL_LABEL - 1).trimEnd()}…`
+    : summary
+}
+
+export function pickCompactToolLabel(opts: {
+  simplified: boolean
+  purpose?: string | null
+  rawLabel: string
+  uiLang: string
+  isShell: boolean
+  input?: string
+}): string {
+  const picked = pickToolLabel(opts)
+  // A compatible agent-written purpose is already the best concise summary.
+  if (!opts.isShell || picked !== opts.rawLabel) return picked
+  return compactShellToolLabel(picked, opts.input)
+}

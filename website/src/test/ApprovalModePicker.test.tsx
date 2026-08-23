@@ -12,13 +12,13 @@ import ApprovalModePicker from '../components/ApprovalModePicker'
 import { createTestStore } from './helpers'
 import { api } from '../api/client'
 
-function renderPicker(mode = 'normal', compact = false) {
+function renderPicker(mode = 'normal', compact = false, permissionModes?: string[]) {
   const store = createTestStore()
   // MemoryRouter: the picker links to the duration setting via useNavigate.
   render(
     <Provider store={store}>
       <MemoryRouter>
-        <ApprovalModePicker mode={mode} slotKey="dashboard:1" compact={compact} />
+        <ApprovalModePicker mode={mode} slotKey="dashboard:1" compact={compact} permissionModes={permissionModes} />
       </MemoryRouter>
     </Provider>,
   )
@@ -112,6 +112,48 @@ describe('ApprovalModePicker', () => {
     fireEvent.click(screen.getAllByRole('menuitem')[3])
     expect(api.chatMode).not.toHaveBeenCalled()
     expect(screen.queryByText('YOLO mode is an app-wide setting')).not.toBeInTheDocument()
+  })
+
+  it('hides Auto when the harness did not advertise it', () => {
+    renderPicker('normal')
+    fireEvent.click(screen.getByLabelText('Approval mode: Normal'))
+    const texts = screen.getAllByRole('menuitem').map(i => i.textContent || '')
+    expect(texts.some(t => t.includes('Auto'))).toBe(false)
+    expect(screen.getAllByRole('menuitem')).toHaveLength(4)
+  })
+
+  it('shows Auto when the harness advertised it', () => {
+    renderPicker('normal', false, ['auto'])
+    fireEvent.click(screen.getByLabelText('Approval mode: Normal'))
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(5)
+    expect(items.map(i => i.textContent || '').some(t => t.includes('Auto'))).toBe(true)
+  })
+
+  it('selecting Auto without ack shows the confirm card and does not dispatch', () => {
+    renderPicker('normal', false, ['auto'])
+    fireEvent.click(screen.getByLabelText('Approval mode: Normal'))
+    fireEvent.click(screen.getAllByRole('menuitem')[4])
+    expect(screen.getByText('This harness will approve tools itself')).toBeInTheDocument()
+    expect(api.chatMode).not.toHaveBeenCalled()
+  })
+
+  it('Enable in the Auto confirm card dispatches auto; ack persisted only when checkbox ticked', () => {
+    renderPicker('normal', false, ['auto'])
+    fireEvent.click(screen.getByLabelText('Approval mode: Normal'))
+    fireEvent.click(screen.getAllByRole('menuitem')[4])
+    fireEvent.click(screen.getByText('Enable'))
+    expect(api.chatMode).toHaveBeenCalledWith('auto', 'dashboard:1')
+    expect(localStorage.getItem('mc-harness-auto-ack')).toBeNull()
+  })
+
+  it("ticking Don't show again then Enable persists mc-harness-auto-ack", () => {
+    renderPicker('normal', false, ['auto'])
+    fireEvent.click(screen.getByLabelText('Approval mode: Normal'))
+    fireEvent.click(screen.getAllByRole('menuitem')[4])
+    fireEvent.click(screen.getByRole('checkbox'))
+    fireEvent.click(screen.getByText('Enable'))
+    expect(localStorage.getItem('mc-harness-auto-ack')).toBe('1')
   })
 })
 

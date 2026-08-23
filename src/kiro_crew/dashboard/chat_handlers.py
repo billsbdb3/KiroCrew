@@ -21,7 +21,7 @@ from aiohttp import web
 from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import model_registry
-from kiro_crew.acp.client import AcpModelUnavailable
+from kiro_crew.acp.client import AcpError, AcpModelUnavailable
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
 from kiro_crew.config.loader import (
     KiroCrewConfig,
@@ -123,10 +123,12 @@ _SESSION_RELOAD_NOTICE = (
 )
 
 # Approval modes that grant auto-approval to the SLOT they name, as opposed to
-# the process-global YOLO grant. A tuple, not a set: membership is tested against
-# a request-supplied value, and tuple `in` compares by equality rather than
-# hashing, so a non-string body value answers False instead of raising.
-_SLOT_SCOPED_TRUST_MODES = ("trust", "trust_reads")
+# the process-global YOLO grant. ``auto`` is goose session mode auto — it does
+# not auto-answer Crew permission RPCs; it asks the harness not to send them.
+# A tuple, not a set: membership is tested against a request-supplied value,
+# and tuple `in` compares by equality rather than hashing, so a non-string
+# body value answers False instead of raising.
+_SLOT_SCOPED_TRUST_MODES = ("trust", "trust_reads", "auto")
 
 
 def _sweep_stale_permissions(slot: "_ChatSlot") -> None:
@@ -3955,6 +3957,12 @@ def _wire_model_id(provider: AcpProvider, model_name: str) -> str:
         # The claude backend has no id meaning "let the server choose", so
         # returning to default needs a reset.
         return "" if is_default else model_registry.to_provider_id(model_name, "claude_code")
+    if provider.is_codex_backend:
+        from kiro_crew.acp import codex
+
+        return codex.wire_model_id(model_name, is_default=is_default)
+    if provider.is_spec_adapter:
+        return "" if is_default else model_name
     if is_default:
         # kiro DOES express Auto as a real model id — but only switch to it when
         # this session's backend actually advertised it.
@@ -5433,6 +5441,117 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
     )
 
 
+async def _clear_goose_permission_auto(state: DashboardState, slot_key: str | None) -> None:
+    """Pin a goose slot back to approve when leaving Auto."""
+    from kiro_crew.acp import goose as goose_backend
+    from kiro_crew.acp.types import ACP_BACKEND_GOOSE
+
+    if slot_key is not None:
+        if slot_key not in state._slots:
+            return
+        slots = [state._slots[slot_key]]
+    else:
+        slots = list(state._slots.values())
+    for slot in slots:
+        client = state._live_slot_acp_client(slot)
+        opted = getattr(slot, "_harness_permission_mode", "") == goose_backend.MODE_AUTO
+        if client is not None and getattr(client, "_goose_permission_opt_in", "") == (
+            goose_backend.MODE_AUTO
+        ):
+            opted = True
+        if not opted:
+            continue
+        slot._harness_permission_mode = ""
+        if client is not None and getattr(client, "backend", None) == ACP_BACKEND_GOOSE:
+            try:
+                await client.set_goose_permission_mode(goose_backend.MODE_APPROVE)
+            except Exception:
+                logger.warning(
+                    "Failed to pin goose back to approve on slot %s",
+                    slot.key,
+                    exc_info=True,
+                )
+
+
+async def _enable_goose_permission_auto(
+    state: DashboardState, slot_key: str | None
+) -> web.Response | None:
+    """Opt a live goose session into session mode auto. None = success."""
+    from kiro_crew.acp import goose as goose_backend
+    from kiro_crew.acp.types import ACP_BACKEND_GOOSE
+
+    if not slot_key or slot_key not in state._slots:
+        return web.json_response(
+            {"ok": False, "error": "unknown slot", "code": "slot_not_found"},
+            status=400,
+        )
+    slot = state._slots[slot_key]
+    client = state._live_slot_acp_client(slot)
+    if client is None:
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "no live session on this slot",
+                "code": "no_live_session",
+            },
+            status=409,
+        )
+    if getattr(client, "backend", None) == ACP_BACKEND_GOOSE:
+        available = list(getattr(client, "_available_mode_ids", []) or [])
+    else:
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "this harness has no permission Auto",
+                "code": "harness_has_no_permission_auto",
+            },
+            status=400,
+        )
+    if goose_backend.MODE_AUTO not in available:
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "this harness did not advertise permission Auto",
+                "code": "permission_auto_unavailable",
+            },
+            status=400,
+        )
+    if not bool(getattr(client, "_allow_ungated_tools", False)):
+        return web.json_response(
+            {
+                "ok": False,
+                "error": ("permission Auto requires " "agent.acp_backend_allow_ungated_tools"),
+                "code": "ungated_tools_opt_out_required",
+            },
+            status=409,
+        )
+    try:
+        await client.set_goose_permission_mode(goose_backend.MODE_AUTO)
+    except AcpError as exc:
+        return web.json_response(
+            {
+                "ok": False,
+                "error": str(exc),
+                "code": "permission_auto_rejected",
+            },
+            status=503,
+        )
+    slot._harness_permission_mode = goose_backend.MODE_AUTO
+    slot._trust = False
+    slot._trust_reads = False
+    state.sessions.set_approval_policy(f"dashboard:{slot_key}", "")
+    try:
+        sel().log_api_access(
+            caller="dashboard:mode",
+            operation="mode_change:auto",
+            outcome="enabled",
+            resources=slot_key,
+        )
+    except Exception:
+        logger.warning("SEL audit failed for auto mode activation", exc_info=True)
+    return None
+
+
 async def api_chat_mode(request: web.Request) -> web.Response:
     """POST /api/chat/mode — set global tool approval mode.
 
@@ -5440,6 +5559,9 @@ async def api_chat_mode(request: web.Request) -> web.Response:
       - ``normal``: reset to interactive (ask for each tool)
       - ``trust``: auto-approve tools for active slot
       - ``yolo``: auto-approve all tools everywhere
+      - ``auto``: goose session mode auto — the harness approves tools
+        itself and PreToolUse never sees them. Offered only when the
+        live goose session advertised that mode.
 
     Unlike the per-tool approve endpoint, this doesn't require a
     pending approval — it preemptively sets the mode for future tools.
@@ -5505,7 +5627,14 @@ async def api_chat_mode(request: web.Request) -> web.Response:
         # re-indexing state._slots.
         await asyncio.to_thread(safety_override().deactivate, "dashboard")
 
-    if mode == "yolo":
+    if mode != "auto":
+        await _clear_goose_permission_auto(state, slot_key)
+
+    if mode == "auto":
+        refused = await _enable_goose_permission_auto(state, slot_key)
+        if refused is not None:
+            return refused
+    elif mode == "yolo":
         result = await asyncio.to_thread(safety_override().activate, "dashboard")
         if not result.active:
             return web.json_response(

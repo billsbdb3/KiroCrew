@@ -1727,8 +1727,25 @@ _MOVED_CONFIG_FIELDS: dict[str, str] = {
 }
 
 
+def _selectable_acp_backend_values() -> list[str]:
+    from kiro_crew.acp import backends as acp_backends
+
+    return sorted(acp_backends.selectable_ids())
+
+
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
+    # Which harness serves a session. Validated against ACP_BACKENDS_SELECTABLE
+    # rather than a literal list, so the allowlist cannot drift from the set the
+    # rest of the process honours — a value accepted here but refused by
+    # _normalize_acp_backend would be silently degraded back to kiro after a
+    # save that reported success.
+    "agent.acp_backend": {
+        "type": "str",
+        "max_len": 128,
+        "pattern": r"^[A-Za-z0-9._-]*$",
+        "values_fn": _selectable_acp_backend_values,
+    },
     # Default model for new sessions. Membership can NOT be validated against a
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry
@@ -2059,6 +2076,10 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         pattern = spec.get("pattern")
         if pattern and not re.fullmatch(pattern, value):
             return _deny(f"invalid value for {path_key}", f"{path_key}={value}")
+        if path_key == "agent.acp_backend":
+            from kiro_crew.acp.backends import canonical_backend_id
+
+            value = canonical_backend_id(value)
         values_fn = spec.get("values_fn")
         if values_fn and value not in values_fn():
             return _deny(f"invalid value for {path_key}", f"{path_key}={value}")
@@ -2219,6 +2240,12 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     cfg_path = config_path()
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # noqa: F811
 
+    # Model ids healed by a backend switch, reported so the caller can tell the
+    # operator their selection was reset rather than silently changing it.
+    healed_models: list[str] = []
+    # Non-empty when this PATCH actually moved agent.acp_backend to a new value.
+    backend_switched: list[bool] = []
+
     async with _get_config_lock():
         parts = path_key.split(".")
 
@@ -2235,7 +2262,38 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
                 if not isinstance(nxt, dict):
                     raise ValueError(f"config section '{part}' is not an object")
                 section = nxt
+            previous = section.get(parts[-1])
             section[parts[-1]] = value
+
+            # A model id belongs to exactly ONE backend's namespace, so a
+            # selection cannot survive a backend switch: kiro's `gpt-5.6-sol` is
+            # not a Claude model under any spelling, and applying it to the new
+            # backend is refused at the wire. Tolerating that refusal is not
+            # enough on its own — the value stays in the config, so every future
+            # session repeats the refusal and the picker keeps displaying a
+            # selection the backend will never honour.
+            #
+            # Reset to the "auto" sentinel, which is NOT sent to the wire at all
+            # (``_apply_startup_model`` returns early on it), so the new backend
+            # simply serves its own default until the operator picks from its
+            # own advertised list. Healed in the SAME mutation as the switch, so
+            # the two can never be observed out of step.
+            if path_key == "agent.acp_backend" and previous != value:
+                from kiro_crew.acp.client import DEFAULT_MODEL  # noqa: F811
+
+                backend_switched.append(True)
+                agent_section = data.get("agent")
+                if isinstance(agent_section, dict):
+                    if agent_section.get("model") not in (None, "", DEFAULT_MODEL):
+                        healed_models.append(f"agent.model={agent_section['model']}")
+                        agent_section["model"] = DEFAULT_MODEL
+                    # Role pins are namespaced the same way and default to auto.
+                    roles = agent_section.get("role_models")
+                    if isinstance(roles, dict):
+                        for role, pinned in list(roles.items()):
+                            if pinned not in (None, "", DEFAULT_MODEL):
+                                healed_models.append(f"agent.role_models.{role}={pinned}")
+                                roles[role] = DEFAULT_MODEL
             return data
 
         try:
@@ -2281,6 +2339,36 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
         logger.info(
             "Provider switched to %s — config rebuilt, factory reloaded, slot models cleared", value
         )
+
+    # A backend switch is the same hazard as the provider switch above, one level
+    # down: a model id is namespaced to the harness that advertised it, so a slot
+    # still holding kiro's `gpt-5.6-sol` would apply it to the new backend and be
+    # refused at the wire. The provider block clears slot models for exactly this
+    # reason; `agent.acp_backend` needs it too. The provider factory captures
+    # `agent.acp_backend` when it is built, so refresh it and drain prewarmed
+    # providers before any new session can inherit the old adapter. Live sessions
+    # stay on the adapter they started with, matching the Settings disclosure.
+    if backend_switched:
+        state_after_switch: DashboardState = request.app["state"]
+        await state_after_switch.sessions.refresh_defaults()
+        # Best-effort by design: the config write has ALREADY committed by this
+        # point, so a problem clearing in-memory slot state must not turn a
+        # successful save into a 500 and leave the operator believing the switch
+        # did not happen. The stale slot model is re-cleared on the next switch
+        # and is refused harmlessly at the wire meanwhile.
+        try:
+            for slot in state_after_switch._slots.values():
+                if slot.model:
+                    slot.model = ""
+            state_after_switch.push_slots_update()
+        except Exception:
+            logger.warning("Could not clear slot models after backend switch", exc_info=True)
+        if healed_models:
+            logger.info(
+                "ACP backend switched to %s — reset namespaced model selection(s): %s",
+                value or "kiro",
+                ", ".join(healed_models),
+            )
 
     # The default model and default reasoning effort are captured when the
     # provider factory is built (at gateway startup), so a config write alone

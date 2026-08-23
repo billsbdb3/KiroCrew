@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from kiro_crew import model_registry
+from kiro_crew.acp.types import is_spec_adapter_provider_label
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
@@ -1653,7 +1654,7 @@ def build_session_replay(
     return replay.translate(_MULTIBYTE_TABLE)
 
 
-def _skills_injection_plan(agent: str | None, *, is_cc: bool) -> tuple[bool, list[str]]:
+def _skills_injection_plan(agent: str | None, *, is_spec_adapter: bool) -> tuple[bool, list[str]]:
     """Whether to inject skills for *agent*, plus the glob restriction to apply.
 
     THE single source of truth for the agent-scoping rule, shared by the
@@ -1668,7 +1669,7 @@ def _skills_injection_plan(agent: str | None, *, is_cc: bool) -> tuple[bool, lis
     """
     globs = agent_skill_globs(agent) if agent else []
     is_custom = bool(agent) and agent != "kirocrew"
-    return (is_cc if globs else not is_custom), globs
+    return (is_spec_adapter if globs else not is_custom), globs
 
 
 def _emit_context_section_timings(
@@ -1790,8 +1791,19 @@ class ContextBuilder:
         if bot_name:
             self._bot_name = bot_name
         else:
+            from kiro_crew.acp.types import ACP_BACKEND_CLAUDE
+
             cfg = KiroCrewConfig.load()
-            self._bot_name = "KiroCrew" if cfg.agent.provider == "claude_code" else "Kiro"
+            # Reads the ACP BACKEND, not agent.provider: the provider enum is
+            # single-valued ("acp"), so comparing it against "claude_code" could
+            # never be true and the branded name never applied. Branding stays
+            # claude-specific rather than spec-adapter-wide, because the persona
+            # rewrite substitutes Claude's own product wording.
+            # The persona NAME substituted into the prompt, carried over from main
+            # unchanged. Respelling it would rename the bot, not fix a typo.
+            _branded = "KiroCrew"  # brand-ok
+            claude_active = cfg.agent.acp_backend == ACP_BACKEND_CLAUDE
+            self._bot_name = _branded if claude_active else "Kiro"
         # Register default memory in the workspace cache
         _memory_stores["default"] = self.memory
 
@@ -2037,7 +2049,7 @@ class ContextBuilder:
         and hooks are injected for all agents.
         """
         is_custom = agent and agent != "kirocrew"
-        is_cc = provider_type == "claude_code"
+        is_spec_adapter = is_spec_adapter_provider_label(provider_type)
         caps = _resolve_caps(model_window)
         parts: list[str] = []
 
@@ -2202,7 +2214,11 @@ class ContextBuilder:
         # (claude-agent-acp) does NOT read agent ``resources``, so only it needs
         # the explicit load. Injecting on the ACP/kiro backend would duplicate
         # what kiro-cli already loaded.
-        if not is_custom and is_cc and _group_included(context_groups, CONTEXT_GROUP_PROJECT):
+        if (
+            not is_custom
+            and is_spec_adapter
+            and _group_included(context_groups, CONTEXT_GROUP_PROJECT)
+        ):
             steering_ctx = _load_steering_resources()
             if steering_ctx:
                 if lazy_skills and len(steering_ctx) > caps.steering:
@@ -2355,7 +2371,7 @@ class ContextBuilder:
         # skill's summary. The slice below is a defensive backstop only.
         # Mapped: CC only (kiro loads them natively). Unmapped: kirocrew only.
         # Shared with the post-compaction re-injection in build_message.
-        inject_skills, skill_globs = _skills_injection_plan(agent, is_cc=is_cc)
+        inject_skills, skill_globs = _skills_injection_plan(agent, is_spec_adapter=is_spec_adapter)
         if inject_skills:
             # ON: usage-ranked top-K bounded by the skills section cap.
             # OFF (budget=None): legacy full skills dump, unchanged behavior.
@@ -2551,6 +2567,11 @@ class ContextBuilder:
         _user_bounds: tuple[int, int] | None = None
         _user_part_index: int | None = None
         is_cc = provider_type == "claude_code"
+        # Two DIFFERENT concerns, deliberately not one flag: the skills plan is a
+        # DIALECT question (a spec adapter loads no kiro agent config, so Kiro Crew
+        # injects what kiro-cli would have loaded), while the persona rewrite below
+        # is claude-specific BRANDING that substitutes Claude's own product wording.
+        is_spec_adapter = is_spec_adapter_provider_label(provider_type)
 
         # Session context on first message only
         if is_new_session:
@@ -2688,7 +2709,7 @@ class ContextBuilder:
         # mapping excludes and an unmapped custom agent cannot receive a block
         # its session-start context never contained.
         if not is_new_session and needs_reinjection:
-            _inject, _globs = _skills_injection_plan(agent, is_cc=is_cc)
+            _inject, _globs = _skills_injection_plan(agent, is_spec_adapter=is_spec_adapter)
             if _inject:
                 _cfg = KiroCrewConfig.load()
                 lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))

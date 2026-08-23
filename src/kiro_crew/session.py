@@ -335,6 +335,7 @@ POOL_DECISIONS: frozenset[str] = frozenset(
         "bypass_stateless",
         "bypass_cwd",
         "bypass_env",
+        "bypass_backend",
         "disabled",
         "other",
     }
@@ -962,6 +963,62 @@ class SessionManager:
         await sess.semaphore.acquire()
         return True
 
+    @property
+    def acp_backend(self) -> str:
+        """The harness id a NEW session would start on (``""`` = kiro-cli).
+
+        Reads the config this store already holds rather than loading it again, so
+        a caller on the event loop — the 5-second status push, the usage poll —
+        pays no filesystem stat and no schema revalidation. ``refresh_defaults``
+        is what keeps it current: it replaces ``_cfg`` when the operator switches
+        harness, and this value is deliberately the NEW-session default rather
+        than any live session's backend, matching what the Settings card reports.
+        """
+        return getattr(self._cfg.agent, "acp_backend", "") or ""
+
+    def live_harness(self, session_key: str) -> tuple[str | None, list[str]]:
+        """The backend and advertised model ids of a LIVE session.
+
+        ``None`` backend means there is no parent to inherit from (no session,
+        or a mock whose ``backend`` is not a string). An empty-string backend
+        is kiro-cli and must be distinguished from that absence — dedicated
+        children pin ``acp_backend=""`` so a Settings switch cannot redirect
+        them onto an adapter.
+
+        Advertised ids come from the same ``available_models`` surface the
+        picker reads. Empty means entitlement unknown, which
+        ``resolve_usable_model`` already treats as inherit-for-auto / trust a
+        concrete pin.
+        """
+        if not session_key:
+            return None, []
+        provider = self.get_provider(session_key)
+        if provider is None:
+            return None, []
+        client = getattr(provider, "client", None) or getattr(provider, "_client", None)
+        backend = getattr(client, "backend", None) if client is not None else None
+        if not isinstance(backend, str):
+            backend = getattr(provider, "backend", None)
+        if not isinstance(backend, str):
+            return None, []
+        raw: object = None
+        models = getattr(provider, "available_models", None)
+        if callable(models):
+            try:
+                raw = models()
+            except Exception:
+                raw = None
+        elif models is not None:
+            raw = models
+        elif client is not None:
+            client_models = getattr(client, "available_models", None)
+            if callable(client_models):
+                try:
+                    raw = client_models()
+                except Exception:
+                    raw = None
+        return backend, advertised_model_ids(raw)
+
     def active_providers(self) -> list[LLMProvider]:
         """Return the providers of all currently-active sessions.
 
@@ -1157,10 +1214,10 @@ class SessionManager:
     async def refresh_defaults(self) -> None:
         """Adopt config changes that only affect NEW sessions.
 
-        For settings that are *defaults* — ``agent.model``,
-        ``agent.reasoning_effort`` — the new value must reach the next session
-        without a gateway restart, because the provider factory and ``_cfg``
-        both capture them when they are built.
+        For settings that apply to *new sessions* — ``agent.acp_backend``,
+        ``agent.model``, ``agent.reasoning_effort`` — the new value must reach
+        the next session without a gateway restart, because the provider factory
+        and ``_cfg`` both capture them when they are built.
 
         Unlike :meth:`reload_provider_factory`, this deliberately does NOT touch
         ``_sessions``: a default is by definition not retroactive, and shutting
@@ -1192,7 +1249,9 @@ class SessionManager:
             self._pool_health_task = None
         await self.start_pool(blocking=False)
         logger.info(
-            "Session defaults refreshed: model=%s effort=%r (live sessions untouched)",
+            "New-session config refreshed: backend=%s model=%s effort=%r "
+            "(live sessions untouched)",
+            cfg.agent.acp_backend or "kiro",
             cfg.agent.model,
             cfg.agent.reasoning_effort,
         )
@@ -2866,6 +2925,14 @@ class SessionManager:
             pool_decision = "bypass_cwd"
         elif extra_env:
             pool_decision = "bypass_env"
+        elif (
+            "acp_backend" in extra_factory_kwargs
+            and extra_factory_kwargs["acp_backend"] != self.acp_backend
+        ):
+            # The warm pool was spawned under the factory snapshot. A dedicated
+            # child that pins the live parent harness must not claim a process
+            # for a different backend.
+            pool_decision = "bypass_backend"
         else:
             pool_decision = ""
         pooled = None if pool_decision else await self._drain_and_claim(agent)
@@ -3028,8 +3095,26 @@ class SessionManager:
                 )
 
                 if isinstance(provider, AcpProvider):
-                    provider.client.set_resume_session_id(resume_sid)
-                    logger.info("Attempting session/load for %s (sid=%s)", key, resume_sid)
+                    from kiro_crew.acp.backends import (
+                        CAP_NATIVE_RESUME,
+                        descriptor_for,
+                        supports,
+                    )
+
+                    backend = provider.client.backend
+                    if not supports(backend, CAP_NATIVE_RESUME):
+                        # Only measured transcript restoration may suppress
+                        # Crew's replay; advertising session/load is insufficient.
+                        logger.info(
+                            "Skipping session/load for %s: native resume is not supported on %s",
+                            key,
+                            descriptor_for(backend).label,
+                        )
+                        resume_sid = None
+                        _provider_switched = True
+                    else:
+                        provider.client.set_resume_session_id(resume_sid)
+                        logger.info("Attempting session/load for %s (sid=%s)", key, resume_sid)
                 elif ClaudeCodeProvider is not None and isinstance(provider, ClaudeCodeProvider):
                     provider.set_resume_session_id(resume_sid)
                     logger.info("CC resume for %s (sid=%s)", key, resume_sid)

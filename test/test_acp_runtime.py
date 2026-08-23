@@ -43,6 +43,7 @@ from kiro_crew.acp.runtime import (
 )
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
     EVENT_COMPLETE,
     EVENT_TEXT_CHUNK,
     JSONRPC_METHOD_NOT_FOUND,
@@ -121,9 +122,7 @@ async def _stop_reader(task: asyncio.Task) -> None:
         pass
 
 
-async def _await_routed(
-    rt: AcpRuntime, *session_ids: str, timeout: float = 5.0
-) -> dict[str, int]:
+async def _await_routed(rt: AcpRuntime, *session_ids: str, timeout: float = 5.0) -> dict[str, int]:
     """Wait until the runtime has an in-flight request for each session, and
     return the ``{session_id: request_id}`` map.
 
@@ -324,10 +323,7 @@ async def test_ownerless_request_answered_once_not_broadcast():
         # The answer task runs off the reader loop; give it ticks to complete.
         for _ in range(20):
             await asyncio.sleep(0)
-        replies = [
-            json.loads(call.args[0].decode())
-            for call in proc.stdin.write.call_args_list
-        ]
+        replies = [json.loads(call.args[0].decode()) for call in proc.stdin.write.call_args_list]
         errors = [r for r in replies if r.get("id") == 4864 and "error" in r]
         assert len(errors) == 1, f"expected exactly one reply, got {replies}"
         assert errors[0]["error"]["code"] == -32601
@@ -398,6 +394,45 @@ async def test_kas_auth_waits_for_shared_answer_capacity_then_answers():
 
 
 @pytest.mark.asyncio
+async def test_ownerless_permission_request_answered_once_not_enqueued():
+    """A permission REQUEST with no sessionId is not approved on any handle."""
+    rt, reader, proc = _make_runtime()
+    q = _register(rt, "sA", "sB")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "id": 9001,
+                "method": "session/request_permission",
+                "params": {
+                    "toolCall": {"title": "shell"},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                    ],
+                },
+            },
+        )
+        for _ in range(20):
+            await asyncio.sleep(0)
+        replies = [json.loads(call.args[0].decode()) for call in proc.stdin.write.call_args_list]
+        errors = [r for r in replies if r.get("id") == 9001 and "error" in r]
+        assert len(errors) == 1, f"expected exactly one reply, got {replies}"
+        assert errors[0]["error"]["code"] == -32601
+        selected = [
+            r
+            for r in replies
+            if r.get("id") == 9001
+            and (r.get("result") or {}).get("outcome", {}).get("outcome") == "selected"
+        ]
+        assert selected == []
+        assert q["sA"].empty()
+        assert q["sB"].empty()
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
 async def test_ownerless_response_with_null_result_is_not_answered():
     """An id-carrying frame with NO method is a response, not a request.
 
@@ -412,10 +447,7 @@ async def test_ownerless_response_with_null_result_is_not_answered():
         _feed(reader, {"id": 77, "result": None})  # response shape, no method
         for _ in range(20):
             await asyncio.sleep(0)
-        replies = [
-            json.loads(call.args[0].decode())
-            for call in proc.stdin.write.call_args_list
-        ]
+        replies = [json.loads(call.args[0].decode()) for call in proc.stdin.write.call_args_list]
         assert not [r for r in replies if r.get("id") == 77]
     finally:
         await _stop_reader(task)
@@ -1501,11 +1533,14 @@ async def test_handle_approve_tool():
     rt, _, proc = _make_runtime()
     q = _register(rt, "sA")
     handle = AcpSessionHandle("sA", q["sA"], rt)
-    await handle.approve_tool("req-7", option_id="allow_always")
+    handle._permission_options["req-7"] = {
+        "allow_once": "allow_once",
+        "allow_always": "allow_always",
+    }
+    await handle.approve_tool("req-7", option_id="allow_always", always=True)
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())
     assert sent["id"] == "req-7"
-    assert sent["result"]["outcome"]["outcome"] == "selected"
-    assert sent["result"]["outcome"]["optionId"] == "allow_always"
+    assert sent["result"]["outcome"]["outcome"] == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -1701,8 +1736,12 @@ async def test_dispatch_permission_request():
         # The critical regression guard: is_shell must be True so the trust-mode
         # gate does not reject the long shell command title on the length cap.
         assert perm[0].is_shell is True
-        # Advertised optionIds recorded so approve/reject echo the exact ids.
-        assert handle._permission_options[5001] == {"once": "allow_once", "always": "allow_always"}
+        # Advertised optionIds recorded BY ACP KIND so approve/reject echo the
+        # exact ids the backend offered (see build_permission_event).
+        assert handle._permission_options[5001] == {
+            "allow_once": "allow_once",
+            "allow_always": "allow_always",
+        }
     finally:
         await _stop_reader(task)
 
@@ -1714,8 +1753,8 @@ async def test_approve_tool_echoes_recorded_option():
     q = _register(rt, "sA")
     handle = AcpSessionHandle("sA", q["sA"], rt)
     # Simulate build_permission_event having recorded claude-agent-acp ids.
-    handle._permission_options[42] = {"once": "allow", "always": "allow_always"}
-    await handle.approve_tool(42)  # no explicit id → resolves the "once" variant
+    handle._permission_options[42] = {"allow_once": "allow", "allow_always": "allow_always"}
+    await handle.approve_tool(42)  # no explicit id → resolves the allow_once variant
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())
     assert sent["result"]["outcome"]["optionId"] == "allow"
     assert 42 not in handle._permission_options  # consumed on use
@@ -1727,11 +1766,62 @@ async def test_reject_tool_prefers_recorded_reject_option():
     rt, _, proc = _make_runtime()
     q = _register(rt, "sA")
     handle = AcpSessionHandle("sA", q["sA"], rt)
-    handle._permission_options[7] = {"once": "allow", "reject": "reject"}
+    handle._permission_options[7] = {"allow_once": "allow", "reject_once": "reject"}
     await handle.reject_tool(7)
     sent = json.loads(proc.stdin.write.call_args.args[0].decode())
     assert sent["result"]["outcome"]["outcome"] == "selected"
     assert sent["result"]["outcome"]["optionId"] == "reject"
+
+
+@pytest.mark.asyncio
+async def test_recorded_option_keys_are_the_kinds_the_consumers_read():
+    """The writer's key vocabulary must be the one approve/reject look up.
+
+    build_permission_event records ``kind_to_id`` keyed by ACP option KIND, and
+    approve_tool/reject_tool read that map. Nothing pinned the two together, so
+    when the writer moved from short aliases (``once``/``always``) to kinds the
+    consumers kept reading the old keys and silently answered with a literal
+    fallback id the backend may never have advertised — while the consumer tests
+    still passed, because each SEEDED the map itself in the old shape.
+
+    Asserting against the real writer's output is what makes the two sides
+    unable to drift apart again.
+    """
+    from kiro_crew.acp._dispatch import build_permission_event
+    from kiro_crew.acp.types import METHOD_REQUEST_PERMISSION
+
+    msg = JsonRpcMessage.from_dict(
+        {
+            "id": 99,
+            "method": METHOD_REQUEST_PERMISSION,
+            "params": {
+                "sessionId": "sX",
+                "toolCall": {"toolCallId": "tc1", "title": "shell"},
+                "options": [
+                    {"optionId": "backend-allow-once", "name": "Once", "kind": "allow_once"},
+                    {
+                        "optionId": "backend-allow-always",
+                        "name": "Always",
+                        "kind": "allow_always",
+                    },
+                    {"optionId": "backend-reject", "name": "No", "kind": "reject_once"},
+                ],
+            },
+        }
+    )
+    _event, recorded = build_permission_event(msg, raw_params_cache={})
+    assert recorded is not None
+    # Exactly the keys the consumers index by.
+    assert set(recorded) == {"allow_once", "allow_always", "reject_once"}
+
+    rt, _, proc = _make_runtime()
+    q = _register(rt, "sX")
+    handle = AcpSessionHandle("sX", q["sX"], rt)
+    handle._permission_options[99] = recorded
+    await handle.approve_tool(99)
+    sent = json.loads(proc.stdin.write.call_args.args[0].decode())
+    # The backend's OWN id, not a literal guess.
+    assert sent["result"]["outcome"]["optionId"] == "backend-allow-once"
 
 
 @pytest.mark.asyncio
@@ -3585,6 +3675,76 @@ class TestAcpRuntimeLoadSession:
         assert METHOD_SET_MODE in methods
 
     @pytest.mark.asyncio
+    async def test_kas_session_new_delivers_managed_core_when_gateway_is_off(self, monkeypatch):
+        """KAS has no --agent disk load and custom agents omit mcpServers.
+
+        Session-level ``mcpServers`` is therefore the only channel. With the
+        gateway off the pooled list is empty, so without this merge a KAS
+        session advertises ``@kirocrew-core`` tools that resolve nowhere.
+        """
+        rt, _, _ = _make_runtime()
+        rt._acp_backend = ACP_BACKEND_KAS
+        sent: list[dict] = []
+
+        async def _fake_send(method, params, timeout=None):
+            if method == METHOD_SESSION_NEW:
+                sent.append(params)
+                return {"sessionId": "sid-kas", "modes": {"availableModes": [{"id": "kirocrew"}]}}
+            return {}
+
+        async def _fake_agents(agent):
+            return [{"id": agent, "prompt": "p", "tools": ["@kirocrew-core"]}]
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
+
+        await rt.create_session(cwd="/work", agent="kirocrew")
+
+        names = {entry["name"] for entry in sent[0]["mcpServers"]}
+        assert "kirocrew-core" in names
+        assert "kirocrew-cron" in names
+
+    @pytest.mark.asyncio
+    async def test_kas_session_load_delivers_the_same_managed_servers(self, monkeypatch):
+        rt, _, _ = _make_runtime()
+        rt._can_load_session = True
+        rt._acp_backend = ACP_BACKEND_KAS
+        sent: list[dict] = []
+
+        async def _fake_send(method, params, timeout=None):
+            if method == METHOD_SESSION_LOAD:
+                sent.append(params)
+                return {"modes": {"currentModeId": "kirocrew"}, "models": []}
+            return {}
+
+        async def _fake_agents(agent):
+            return [{"id": agent, "prompt": "p", "tools": ["@kirocrew-core"]}]
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
+
+        await rt.load_session("", "sid-kas", cwd="/work", agent="kirocrew")
+
+        names = {entry["name"] for entry in sent[0]["mcpServers"]}
+        assert "kirocrew-core" in names
+
+    @pytest.mark.asyncio
+    async def test_kiro_session_new_stays_empty_when_gateway_is_off(self, monkeypatch):
+        """The kiro path still loads servers from --agent. Do not inject here."""
+        rt, _, _ = _make_runtime()
+        sent: list[dict] = []
+
+        async def _fake_send(method, params, timeout=None):
+            if method == METHOD_SESSION_NEW:
+                sent.append(params)
+                return {"sessionId": "sid-kiro"}
+            return {}
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        await rt.create_session(cwd="/work", agent="kirocrew")
+        assert sent[0]["mcpServers"] == []
+
+    @pytest.mark.asyncio
     async def test_load_session_raises_when_capability_absent(self):
         rt, _, _ = _make_runtime()
         rt._can_load_session = False
@@ -3656,9 +3816,7 @@ class TestAcpRuntimeLoadSession:
         )
 
     @pytest.mark.asyncio
-    async def test_load_session_keeps_the_transcript_path_alongside_the_agents(
-        self, monkeypatch
-    ):
+    async def test_load_session_keeps_the_transcript_path_alongside_the_agents(self, monkeypatch):
         """Merged, not assigned: a third _meta writer must not drop an earlier one.
 
         The two envelopes belong to different backends today (a transcript path is
@@ -3791,12 +3949,19 @@ class TestAcpRuntimeLoadSession:
         overlay = tmp_path / "agents"
         overlay.mkdir()
         (overlay / "kirocrew.json").write_text(
-            json.dumps({"name": "kirocrew", "mcpServers": {"builder-mcp": {
-                _WRAPPER_MARKER: True,
-                "command": "/data/mcp-gateway/stubs/mc-mcp-stub-wrapper.sh",
-                "args": ["--target-command=builder-mcp"],
-                "env": {},
-            }}}),
+            json.dumps(
+                {
+                    "name": "kirocrew",
+                    "mcpServers": {
+                        "builder-mcp": {
+                            _WRAPPER_MARKER: True,
+                            "command": "/data/mcp-gateway/stubs/mc-mcp-stub-wrapper.sh",
+                            "args": ["--target-command=builder-mcp"],
+                            "env": {},
+                        }
+                    },
+                }
+            ),
             encoding="utf-8",
         )
         rt, _, _ = _make_runtime()
@@ -3902,11 +4067,37 @@ class TestAcpRuntimeLoadSession:
             "_initialize_session",
         } <= builders.keys(), f"expected builders missing from scan: {sorted(builders)}"
         for name, body in builders.items():
+            # Three accepted forms. `_session_mcp_servers` is the single owner of
+            # the whole array introduced so the builders cannot drift and the
+            # pooled stubs get reduced to the spec key set exactly once; it
+            # consults the pooled resolution internally. The two older direct
+            # references remain valid for builders that assemble the array inline.
             assert (
-                "pooled_session_servers" in body or "_pooled_mcp_servers" in body
+                "pooled_session_servers" in body
+                or "_pooled_mcp_servers" in body
+                or "_session_mcp_servers" in body
             ), (
                 f"{name} issues session/new or session/load but never consults "
                 "the pooled broker stubs — it would un-pool its sessions (#3528)"
+            )
+
+        # The same guard, for Kiro Crew's OWN managed servers. A spec adapter reads
+        # no Crew config, so a builder that omits them hands the operator a session
+        # with no memory, no cron, no spawn and no artifacts — inert rather than
+        # broken, which is why it went unnoticed while the shaper had no callers.
+        # kiro-family builders are exempt: their servers arrive via --agent.
+        _KIRO_FAMILY_BUILDERS = {"create_session", "load_session"}
+        for name, body in builders.items():
+            if name in _KIRO_FAMILY_BUILDERS:
+                continue
+            assert (
+                "_session_mcp_servers" in body
+                or "_spec_session_mcp_servers" in body
+                or "_claude_session_mcp_servers" in body
+            ), (
+                f"{name} issues session/new or session/load for a spec adapter but "
+                "never consults Kiro Crew's managed MCP servers — the session "
+                "would have no Crew tools at all"
             )
 
 
@@ -4432,9 +4623,7 @@ async def test_reader_retains_mcp_registration_frames_during_init():
             return {}
 
         with patch.object(rt, "_send_and_await", _fake_send):
-            with patch.object(
-                AcpSessionHandle, "drain_init", AsyncMock()
-            ) as mock_drain:
+            with patch.object(AcpSessionHandle, "drain_init", AsyncMock()) as mock_drain:
                 handle = await rt.create_session(cwd="/w", agent="kirocrew", mcp_servers=[])
         assert handle.session_id == "sid-warm"
         mock_drain.assert_awaited_once()
@@ -4723,6 +4912,7 @@ async def test_handle_steer_sends_session_steer():
         return 1
 
     rt = MagicMock()
+    rt.acp_backend = ACP_BACKEND_KIRO
     rt.send_request = _send_request
     handle = AcpSessionHandle("sA", asyncio.Queue(), rt)
     assert handle.supports_steer is True
@@ -4743,6 +4933,7 @@ async def test_handle_steer_stamps_write_time_and_provider_passes_it_through():
     early, so a refused steer must not move it.
     """
     rt = MagicMock()
+    rt.acp_backend = ACP_BACKEND_KIRO
 
     async def _send_request(method, params):
         return 1
@@ -5179,9 +5370,11 @@ def test_build_permission_event_non_string_option_entries_skipped():
         }
     )
     event, recorded = build_permission_event(msg, raw_params_cache={})  # must not raise
+    # `kind` now travels with each option so consumers can distinguish
+    # once-vs-always without re-deriving it from the id.
     assert event.options == [
-        {"id": "allow_once", "label": ""},
-        {"id": "allow_always", "label": "Always"},
+        {"id": "allow_once", "label": "", "kind": "allow_once"},
+        {"id": "allow_always", "label": "Always", "kind": "allow_always"},
     ]
     assert recorded is not None
 
@@ -5339,6 +5532,52 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
         assert key not in env, f"{key} leaked into runtime child env"
     assert env.get("KIROCREW_UNRELATED_KEEPME") == "keep-this-value"
     assert env.get("AWS_ACCESS_KEY_ID") == "FAKE-akid"
+
+
+@pytest.mark.asyncio
+async def test_runtime_spawn_pins_callbacks_to_parent_bound_port(monkeypatch):
+    """The shared runtime must call back to its parent, not an inherited sibling."""
+    import kiro_crew.acp.runtime as runtime_mod
+
+    monkeypatch.setenv("KIROCREW_PORT", "6776")
+    monkeypatch.setenv("KIROCREW_BOUND_PORT", "7959")
+    captured: dict[str, object] = {}
+
+    class _StopSpawn(Exception):
+        pass
+
+    async def _fake_exec(*_args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        raise _StopSpawn()
+
+    async def resolve_kiro_bin():
+        return "/fake/kiro"
+
+    monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_kiro_bin)
+    monkeypatch.setattr(
+        runtime_mod,
+        "wrap_argv",
+        lambda argv, mode, strip_python_env=False, is_kiro_cli=None: (argv, None),
+    )
+    monkeypatch.setattr(runtime_mod, "cgroup_scope_argv", lambda argv: argv)
+    monkeypatch.setattr(runtime_mod, "augmented_path", lambda p: p)
+    monkeypatch.setattr(runtime_mod, "resolve_krb5_ccname", lambda env: None)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    rt = AcpRuntime(
+        sandbox_mode="auto",
+        extra_env={
+            "KIROCREW_PORT": "9000",
+            "KIROCREW_BOUND_PORT": "9001",
+        },
+    )
+    with pytest.raises(_StopSpawn):
+        await rt.spawn()
+
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env.get("KIROCREW_PORT") == "7959"
+    assert env.get("KIROCREW_BOUND_PORT") == "7959"
 
 
 # ── Unroutable-frame drop accounting (log-flood containment) ──
@@ -5749,15 +5988,11 @@ def test_mode_available_helper():
 
     assert AcpRuntime._mode_available("kirocrew", _new_resp(None)) is True
     assert (
-        AcpRuntime._mode_available(
-            "kirocrew", _new_resp({"availableModes": [{"id": "kirocrew"}]})
-        )
+        AcpRuntime._mode_available("kirocrew", _new_resp({"availableModes": [{"id": "kirocrew"}]}))
         is True
     )
     assert (
-        AcpRuntime._mode_available(
-            "kirocrew", _new_resp({"availableModes": [{"id": "default"}]})
-        )
+        AcpRuntime._mode_available("kirocrew", _new_resp({"availableModes": [{"id": "default"}]}))
         is False
     )
     # Present-but-empty availableModes → advertised, agent absent → fail closed.
@@ -6026,9 +6261,7 @@ async def test_unroutable_permission_request_is_auto_rejected(caplog):
 
         frame = _last_written_frame(proc)
         assert frame["id"] == 77
-        assert frame["result"] == {
-            "outcome": {"outcome": "selected", "optionId": "reject_once"}
-        }
+        assert frame["result"] == {"outcome": {"outcome": "selected", "optionId": "reject_once"}}
         # Answered, not dropped: the drop counter must stay empty so the
         # summary log cannot misattribute an answered request as a drop.
         assert rt._dropped_frames == {}
@@ -6116,7 +6349,9 @@ async def test_registered_session_permission_still_routes_to_queue():
                 "method": "session/request_permission",
                 "params": {
                     "sessionId": "known-session",
-                    "options": [{"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}],
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
                 },
             },
         )
@@ -6378,7 +6613,10 @@ async def test_unannounced_child_session_update_still_drops():
             reader,
             {
                 "method": "session/update",
-                "params": {"sessionId": "never-announced", "update": {"sessionUpdate": "tool_call"}},
+                "params": {
+                    "sessionId": "never-announced",
+                    "update": {"sessionUpdate": "tool_call"},
+                },
             },
         )
         await _drain(reader)
@@ -6447,31 +6685,42 @@ def test_child_low_fidelity_requires_structured_security_context():
     assert ev.child_low_fidelity is True
     # Child shell with params but unrecoverable command → LOW.
     ev = AcpEvent(
-        kind="permission_request", sub_session_id="child-a",
-        is_shell=True, raw_tool_params={"note": "no command key"},
-        raw_params_trusted=True, shell_classified=True,
+        kind="permission_request",
+        sub_session_id="child-a",
+        is_shell=True,
+        raw_tool_params={"note": "no command key"},
+        raw_params_trusted=True,
+        shell_classified=True,
     )
     assert ev.child_low_fidelity is True
     # Inline (agent-authored) params without cache provenance → LOW even
     # with a recoverable command.
     ev = AcpEvent(
-        kind="permission_request", sub_session_id="child-a",
-        is_shell=True, raw_tool_params={"command": "sha256sum README.md"},
-        raw_params_trusted=False, shell_classified=True,
+        kind="permission_request",
+        sub_session_id="child-a",
+        is_shell=True,
+        raw_tool_params={"command": "sha256sum README.md"},
+        raw_params_trusted=False,
+        shell_classified=True,
     )
     assert ev.child_low_fidelity is True
     # Unresolved shell classification (cache miss defaults is_shell=False) → LOW.
     ev = AcpEvent(
-        kind="permission_request", sub_session_id="child-a",
+        kind="permission_request",
+        sub_session_id="child-a",
         raw_tool_params={"path": "/tmp/x"},
-        raw_params_trusted=True, shell_classified=False,
+        raw_params_trusted=True,
+        shell_classified=False,
     )
     assert ev.child_low_fidelity is True
     # Child with full provenance context → parity (not low).
     ev = AcpEvent(
-        kind="permission_request", sub_session_id="child-a",
-        is_shell=True, raw_tool_params={"command": "sha256sum README.md"},
-        raw_params_trusted=True, shell_classified=True,
+        kind="permission_request",
+        sub_session_id="child-a",
+        is_shell=True,
+        raw_tool_params={"command": "sha256sum README.md"},
+        raw_params_trusted=True,
+        shell_classified=True,
     )
     assert ev.child_low_fidelity is False
     # Non-child events are never low-fidelity.
@@ -6669,9 +6918,7 @@ def test_missing_kind_is_not_a_resolved_shell_classification():
             },
         }
     )
-    event, _ = build_permission_event(
-        msg, shell_cache=shell_cache, raw_params_cache=raw_cache
-    )
+    event, _ = build_permission_event(msg, shell_cache=shell_cache, raw_params_cache=raw_cache)
     event.sub_session_id = "child-a"
     assert event.shell_classified is False
     assert event.child_low_fidelity is True  # downgrade applies
@@ -6734,9 +6981,7 @@ def test_refinement_fills_raw_params_cache_for_following_permission():
             },
         }
     )
-    event, _ = build_permission_event(
-        msg, shell_cache=shell_cache, raw_params_cache=raw_cache
-    )
+    event, _ = build_permission_event(msg, shell_cache=shell_cache, raw_params_cache=raw_cache)
     event.sub_session_id = "child-a"
     assert event.raw_params_trusted is True
     assert event.shell_classified is True

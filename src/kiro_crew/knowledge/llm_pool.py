@@ -4,6 +4,7 @@ Provider-agnostic bounded pool of long-lived workers (CC or ACP).
 Knowledge extraction and URL fetch use separate instances of this pool so their
 workload policies and session state remain isolated.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -35,11 +36,13 @@ except ImportError:
 try:
     from kiro_crew.session_pid import register_protected_pid, unregister_protected_pid
 except Exception:  # pragma: no cover - standalone / test fallback
+
     def register_protected_pid(pid: int) -> None:  # type: ignore[misc]
         return None
 
     def unregister_protected_pid(pid: int) -> None:  # type: ignore[misc]
         return None
+
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +128,28 @@ def _get_provider_type(config: Optional[dict] = None) -> str:
     return provider if isinstance(provider, str) and provider else "acp"
 
 
+def _get_acp_backend(config: Optional[dict] = None) -> str:
+    """Configured ``agent.acp_backend``; defaults to kiro-cli (``""``).
+
+    Read here rather than threaded in, because the pool builds its own workers
+    and never sees the provider factory. Without this the pool spawned kiro-cli
+    on a host whose operator selected another backend — which on a host with no
+    kiro-cli at all is an unresolvable binary rather than a wrong answer.
+
+    Only a value the operator may actually persist is honoured. A known-but-not-
+    selectable id degrades to the default, matching what
+    ``config.loader._normalize_acp_backend`` does for the chat path, so the pool
+    cannot end up on a backend the rest of the process refused.
+    """
+    from kiro_crew.acp.types import ACP_BACKENDS_SELECTABLE
+
+    data = _read_config() if config is None else config
+    backend = _section(data, "agent").get("acp_backend")
+    if isinstance(backend, str) and backend in ACP_BACKENDS_SELECTABLE:
+        return backend
+    return ""
+
+
 def _get_sandbox_mode(config: Optional[dict] = None) -> str:
     """OS-level sandbox mode for knowledge-worker subprocesses.
 
@@ -158,9 +183,7 @@ def _get_idle_ttl(config: Optional[dict] = None) -> float:
     value falls back to the default rather than silently disabling the reaper.
     """
     data = _read_config() if config is None else config
-    value = _section(data, "knowledge").get(
-        "pool_idle_ttl_secs", DEFAULT_IDLE_TTL_SECS
-    )
+    value = _section(data, "knowledge").get("pool_idle_ttl_secs", DEFAULT_IDLE_TTL_SECS)
     if isinstance(value, bool):
         return DEFAULT_IDLE_TTL_SECS
     if isinstance(value, (int, float)) and value >= 0:
@@ -174,9 +197,7 @@ def _get_pool_size(config: Optional[dict] = None) -> int:
     Reads ``knowledge.extraction_pool_size`` (default 3, clamped 1–10).
     """
     data = _read_config() if config is None else config
-    value = _section(data, "knowledge").get(
-        "extraction_pool_size", DEFAULT_POOL_SIZE
-    )
+    value = _section(data, "knowledge").get("extraction_pool_size", DEFAULT_POOL_SIZE)
     if isinstance(value, bool):
         return DEFAULT_POOL_SIZE
     if isinstance(value, int) and 1 <= value <= 10:
@@ -197,8 +218,7 @@ def _normalize_effort(value: object) -> Optional[str]:
 def _select_effort_level(requested: str, supported: list[str]) -> Optional[str]:
     """Select the highest advertised effort no higher than ``requested``."""
     supported_levels = {
-        level for level in supported
-        if isinstance(level, str) and is_valid_effort(level)
+        level for level in supported if isinstance(level, str) and is_valid_effort(level)
     }
     if not supported_levels:
         # An advertised option without a usable level is treated like a lazy
@@ -206,7 +226,8 @@ def _select_effort_level(requested: str, supported: list[str]) -> Optional[str]:
         return requested
     requested_index = EFFORT_LEVELS.index(requested)
     eligible = [
-        level for level in EFFORT_LEVELS
+        level
+        for level in EFFORT_LEVELS
         if level in supported_levels and EFFORT_LEVELS.index(level) <= requested_index
     ]
     return eligible[-1] if eligible else None
@@ -298,9 +319,19 @@ class AcpWorker(Worker):
             if self._sandbox_mode is not None
             else await asyncio.to_thread(_get_sandbox_mode)
         )
-        logger.info("AcpWorker: starting with agent=%s", AGENT_NAME)
+        # Resolved at start, not at import: a respawn then follows the operator's
+        # current setting instead of the one in force when the module loaded.
+        acp_backend = await asyncio.to_thread(_get_acp_backend)
+        logger.info(
+            "AcpWorker: starting with agent=%s, acp_backend=%s",
+            AGENT_NAME,
+            acp_backend or "kiro",
+        )
         self._client = AcpClient(
-            agent=AGENT_NAME, sandbox_mode=sandbox_mode, audit_source="subagent"
+            agent=AGENT_NAME,
+            sandbox_mode=sandbox_mode,
+            audit_source="subagent",
+            acp_backend=acp_backend,
         )
         self._effective_effort = None
         await self._client.ensure_ready()
@@ -313,7 +344,11 @@ class AcpWorker(Worker):
             register_protected_pid(pid)
         else:
             self._protected_pid = None
-        logger.info("AcpWorker: ready (agent=%s, pid=%s)", AGENT_NAME, getattr(self._client, '_pid', 'unknown'))
+        logger.info(
+            "AcpWorker: ready (agent=%s, pid=%s)",
+            AGENT_NAME,
+            getattr(self._client, "_pid", "unknown"),
+        )
 
     async def _apply_effort(self) -> None:
         """Apply the requested effort without breaking provider-default fallback."""
@@ -335,8 +370,7 @@ class AcpWorker(Worker):
             effective = _select_effort_level(requested, supported)
             if effective is None:
                 logger.warning(
-                    "AcpWorker: no supported effort at or below %s; "
-                    "using provider default",
+                    "AcpWorker: no supported effort at or below %s; " "using provider default",
                     requested,
                 )
                 return
@@ -431,10 +465,14 @@ class CCWorker(Worker):
             self._claude_bin,
             "-p",
             "--verbose",
-            "--model", "haiku",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-            "--permission-mode", "bypassPermissions",
+            "--model",
+            "haiku",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--permission-mode",
+            "bypassPermissions",
         ]
         # Optional URL-fetch tool. Empty by default (no built-in remote fetch on a
         # vanilla machine). Users can opt in by setting KIROCREW_KNOWLEDGE_FETCH_TOOLS
@@ -478,10 +516,7 @@ class CCWorker(Worker):
             await self._spawn()
         assert self._proc is not None and self._proc.stdin is not None
 
-        msg = json.dumps({
-            "type": "user",
-            "message": {"role": "user", "content": prompt}
-        })
+        msg = json.dumps({"type": "user", "message": {"role": "user", "content": prompt}})
         self._proc.stdin.write((msg + "\n").encode())
         await self._proc.stdin.drain()
 
@@ -604,13 +639,8 @@ class LLMPool:
             # fallback default), so callers that pass a specific pool_size to the
             # constructor are not overridden.
             configured_size = _get_pool_size(config)
-            explicit = "extraction_pool_size" in (_section(
-                config, "knowledge") if config else {})
-            if (
-                self._use_config_pool_size
-                and explicit
-                and configured_size != self._pool_size
-            ):
+            explicit = "extraction_pool_size" in (_section(config, "knowledge") if config else {})
+            if self._use_config_pool_size and explicit and configured_size != self._pool_size:
                 self._pool_size = configured_size
                 self._semaphore = asyncio.Semaphore(configured_size)
             self._idle_ttl = _get_idle_ttl(config)
@@ -636,7 +666,8 @@ class LLMPool:
                 self._reaper_task = asyncio.create_task(self._idle_reaper())
             logger.info(
                 "LLMPool started: %d workers, provider=%s",
-                self._pool_size, self._provider_type,
+                self._pool_size,
+                self._provider_type,
             )
 
     async def _create_worker(self) -> Worker:
@@ -777,7 +808,8 @@ class LLMPool:
             self._reaping_workers = None
         logger.info(
             "LLMPool: scaled to zero after %.0fs idle (%d workers freed)",
-            self._idle_ttl, len(workers),
+            self._idle_ttl,
+            len(workers),
         )
         return True
 
@@ -822,8 +854,9 @@ class LLMPool:
             await worker.reset_conversation()
         except Exception:
             logger.warning(
-                "LLMPool: worker %d conversation reset failed; will be replaced on "
-                "next acquire", idx, exc_info=True,
+                "LLMPool: worker %d conversation reset failed; will be replaced on " "next acquire",
+                idx,
+                exc_info=True,
             )
 
     async def send_batch(self, prompts: list[str], timeout: float = DEFAULT_TIMEOUT) -> list[str]:

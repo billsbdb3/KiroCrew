@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import { motion } from 'framer-motion'
 import { useNavigate } from 'react-router-dom'
-import { ShieldCheck, BookOpen, Handshake, Rocket, Check, Clock } from 'lucide-react'
+import { ShieldCheck, BookOpen, Handshake, Rocket, Zap, Check, Clock } from 'lucide-react'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from './ui/dropdown-menu'
 import { useAppDispatch, useAppSelector } from '../store'
 import { changeApprovalMode } from '../store/dashboardSlice'
 import { safeSetItem } from '../utils/safeStorage'
+import { Btn } from './ui'
 
 import { i18nT } from '../i18n/t'
 /** Single source of truth for approval-mode presentation.
@@ -21,7 +22,13 @@ export const APPROVAL_SEGMENTS = [
   { key: 'yolo' as const, icon: <Rocket size={13} />, color: 'text-danger' },
 ]
 
-export type ApprovalModeKey = (typeof APPROVAL_SEGMENTS)[number]['key']
+const AUTO_SEGMENT = {
+  key: 'auto' as const,
+  icon: <Zap className="lucide-inline" />,
+  color: 'text-danger',
+}
+
+export type ApprovalModeKey = (typeof APPROVAL_SEGMENTS)[number]['key'] | typeof AUTO_SEGMENT['key']
 
 /** Localized name for a configured ad-hoc duration, so no raw config token
  *  reaches user-facing copy. Static literal keys keep the dead-key and
@@ -59,6 +66,12 @@ function segmentText(key: ApprovalModeKey): { label: string; tooltip: string; de
         tooltip: i18nT('components.approvalModePicker.yolo_tooltip'),
         desc: i18nT('components.approvalModePicker.yolo_desc'),
       }
+    case 'auto':
+      return {
+        label: i18nT('components.approvalModePicker.auto_label'),
+        tooltip: i18nT('components.approvalModePicker.auto_tooltip'),
+        desc: i18nT('components.approvalModePicker.auto_desc'),
+      }
     case 'normal':
     default:
       return {
@@ -69,12 +82,16 @@ function segmentText(key: ApprovalModeKey): { label: string; tooltip: string; de
   }
 }
 
-/** Approval-mode picker (Normal / Reads / Trust / YOLO) for the chat footer.
+/** Approval-mode picker (Normal / Reads / Trust / YOLO, plus Auto) for the chat footer.
  *
  *  Self-contained Radix DropdownMenu using the standard shadcn panel and item
  *  styling: renders its own trigger pill and dispatches changeApprovalMode
  *  itself. Radix supplies positioning, outside-click + Escape dismiss,
  *  arrow-key roving and focus return.
+ *
+ *  Auto appears only when the live harness advertised it (goose session mode
+ *  `auto`). It is a different confirm from YOLO: Auto skips PreToolUse, so
+ *  it uses `mc-harness-auto-ack`, never `mc-yolo-ack`.
  *
  *  The app-wide YOLO confirm gate is preserved: switching to YOLO without a
  *  stored `mc-yolo-ack` keeps the menu open (onSelect preventDefault) and
@@ -82,20 +99,24 @@ function segmentText(key: ApprovalModeKey): { label: string; tooltip: string; de
  *  `mc-yolo-ack` is committed ONLY when the user confirms via Enable with
  *  the checkbox ticked — never on checkbox change, so check-then-Cancel
  *  cannot silently disable the confirm. */
-export default function ApprovalModePicker({ mode, slotKey, compact }: { mode: string; slotKey: string; compact?: boolean }) {
+export default function ApprovalModePicker({ mode, slotKey, compact, permissionModes }: { mode: string; slotKey: string; compact?: boolean; permissionModes?: string[] }) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const yoloDuration = useAppSelector(s => s.dashboard.status?.yolo_duration)
   const [open, setOpen] = useState(false)
   const [yoloConfirm, setYoloConfirm] = useState(0)
   const [yoloDontAsk, setYoloDontAsk] = useState(false)
+  const [autoConfirm, setAutoConfirm] = useState(0)
+  const [autoDontAsk, setAutoDontAsk] = useState(false)
 
-  const display = APPROVAL_SEGMENTS.find(s => s.key === mode) || APPROVAL_SEGMENTS[0]
+  const offersAuto = (permissionModes ?? []).includes('auto')
+  const segments = offersAuto ? [...APPROVAL_SEGMENTS, AUTO_SEGMENT] : APPROVAL_SEGMENTS
+  const display = segments.find(s => s.key === mode) || (mode === 'auto' ? AUTO_SEGMENT : APPROVAL_SEGMENTS[0])
   const displayText = segmentText(display.key)
 
   const onOpenChange = (o: boolean) => {
     setOpen(o)
-    if (!o) { setYoloConfirm(0); setYoloDontAsk(false) }
+    if (!o) { setYoloConfirm(0); setYoloDontAsk(false); setAutoConfirm(0); setAutoDontAsk(false) }
   }
 
   const pick = (m: ApprovalModeKey) => {
@@ -115,7 +136,7 @@ export default function ApprovalModePicker({ mode, slotKey, compact }: { mode: s
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent side="top" align="start" collisionPadding={8} className="w-[280px]">
-        {APPROVAL_SEGMENTS.map(s => {
+        {segments.map(s => {
           const t = segmentText(s.key)
           return (
           <DropdownMenuItem
@@ -127,6 +148,13 @@ export default function ApprovalModePicker({ mode, slotKey, compact }: { mode: s
                 if (localStorage.getItem('mc-yolo-ack')) { pick('yolo'); return }
                 e.preventDefault()
                 setYoloConfirm(c => c + 1)
+                return
+              }
+              if (s.key === 'auto') {
+                if (mode === 'auto') { e.preventDefault(); return }
+                if (localStorage.getItem('mc-harness-auto-ack')) { pick('auto'); return }
+                e.preventDefault()
+                setAutoConfirm(c => c + 1)
                 return
               }
               pick(s.key)
@@ -174,8 +202,18 @@ export default function ApprovalModePicker({ mode, slotKey, compact }: { mode: s
                 <button className="px-2.5 py-1 rounded-md text-muted hover:text-text hover:bg-bg-hover cursor-pointer bg-transparent border-none" onClick={() => setYoloConfirm(0)}>
                   {i18nT('components.approvalModePicker.cancel')}
                 </button>
-                <label className="flex items-center gap-1 text-[11px] text-muted cursor-pointer ml-auto">
-                  <input type="checkbox" className="rounded" checked={yoloDontAsk} onChange={e => setYoloDontAsk(e.target.checked)} />
+                <label
+                  htmlFor="approval-yolo-dont-ask"
+                  className="flex items-center gap-1 text-[11px] text-muted cursor-pointer ml-auto"
+                >
+                  <input
+                    id="approval-yolo-dont-ask"
+                    type="checkbox"
+                    className="rounded"
+                    aria-label={i18nT('components.approvalModePicker.don_t_show_again')}
+                    checked={yoloDontAsk}
+                    onChange={e => setYoloDontAsk(e.target.checked)}
+                  />
                   {i18nT('components.approvalModePicker.don_t_show_again')}
                 </label>
               </div>
@@ -185,6 +223,48 @@ export default function ApprovalModePicker({ mode, slotKey, compact }: { mode: s
               >
                 {i18nT('components.approvalModePicker.configure_duration')}
               </button>
+            </motion.div>
+          </>
+        )}
+        {autoConfirm > 0 && (
+          <>
+            <DropdownMenuSeparator />
+            <motion.div
+              key={autoConfirm}
+              animate={{ x: [0, -3, 3, -2, 2, 0] }}
+              transition={{ duration: 0.3 }}
+              className="px-3 py-2 text-[12px]"
+              onClick={e => e.stopPropagation()}
+              onKeyDown={e => e.stopPropagation()}
+            >
+              <p className="font-medium text-text">{i18nT('components.approvalModePicker.auto_confirm_title')}</p>
+              <p className="text-muted mt-0.5">{i18nT('components.approvalModePicker.auto_confirm_body')}</p>
+              <div className="flex items-center gap-2 mt-1.5">
+                <Btn
+                  autoFocus
+                  danger
+                  onClick={() => { if (autoDontAsk) safeSetItem('mc-harness-auto-ack', '1'); pick('auto') }}
+                >
+                  {i18nT('components.approvalModePicker.enable')}
+                </Btn>
+                <Btn onClick={() => setAutoConfirm(0)}>
+                  {i18nT('components.approvalModePicker.cancel')}
+                </Btn>
+                <label
+                  htmlFor="approval-auto-dont-ask"
+                  className="flex items-center gap-1 text-[11px] text-muted cursor-pointer ml-auto"
+                >
+                  <input
+                    id="approval-auto-dont-ask"
+                    type="checkbox"
+                    className="rounded"
+                    aria-label={i18nT('components.approvalModePicker.don_t_show_again')}
+                    checked={autoDontAsk}
+                    onChange={e => setAutoDontAsk(e.target.checked)}
+                  />
+                  {i18nT('components.approvalModePicker.don_t_show_again')}
+                </label>
+              </div>
             </motion.div>
           </>
         )}

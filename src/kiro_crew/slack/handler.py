@@ -157,6 +157,88 @@ _BANG_TO_SLASH: dict[str, str] = {
 APPROVAL_AUTO = "auto"
 APPROVAL_INTERACTIVE = "interactive"
 
+#: Slack reaction when a mid-turn message is folded via ``_session/steer``.
+_STEER_ACK_REACTION = "speech_balloon"
+#: Slack reaction when a mid-turn message is queued as a follow-up turn.
+_FOLLOW_UP_ACK_REACTION = "hourglass_flowing_sand"
+
+
+def _busy_owner_key(sessions: SessionManager, session_key: str, thread_ts: str = "") -> str:
+    """The live session a Slack thread is driving (dashboard link or itself)."""
+    lookup = thread_ts or session_key
+    owner = sessions.get_session_for_thread(lookup)
+    if isinstance(owner, str) and owner:
+        return owner
+    return session_key
+
+
+def dequeue_busy_followup(
+    sessions: SessionManager, session_key: str, thread_ts: str = ""
+) -> tuple[str, str, dict] | None:
+    """Pop the next mid-turn follow-up, trying the linked owner first.
+
+    ``inject_busy_followup`` enqueues on the live owner (a dashboard slot when
+    the thread is linked). The events.py drain still holds the bare Slack
+    ``thread_ts``, so a bare-only dequeue would strand those messages.
+    """
+    owner = _busy_owner_key(sessions, session_key, thread_ts)
+    if owner != session_key:
+        item = sessions.dequeue(owner)
+        if item is not None:
+            return item
+    return sessions.dequeue(session_key)
+
+
+async def inject_busy_followup(
+    sessions: SessionManager,
+    session_key: str,
+    text: str,
+    msg_ts: str,
+    *,
+    slack: SlackClientOps | None = None,
+    channel: str = "",
+    thread_ts: str = "",
+    force_busy: bool = False,
+    enqueue_kwargs: dict | None = None,
+) -> str:
+    """Handle a Slack message that arrived while a turn is already in flight.
+
+    Returns ``"idle"`` when the session is not busy (caller continues into
+    ``get_or_create``). Otherwise steers immediately when the live provider
+    implements ``supports_steer`` (kiro + KAS), or enqueues a follow-up and
+    returns without waiting on the session semaphore — the Discord-shaped
+    path. Spec adapters stay out of ``ACP_BACKENDS_STEER``; this reads the
+    named capability rather than comparing backend ids (H5/H6).
+
+    ``force_busy`` covers the events.py startup race: a handler task exists
+    but has not acquired the semaphore yet.
+    """
+    owner = _busy_owner_key(sessions, session_key, thread_ts)
+    if not force_busy and sessions.is_busy(owner) is not True:
+        return "idle"
+    provider = sessions.get_provider(owner)
+    if provider is not None and getattr(provider, "supports_steer", False) is True:
+        steer = getattr(provider, "steer", None)
+        has_active = getattr(provider, "has_active_turn", None)
+        live = has_active is None or bool(has_active())
+        if live and steer is not None and await steer(text) is True:
+            if slack is not None and channel and msg_ts:
+                try:
+                    await slack.add_reaction(channel, msg_ts, _STEER_ACK_REACTION)
+                except Exception:
+                    logger.debug("slack: steer ack reaction failed", exc_info=True)
+            return "steer"
+    extra = dict(enqueue_kwargs or {})
+    queued = sessions.enqueue(owner, msg_ts, text, force=True, **extra)
+    if queued is not True:
+        return "idle"
+    if slack is not None and channel and msg_ts:
+        try:
+            await slack.add_reaction(channel, msg_ts, _FOLLOW_UP_ACK_REACTION)
+        except Exception:
+            logger.debug("slack: follow-up ack reaction failed", exc_info=True)
+    return "follow_up"
+
 
 def _should_auto_approve_spawn(context_builder, event_title: str) -> bool:
     """Check if a spawn_run tool call should be auto-approved."""
@@ -2241,9 +2323,7 @@ async def _handle_compact_command(
                 outcome = "completed"
             elif cr["type"] == "failed":
                 error = cr.get("summary", "")
-                result_text = (
-                    f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
-                )
+                result_text = f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
                 outcome = "failed"
             else:
                 result_text = "⚠️ Compaction timed out."
@@ -3080,6 +3160,25 @@ async def handle_message(
         session_key = thread_owner_key
 
     client: LLMProvider | None = None
+    _mid_turn = await inject_busy_followup(
+        sessions,
+        session_key,
+        text,
+        msg_ts,
+        slack=slack,
+        channel=channel,
+        thread_ts=reply_ts,
+        enqueue_kwargs={
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "sender_id": user_id,
+            "team_id": team_id,
+            "agent_override": channel_agent,
+            "user_display_name": user_display_name,
+        },
+    )
+    if _mid_turn != "idle":
+        return
     try:
         task.start()
         # Re-resolve _agent against (possibly linked) session_key for the main

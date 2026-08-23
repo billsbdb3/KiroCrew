@@ -1383,6 +1383,27 @@ def resolve_agent_config_path() -> Path:
     return config_package_dir() / "defaults.json"
 
 
+def _selectable_acp_backends() -> list[str]:
+    """The values an operator may persist in ``agent.acp_backend``.
+
+    A function, not a literal, and called at SCHEMA-BUILD time rather than while
+    this module's dataclasses are being defined. The import cannot happen at class
+    definition: reaching ``kiro_crew.acp.types`` executes the ``kiro_crew.acp``
+    package init, which imports the ACP client and runtime, which import this
+    module — the same cycle ``_normalize_acp_backend`` documents.
+
+    Restating the list instead is what allowed the schema to keep validating
+    against ``['', 'kas']`` after codex, claude and goose became selectable. That
+    failed in the worst available way: the config PATCH validated against a
+    different allowlist, answered 200, and this schema then rejected the value on
+    the next load and silently degraded it to the default — a save that reported
+    success and changed nothing.
+    """
+    from kiro_crew.acp import backends as acp_backends
+
+    return sorted(acp_backends.selectable_ids())
+
+
 def _meta(label: str, help: str, **kwargs: object) -> dict:
     """Helper to build field metadata dicts with safe defaults."""
     return {"label": label, "help": help, **kwargs}
@@ -1531,9 +1552,31 @@ class AgentConfig:
         default="",
         metadata=_meta(
             "ACP Backend",
-            "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent. "
-            "KAS runs chat but has no native subagent progress reporting yet.",
-            enum=["", "kas"],
+            "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent, "
+            "or an operator-installed registry adapter "
+            "('claude', 'codex', 'goose', 'opencode', 'pi'). "
+            "An adapter whose tool calls cannot be shown to reach Kiro Crew's gate "
+            "is refused at session start unless acp_backend_allow_ungated_tools.",
+            # Derived, never restated. A hardcoded list here silently froze at
+            # ['', 'kas'] while three adapters were added to
+            # ACP_BACKENDS_SELECTABLE, and the failure was invisible from the API:
+            # the PATCH validated against the editable-config allowlist, answered
+            # 200, and this schema then rejected the value on the next load and
+            # degraded it to the default. A save that reports success and changes
+            # nothing is worse than a refusal, so the two must read one source.
+            enum=_selectable_acp_backends,
+        ),
+    )
+    acp_backend_allow_ungated_tools: bool = field(
+        default=False,
+        metadata=_meta(
+            "Allow Ungated Tools",
+            "Start a session on an experimental ACP backend even when its tool "
+            "decisions cannot be shown to reach Kiro Crew's PreToolUse gate. "
+            "OFF by default, and leaving it off is the safe choice: with it on, "
+            "the bundled denied-command rules, the sensitive-path block and the "
+            "governance ceiling are not consulted for tool calls the backend "
+            "auto-approves on its own.",
         ),
     )
     default_agent: str = field(
@@ -4458,14 +4501,14 @@ def _normalize_acp_backend(value: object) -> str:
     imports the ACP client and runtime, which import this module — and this
     module is imported first by the gateway and desktop entrypoints.
     """
-    from kiro_crew.acp.types import (
-        ACP_BACKEND_KIRO,
-        ACP_BACKENDS_KNOWN,
-        ACP_BACKENDS_SELECTABLE,
-    )
+    from kiro_crew.acp import backends as acp_backends
+    from kiro_crew.acp.types import ACP_BACKEND_KIRO, ACP_BACKENDS_KNOWN
 
-    if isinstance(value, str) and value in ACP_BACKENDS_SELECTABLE:
-        return value
+    selectable = acp_backends.selectable_ids()
+    if isinstance(value, str):
+        value = acp_backends.canonical_backend_id(value)
+        if value in selectable:
+            return value
     if value not in (None, ""):
         known_but_unusable = isinstance(value, str) and value in ACP_BACKENDS_KNOWN
         logger.warning(
@@ -4473,7 +4516,7 @@ def _normalize_acp_backend(value: object) -> str:
             "Selectable values: %s",
             value,
             "not usable yet" if known_but_unusable else "unknown",
-            ", ".join(repr(b) for b in sorted(ACP_BACKENDS_SELECTABLE)),
+            ", ".join(repr(b) for b in sorted(selectable)),
         )
     return ACP_BACKEND_KIRO
 
@@ -7139,6 +7182,9 @@ class KiroCrewConfig:
                 provider=agent_data.get("provider", "acp"),
                 mcp_registry_mode=_safe_bool(agent_data.get("mcp_registry_mode", False), False),
                 acp_backend=_normalize_acp_backend(agent_data.get("acp_backend")),
+                acp_backend_allow_ungated_tools=_safe_bool(
+                    agent_data.get("acp_backend_allow_ungated_tools"), False
+                ),
                 default_agent=agent_data.get("default_agent", ""),
                 sweep_agents_backups=_safe_bool(
                     agent_data.get("sweep_agents_backups", False), False
@@ -8295,11 +8341,23 @@ class KiroCrewConfig:
 
         KiroCrew is KiroACP-only: the sole provider is the ACP adapter driving
         the kiro-cli backend. The factory accepts an optional ``session_key`` to
-        create a per-session subdirectory under ``workspace_root()``.
+        create a per-session subdirectory under ``workspace_root()``, and an
+        optional ``acp_backend`` to pin a dedicated child to a live parent
+        harness (``None`` keeps this snapshot; ``""`` is kiro-cli).
         """
-        from kiro_crew.providers.acp import (
-            AcpProvider,  # circular: acp -> client -> session -> config.loader
-        )
+        # Both imports are deferred: importing either package runs code that
+        # reaches back into config.loader (acp -> client -> session -> loader).
+        from kiro_crew.acp import backends as acp_backends
+        from kiro_crew.providers.acp import AcpProvider
+
+        factory_backend = self.agent.acp_backend or ""
+        # A programmatic config mutation bypasses the persisted-value normalizer.
+        # Refuse an unknown backend while the factory is built, rather than
+        # deferring the typo until the first session tries a capability lookup.
+        acp_backends.descriptor_for(factory_backend)
+        # Capability lookups follow the effective backend of each call. Dedicated
+        # subagent children pass the live parent harness, which can differ from
+        # this snapshot after a Settings switch.
 
         model = self.agent.model
         if model == DEFAULT_MODEL:
@@ -8341,8 +8399,13 @@ class KiroCrewConfig:
             extra_env: dict[str, str] | None = None,
             reasoning_effort_override: str | None = None,
             crew_agent: str | None = None,
+            acp_backend: str | None = None,
             **_kwargs: object,
         ) -> AcpProvider:
+            # None = factory snapshot. "" is kiro-cli and must pin, not fall back.
+            backend = factory_backend if acp_backend is None else acp_backend
+            registry_model_ids = acp_backends.supports(backend, acp_backends.CAP_REGISTRY_MODEL_IDS)
+            tool_search_supported = acp_backends.supports(backend, acp_backends.CAP_TOOL_SEARCH)
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
             # Canonical crew identity for the session (keys per-agent watchdog
             # windows on the handle) — one shared resolution rule, see
@@ -8383,7 +8446,13 @@ class KiroCrewConfig:
             # …) are DISTINCT real kiro models and must pass through unchanged,
             # not get folded to Sonnet the way the claude_code path downgrades
             # them (the claude backend has no Haiku).
-            m = model_registry.to_acp_id(m) if m else m
+            #
+            # Gated on the capability rather than on "is the backend empty":
+            # a backend whose ids are not model_registry keys must receive the
+            # value untouched, since translating it would either fold it onto an
+            # unrelated kiro model or drop it.
+            if registry_model_ids:
+                m = model_registry.to_acp_id(m) if m else m
             # Thread the slot's effort into a per-model override so the kiro
             # cli.json overlay is written from it at spawn — without this, a
             # kiro cold start (or the handler's reset-then-respawn) would only
@@ -8410,14 +8479,18 @@ class KiroCrewConfig:
                 session_key=session_key,
                 channel_id=channel_id,
                 extra_env=extra_env,
-                acp_backend=self.agent.acp_backend,
+                acp_backend=backend,
                 effort_per_model=_eff_per_model,
-                tool_search=tool_search,
+                # None means "do not write the overlay at all", which is the
+                # correct request for a backend that does not read kiro-cli's
+                # cli.json. Passing False would write an explicit disable.
+                tool_search=(tool_search if tool_search_supported else None),
                 tool_search_min_pct=tool_search_min_pct,
                 tool_search_min_tokens=tool_search_min_tokens,
                 mcp_gateway_overlay=_gw_overlay,
                 mcp_gateway_settings_mcp_json=_gw_settings,
                 mcp_gateway_socket=_gw_socket,
+                allow_ungated_tools=self.agent.acp_backend_allow_ungated_tools,
             )
 
         return _acp

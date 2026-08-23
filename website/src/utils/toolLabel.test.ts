@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { labelMatchesLanguage, pickToolLabel } from './toolLabel'
+import { compactShellToolLabel, labelMatchesLanguage, pickCompactToolLabel, pickToolLabel } from './toolLabel'
 
 describe('labelMatchesLanguage', () => {
   it('accepts same-script prose', () => {
@@ -84,5 +84,86 @@ describe('pickToolLabel', () => {
   it('trims the purpose before deciding', () => {
     expect(pickToolLabel({ simplified: true, purpose: '  Fetch the node  ', rawLabel, uiLang: 'en' }))
       .toBe('Fetch the node')
+  })
+})
+
+describe('compactShellToolLabel', () => {
+  const long = (command: string) => `/bin/zsh -lc "${command}${' '.repeat(140)}"`
+
+  it('leaves short shell titles untouched', () => {
+    expect(compactShellToolLabel('git status')).toBe('git status')
+  })
+
+  it('summarizes repeated reads of one file without exposing the full command', () => {
+    const command = [
+      "sed -n '1,40p' /opt/codex-acp/dist/index.js",
+      "sed -n '80,120p' /opt/codex-acp/dist/index.js",
+      "sed -n '160,200p' /opt/codex-acp/dist/index.js",
+      "sed -n '240,280p' /opt/codex-acp/dist/index.js",
+    ].join('; ')
+    expect(compactShellToolLabel(long(command), JSON.stringify({ command })))
+      .toBe('sed ×4 · index.js')
+  })
+
+  it('summarizes a mixed edit and verification chain by executable', () => {
+    const command = [
+      "perl -0pi -e 's/old/new/' src/kiro_crew/acp/backends.py",
+      "perl -0pi -e 's/old/new/' src/kiro_crew/acp/types.py",
+      'git diff --check',
+    ].join('; ')
+    expect(compactShellToolLabel(long(command), JSON.stringify({ command })))
+      .toBe('perl + git diff ×3')
+  })
+
+  it('does not split separators inside quoted replacement text', () => {
+    const command = "perl -0pi -e 's/old/a; b && c/' src/kiro_crew/acp/types.py; git diff --check"
+    expect(compactShellToolLabel(long(command), JSON.stringify({ command })))
+      .toBe('perl + git diff ×2 · types.py')
+  })
+
+  it('falls back to a bounded label when no executable can be recovered', () => {
+    const label = `${' '.repeat(4)}${'?'.repeat(180)}`
+    expect(compactShellToolLabel(label)).toHaveLength(120)
+    expect(compactShellToolLabel(label).endsWith('…')).toBe(true)
+  })
+})
+
+describe('pickCompactToolLabel', () => {
+  const command = [
+    `perl -0pi -e 's/${'old'.repeat(40)}/new/' src/kiro_crew/acp/backends.py`,
+    'git diff --check',
+  ].join('; ')
+  const rawLabel = `/bin/zsh -lc "${command}"`
+
+  it('keeps an agent-written purpose instead of replacing it with a shell summary', () => {
+    expect(pickCompactToolLabel({
+      simplified: true,
+      purpose: 'Update and verify capability definitions',
+      rawLabel,
+      uiLang: 'en',
+      isShell: true,
+    })).toBe('Update and verify capability definitions')
+  })
+
+  it('compacts an oversized raw shell label in simplified and raw modes', () => {
+    for (const simplified of [true, false]) {
+      expect(pickCompactToolLabel({
+        simplified,
+        purpose: '',
+        rawLabel,
+        uiLang: 'en',
+        isShell: true,
+      })).toBe('perl + git diff ×2 · backends.py')
+    }
+  })
+
+  it('does not compact long non-shell tool titles', () => {
+    expect(pickCompactToolLabel({
+      simplified: true,
+      purpose: '',
+      rawLabel,
+      uiLang: 'en',
+      isShell: false,
+    })).toBe(rawLabel)
   })
 })

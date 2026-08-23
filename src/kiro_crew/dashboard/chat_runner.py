@@ -218,6 +218,7 @@ from kiro_crew.providers.base import (
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
     LLMEvent,
+    LLMProvider,
 )
 from kiro_crew.quick_prompts import QUICK_PROMPTS
 from kiro_crew.safety_override import safety_override
@@ -1079,6 +1080,25 @@ def _context_usage_payload(slot_key: str, client: Any) -> dict[str, Any]:
         payload["window_tokens"] = window
     else:
         payload["reset"] = True
+    # Plan rate limit (claude-agent-acp's `_meta["_claude/rateLimit"]`), attached
+    # to this frame rather than given its own event: it rides the same
+    # usage_update the context counts come from, refreshes on the same cadence,
+    # and lands in the same popover. Omitted entirely when the provider reports
+    # none, so the key's PRESENCE is the frontend's "this harness has a quota"
+    # signal — an empty dict would render a header over no rows. The `reset`
+    # branch above does not clear it: a compaction changes the transcript, not
+    # the account's quota.
+    #
+    # Read through the ABC-declared accessor on a positive isinstance check, not
+    # a `hasattr` capability probe (H8): the method exists on every conforming
+    # provider with a None default, so a probe would be testing whether `client`
+    # is a provider at all — which is what the isinstance actually asks. The dict
+    # check then keeps an unspecced test double's Mock return (truthy, and not
+    # JSON-serializable) out of a live WS frame.
+    if isinstance(client, LLMProvider):
+        rate_limit = client.rate_limit_payload()
+        if isinstance(rate_limit, dict) and rate_limit:
+            payload["rate_limit"] = rate_limit
     return payload
 
 
@@ -6723,9 +6743,11 @@ async def _run_chat(
                 # tool's own return over the MCP pipe — this does NOT rewrite the
                 # model's tool result, which is why the tool's own message is
                 # written to not over-claim the (consumer-applied) effect.
-                # Gated on _pending_dir_tool — the CANONICAL _meta.kiro tool name
-                # for a genuine MCP call, NOT model-authored result/title text —
-                # so a forged marker under a shell/non-directive tool is ignored.
+                # Gated on _pending_dir_tool — the CANONICAL tool name for a
+                # genuine MCP call (kiro ``_meta.kiro`` or a non-shell
+                # spec-adapter ``mcp__`` title), NOT model-authored result
+                # text — so a forged marker under a shell/non-directive tool
+                # is ignored.
                 # A native sub-agent's tool calls DO surface here (flat events
                 # tagged in _native_tc_card) but have no independently bindable
                 # slot, so they are refused rather than applied to the parent —

@@ -24,6 +24,9 @@ def register(app: web.Application) -> None:
     # Agents
     app.router.add_get("/api/agents/installed", handlers.api_agents_installed)
     app.router.add_get("/api/models", handlers.api_models)
+    # Backend registry: the ONE source for the capability table, so the Settings
+    # card and `kirocrew doctor` cannot disagree about what a backend supports.
+    app.router.add_get("/api/acp-backends", handlers.api_acp_backends)
     app.router.add_get("/api/effort-levels", handlers.api_effort_levels)
     app.router.add_get("/api/slash-commands", handlers.api_slash_commands)
     app.router.add_get("/api/agents/detail/{name}", handlers.api_agent_detail)

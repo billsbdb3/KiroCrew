@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import type { ReactElement } from 'react'
 import { render, screen, renderHook, act, cleanup } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
+import { ACP_BACKEND_ROUTE } from '../pages/overview/AcpBackendCard'
 
 // DeveloperPage's sibling tabs are heavy and irrelevant here — the last describe
 // only needs the page's tab rail and the Feature Previews pane behind it.
@@ -291,5 +292,19 @@ describe('Developer > Feature Previews', () => {
     const tab = screen.getByRole('button', { name: /feature previews/i })
     await act(async () => { tab.click() })
     expect(screen.getByRole('switch', { name: /webhooks/i })).toBeTruthy()
+  })
+})
+
+/**
+ * The Developer tab key the top-bar harness readout deep-links to. It lives in
+ * this file because the mocks that make `DeveloperPage` cheap to render are
+ * already here, and because the claim is the same shape as the one above: a tab
+ * key that no longer names the pane holding the control leaves the reader on
+ * whichever tab the rail defaults to, with every unit test still green.
+ */
+describe('ACP adapter deep link', () => {
+  it('names a Developer tab that renders the adapter card owner', () => {
+    render(<MemoryRouter initialEntries={[ACP_BACKEND_ROUTE]}><DeveloperPage /></MemoryRouter>)
+    expect(screen.getByTestId('kirocrew-cfg')).toBeTruthy()
   })
 })

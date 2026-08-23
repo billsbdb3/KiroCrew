@@ -113,7 +113,8 @@ def _optional_inner(tp: type) -> tuple[type, bool]:
     origin = typing.get_origin(tp)
     if origin is typing.Union or (
         # ``X | None`` (PEP 604) has origin ``types.UnionType`` on 3.10+
-        origin is not None and getattr(origin, "__name__", "") == "UnionType"
+        origin is not None
+        and getattr(origin, "__name__", "") == "UnionType"
     ):
         args = [a for a in typing.get_args(tp) if a is not type(None)]  # noqa: E721
         if len(args) == 1 and len(typing.get_args(tp)) == 2:
@@ -160,6 +161,16 @@ def _build_field_schema(
     sensitive: bool = meta.get("sensitive", False)
     deprecated: bool = meta.get("deprecated", False)
     enum_values: list | None = meta.get("enum", None)
+    # An enum may be supplied as a CALLABLE, resolved here at schema-build time
+    # rather than at class-definition time. Some vocabularies cannot be imported
+    # while the dataclass is being defined: `agent.acp_backend` draws its values
+    # from `kiro_crew.acp.types`, and importing that executes the `kiro_crew.acp`
+    # package init, which imports the ACP client, which imports the config loader
+    # being defined. Restating the list instead is what let it freeze at
+    # ['', 'kas'] while three adapters were added, so the indirection buys a
+    # single source of truth.
+    if callable(enum_values):
+        enum_values = list(enum_values())
 
     tp: type = resolved_type if resolved_type is not None else str
     # A field annotated ``X | None`` / ``Optional[X]`` maps to its base type

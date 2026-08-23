@@ -354,8 +354,17 @@ def validate_config_data(data: dict) -> dict:
 
     # 3. Normalize case-insensitive enum fields before validation
     agent = data.get("agent")
-    if isinstance(agent, dict) and isinstance(agent.get("log_level"), str):
-        agent["log_level"] = agent["log_level"].upper()
+    if isinstance(agent, dict):
+        if isinstance(agent.get("log_level"), str):
+            agent["log_level"] = agent["log_level"].upper()
+        # Map a persisted registry spelling onto the hand-written id before the
+        # schema enum runs. selectable_ids() no longer lists ``codex-acp``, so
+        # leaving the registry id in place would delete the field and the
+        # loader would degrade to kiro — the opposite of the alias.
+        if isinstance(agent.get("acp_backend"), str):
+            from kiro_crew.acp.backends import canonical_backend_id
+
+            agent["acp_backend"] = canonical_backend_id(agent["acp_backend"])
 
     # 4. Preserve numeric values written by older config writers.
     _coerce_legacy_numeric_values(data, JSON_SCHEMA)
@@ -399,8 +408,7 @@ def validate_config_data(data: dict) -> dict:
                 actual = _actual_type_name(value)
                 removed = _apply_field_default(data, dot_path)
                 logger.warning(
-                    "Config: type mismatch at '%s': "
-                    "expected %s, got %s (value: %s); %s",
+                    "Config: type mismatch at '%s': " "expected %s, got %s (value: %s); %s",
                     dot_path,
                     expected,
                     actual,

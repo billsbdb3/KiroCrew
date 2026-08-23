@@ -23,6 +23,45 @@ logger = logging.getLogger(__name__)
 _LOCAL_DASHBOARD_OWNER_SUBJECTS = frozenset({"local-app", "local-startup"})
 
 
+def _configured_acp_backend() -> str:
+    """The configured non-default ACP backend, or ``""`` for kiro-cli.
+
+    Fails closed to ``""``: an unreadable config keeps the kiro-cli first-run
+    gate in force rather than suppressing it.
+    """
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return KiroCrewConfig.load().agent.acp_backend or ""
+    except Exception:
+        return ""
+
+
+def _alt_backend_snapshot() -> dict[str, Any]:
+    """A ready snapshot for a host whose backend is not kiro-cli.
+
+    Built from the same dataclass as the real snapshot so the shape cannot drift.
+    ``ready`` alone is what the SPA's blocking gate consults; the remaining flags
+    are set consistently so no other consumer reads a half-ready state and shows
+    a partial setup prompt.
+
+    This asserts nothing about the OTHER backend's readiness — that is reported by
+    ``kirocrew doctor`` and by the tool-gate refusal at session start, which name
+    that backend's own adapter and sign-in command.
+    """
+    result: dict[str, Any] = asdict(
+        PrerequisiteStatus(
+            platform="gateway",
+            installed=True,
+            authenticated=True,
+            ready=True,
+            initial_setup_complete=True,
+        )
+    )
+    result["operation"] = legacy_idle_operation()
+    return result
+
+
 def _not_ready_snapshot(initial_setup_complete: bool = False) -> dict[str, Any]:
     """A retryable not-ready snapshot for when a status probe cannot run.
 
@@ -117,6 +156,24 @@ async def api_kiro_prerequisite_status(request: web.Request) -> web.Response:
         denied = await _dashboard_owner_only(request)
         assert denied is not None
         return denied
+
+    # Backend scope: every field this endpoint reports is about kiro-cli — is it
+    # installed, is it signed in, are its agent specs present. On a host running
+    # another ACP backend those are unanswerable rather than merely false, and a
+    # not-ready answer makes the SPA raise its full-screen first-run gate over a
+    # dashboard that works. Answer ready WITHOUT probing: probing would spawn a
+    # kiro-cli that may not exist, on a poll.
+    #
+    # The other backend's own readiness is reported by `kirocrew doctor` and by
+    # the tool-gate refusal at session start, both of which name that backend's
+    # adapter and sign-in command.
+    if await asyncio.to_thread(_configured_acp_backend):
+        return web.json_response(
+            {
+                **_alt_backend_snapshot(),
+                "setup_allowed": _is_dashboard_owner(request),
+            }
+        )
 
     # Only an owner may force a host probe; a non-owner's refresh reads latched
     # state like any other poll (they receive the redacted payload regardless).

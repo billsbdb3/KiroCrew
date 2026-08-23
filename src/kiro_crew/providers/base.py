@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Any, Literal
 
 # Event kinds — re-exported from the single source of truth
 from kiro_crew.acp.types import (  # noqa: F401
@@ -119,6 +119,21 @@ class LLMProvider(ABC):
         "used / window" token text. Default 0.
         """
         return 0
+
+    def rate_limit_payload(self) -> dict[str, Any] | None:
+        """Plan rate-limit state for the account, or None when not reported.
+
+        A serialized :class:`~kiro_crew.acp.types.AcpRateLimit` — the ABC returns
+        the dict rather than the dataclass so a non-ACP provider is not made to
+        import ACP types to satisfy the seam.
+
+        Declared here with a safe default (H8: a new provider capability lands
+        on the ABC, never as a ``hasattr`` probe on the Kiro path) because most
+        harnesses report no quota at all: kiro-cli bills in credits through a
+        different method entirely, and codex-acp and goose send nothing. Those
+        providers inherit None and the dashboard omits the row.
+        """
+        return None
 
     @property
     def session_id(self) -> str:

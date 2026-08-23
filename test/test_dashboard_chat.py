@@ -21,6 +21,7 @@ from chat_test_helpers import (
     _make_folder_app,
     _make_ready_kiro_prerequisite,
     _make_state,
+    stub_acp_identity,
 )
 
 from kiro_crew.acp.types import TurnUsage
@@ -16307,11 +16308,18 @@ class TestSlotModelLiveSwitch:
         supports_effort: bool = False,
         change_effort: bool = True,
     ):
-        """A live AcpProvider double. ``spec=`` keeps isinstance() working."""
+        """A live AcpProvider double. ``spec=`` keeps isinstance() working.
+
+        The identity is stubbed as a whole SET from one backend id: an unstubbed
+        ``spec=`` property answers a truthy Mock, so setting only the claude flag
+        would leave this double claiming every other harness identity too, and
+        dispatch keyed on any of them would take the wrong branch.
+        """
+        from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, ACP_BACKEND_KIRO
         from kiro_crew.providers.acp import AcpProvider
 
         provider = MagicMock(spec=AcpProvider)
-        provider.is_claude_backend = claude
+        stub_acp_identity(provider, ACP_BACKEND_CLAUDE if claude else ACP_BACKEND_KIRO)
         provider.has_active_turn.return_value = active_turn
         provider.available_models.return_value = [{"modelId": m} for m in models]
         provider.supports_effort.return_value = supports_effort

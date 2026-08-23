@@ -75,6 +75,75 @@ async def _patch(client, path, value):
 # ── Per-role models (agent.role_models.*) ─────────────────────────────────
 
 
+class TestBackendSwitchHealsNamespacedModels:
+    """A model id belongs to one backend's namespace, so it cannot survive a switch.
+
+    kiro's `gpt-5.6-sol` is not a Claude model under any spelling. Left in the
+    config it is refused at the wire on every future session, and the picker keeps
+    showing a selection the backend will never honour — while the picker that
+    would correct it lives behind the session that could not start.
+    """
+
+    @pytest.mark.asyncio
+    async def test_switching_backend_resets_a_namespaced_model(self, tmp_path) -> None:
+        cfg_path = tmp_path / "config.json"
+        seeded = _seed_config()
+        seeded["agent"]["acp_backend"] = ""
+        seeded["agent"]["model"] = "gpt-5.6-sol"
+        seeded["agent"]["role_models"] = {"background": "gpt-5.6-terra", "subagent": "auto"}
+        cfg_path.write_text(json.dumps(seeded), encoding="utf-8")
+
+        app = _make_app()
+        sessions = SimpleNamespace(refresh_defaults=AsyncMock())
+        app["state"] = SimpleNamespace(
+            _slots={"chat-1": SimpleNamespace(model="gpt-5.6-sol")},
+            push_slots_update=lambda: None,
+            sessions=sessions,
+        )
+        with patch("kiro_crew.config.loader.config_path", return_value=cfg_path):
+            async with TestClient(TestServer(app)) as c:
+                resp = await _patch(c, "agent.acp_backend", "claude")
+                assert resp.status == 200
+
+        saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert saved["agent"]["acp_backend"] == "claude"
+        # Reset to the auto sentinel, which is never sent to the wire, so the new
+        # backend serves its own default instead of being handed a foreign id.
+        assert saved["agent"]["model"] == "auto"
+        assert saved["agent"]["role_models"]["background"] == "auto"
+        # An already-auto pin is left exactly as it was.
+        assert saved["agent"]["role_models"]["subagent"] == "auto"
+        # The in-memory slot pin is namespaced too.
+        assert app["state"]._slots["chat-1"].model == ""
+        # The provider factory captures the backend at build time. Refreshing it
+        # makes the next session use Claude while preserving open conversations.
+        sessions.refresh_defaults.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_re_saving_the_same_backend_leaves_the_model_alone(self, tmp_path) -> None:
+        """Only a real change heals — re-sending the current value must not reset a pick."""
+        cfg_path = tmp_path / "config.json"
+        seeded = _seed_config()
+        seeded["agent"]["acp_backend"] = ""
+        seeded["agent"]["model"] = "claude-opus-5"
+        cfg_path.write_text(json.dumps(seeded), encoding="utf-8")
+
+        app = _make_app()
+        sessions = SimpleNamespace(refresh_defaults=AsyncMock())
+        app["state"] = SimpleNamespace(
+            _slots={},
+            push_slots_update=lambda: None,
+            sessions=sessions,
+        )
+        with patch("kiro_crew.config.loader.config_path", return_value=cfg_path):
+            async with TestClient(TestServer(app)) as c:
+                assert (await _patch(c, "agent.acp_backend", "")).status == 200
+
+        saved = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert saved["agent"]["model"] == "claude-opus-5"
+        sessions.refresh_defaults.assert_not_awaited()
+
+
 class TestRoleModels:
     @pytest.mark.asyncio
     async def test_subagent_role_nested_write(self, tmp_config) -> None:
