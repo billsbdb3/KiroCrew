@@ -218,7 +218,7 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
       {aboveComposer && <div className="shrink-0">{aboveComposer}</div>}
 
       {followUpOptions.length > 0 && (
-        <div className={`shrink-0 px-3 ${frameless ? '' : 'bg-bg-subtle'}`}>
+        <div className={`shrink-0 px-3 ${frameless ? '' : 'bg-bg-accent'}`}>
           <FollowUpBar
             options={followUpOptions}
             picked={picked}
@@ -228,7 +228,7 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
         </div>
       )}
 
-      <div className={`flex items-center gap-2 px-3 py-2 shrink-0 ${frameless ? '' : 'border-t border-border bg-bg-subtle'}`}>
+      <div className={`flex items-center gap-2 px-3 py-2 shrink-0 ${frameless ? '' : 'border-t border-border bg-bg-accent'}`}>
         <input
           type="text"
           {...composition}

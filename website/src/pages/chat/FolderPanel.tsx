@@ -264,7 +264,7 @@ export default function FolderPanel({ path, onClose, onFileOpen, onPathChange }:
                 type="button"
                 aria-disabled={expanding}
                 onClick={() => { if (!expanding) setSearchLimit(l => Math.min(l * 2, SEARCH_RESULT_LIMIT_MAX)) }}
-                className="flex w-full items-center gap-1 text-left px-2 py-1.5 text-[10.5px] text-muted/80 underline decoration-dotted underline-offset-2 hover:text-fg transition-colors aria-disabled:opacity-60 aria-disabled:no-underline"
+                className="flex w-full items-center gap-1 text-left px-2 py-1.5 text-[10.5px] text-muted/80 underline decoration-dotted underline-offset-2 hover:text-text transition-colors aria-disabled:opacity-60 aria-disabled:no-underline"
               >
                 {expanding
                   ? <RotateCw size={11} className="shrink-0 animate-spin" />
