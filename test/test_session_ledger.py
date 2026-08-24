@@ -400,6 +400,11 @@ def test_gateway_fire_callbacks_use_the_composer():
         f"loops start each cycle without the work-ledger snapshot: {offenders}"
     )
 
+    # Additive, from the crew-variables work: the snapshot-less renderer must not come
+    # back at a fire site. `compose_nudge_body` being present says the composer is
+    # called; this says the older direct call is not.
+    assert "render_nudge_message(loop.message" not in src
+
 
 # ── HTTP routes ───────────────────────────────────────────────────────────
 

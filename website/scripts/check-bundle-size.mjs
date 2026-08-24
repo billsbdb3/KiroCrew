@@ -41,6 +41,16 @@ export const CHUNK_BUDGETS = {
   // `src/i18n/all.ts` — Rolldown names the chunk after that entry. Grows a
   // little with every translated string, which is expected and fine; what this
   // ceiling catches is a NEW library or surface landing in the catalog chunk.
+  // Raised to 9200 KB. `main` and the crew-variables branch reached the same number
+  // independently: the panel's strings across the 13 shipped catalogs are +30.3 KB,
+  // and other work had already taken the chunk to ~9.1 MB. That is the growth this
+  // entry's own comment calls "expected and fine" — translated strings, not a library
+  // or an unexpected surface — so the ceiling moves rather than the feature.
+  //
+  // Worth keeping from the round that raised it: the annotation previously read
+  // "measured 8666 KB" while the chunk had reached 9094.8 KB — 429 KB of unannotated
+  // growth, so the headroom was gone before anyone noticed it was going. Re-annotate
+  // when you move this, or the next person inherits the same surprise.
   all: 9200 * KB, // measured 9103 KB
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
@@ -69,6 +79,18 @@ export const CHUNK_BUDGETS = {
   // The app-core chunk: the dashboard shell plus everything eagerly imported
   // from it. The vendor split in vite.config.ts already extracts the heaviest
   // libraries; what remains is first-party code with no clean lazy boundary.
+  // Raised on `main` to 3200 KB as the chunk grew; this branch's Environment
+  // Variables panel is one more eagerly-imported first-party surface in it, the same
+  // class as every other panel on that page. A lazy boundary for one panel among ~20
+  // eager siblings would put a suspense flash on a single Settings tab, so that growth
+  // is irreducible without changing how the page loads.
+  //
+  // Kept from an earlier round because it is the part that keeps going wrong: this
+  // annotation once read "measured 2969 KB" while the chunk had reached 3120.2 KB --
+  // 151 KB of unannotated growth, so the headroom was gone before anyone noticed. The
+  // margin is also thinner than it looks: CI once measured 164 B OVER while a local
+  // build of the same commit came in 597 B under. Keep the ceiling ahead of the
+  // measurement, and re-annotate when you move it.
   App: 3200 * KB, // measured 3121 KB
 
   // Markdown/math/syntax rendering stack (katex, highlight.js, remark/rehype)

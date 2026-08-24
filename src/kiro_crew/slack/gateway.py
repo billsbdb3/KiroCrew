@@ -3298,7 +3298,9 @@ class GatewayOrchestrator:
             _prompt_dispatched = False
             # helper picks stable vs ephemeral session key and
             # decides whether to prepend last_result, based on job.persistent_session.
-            session_key, msg = build_cron_session_context(job)
+            # Off-loop: this does a config load, a variables-store read and a JSON
+            # parse, and the cron callback runs on the gateway's event loop.
+            session_key, msg = await asyncio.to_thread(build_cron_session_context, job)
 
             # ── Concurrent execution guard ──
             if (job.script or job.command) and job.id in self._running_script_ids:
@@ -4148,13 +4150,36 @@ class GatewayOrchestrator:
                         # empty parent ("notification only (parent=)") unless an
                         # unrelated surface happened to be mid-turn.
                         await publish_turn_identity(self.sessions, agent_session_key)
+                        # Off-loop, and the ARGUMENT has to be too: this is evaluated
+                        # before run_in_embed_pool is even called, so leaving it inline
+                        # ran a config load, a variables-store read and a JSON parse on
+                        # the event loop for every sequence member.
+                        #
+                        # Expanded PER MEMBER: agent_sequence takes precedence over
+                        # agent_id, so the single expansion computed above from
+                        # agent_id resolves the wrong crew here (the DEFAULT crew for
+                        # a job that sets only a sequence).
+                        #
+                        # Through build_cron_session_context, NOT the bare expander:
+                        # only this path prepends the last_result carry-over, so
+                        # calling the expander directly dropped the prior-run context
+                        # and the do-not-repeat instruction from every run after the
+                        # first.
+                        _member_msg = (
+                            await asyncio.to_thread(build_cron_session_context, job, agent)
+                        )[1]
                         # Off-loop: build_message embeds the episodic query.
                         full_message, _ = await run_in_embed_pool(
                             self.ctx_builder.build_message,
-                            msg,
+                            _member_msg,
                             True,
                             interactive=False,
                             agent=agent,
+                            # ``msg`` has already had crew variables expanded by
+                            # build_cron_session_context, so trigger matching gets
+                            # the author's own text instead: a variable VALUE must
+                            # never be able to pull in a skill body.
+                            trigger_text=job.message,
                         )
                         # Wall clock for the cron agent turn: acp never assigns
                         # TurnUsage.duration_ms, so the row falls back to this.
@@ -4288,6 +4313,9 @@ class GatewayOrchestrator:
                     True,
                     interactive=False,
                     agent=job.agent_id or None,
+                    # Expanded upstream; triggers see the authored text. See the
+                    # sequential site above.
+                    trigger_text=job.message,
                     provider_type=_provider,
                     minimal_context=job.minimal_context,
                 )
@@ -5200,7 +5228,13 @@ class GatewayOrchestrator:
             if self.autonudge_svc:
                 await self.autonudge_svc.remove(loop.id)
             return False
-        msg_body = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
+        msg_body = await compose_nudge_body(
+            loop.message,
+            loop.stop_sentinel_path,
+            loop.slot_key,
+            loop.agent,
+            loop.operator_authored,
+        )
         tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
         # Fail closed: an unattended turn MUST run under the HookManager
         # PreToolUse governance gate (mirrors cron's default approval path).
@@ -5220,7 +5254,16 @@ class GatewayOrchestrator:
             _acquired = True
             _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
             full_msg, _ = await run_in_embed_pool(
-                self.ctx_builder.build_message, tagged, is_new, key, provider_type=_provider
+                self.ctx_builder.build_message,
+                tagged,
+                is_new,
+                key,
+                provider_type=_provider,
+                # ``tagged`` wraps a body render_nudge_message already expanded, so
+                # triggers match the loop's authored instruction instead.
+                trigger_text=loop.message,
+                # The loop's armed crew, so the system prompt resolves the same
+                # crew's variables the body was rendered with.
             )
             # Clock started outside wait_for so BOTH the success path and the
             # TimeoutError branch below can report the real elapsed time. acp
@@ -5381,7 +5424,27 @@ class GatewayOrchestrator:
         if sessions is not None and sessions.is_busy(key):
             logger.info("AutoNudge skip: discord session %s busy (loop %s)", key, loop.id)
             return False
-        msg_body = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
+        # `False`, like Webex: expansion is only safe where skill selection can be
+        # handed the loop's RAW instruction on EVERY path the turn can take.
+        #
+        # The synthetic built below does carry `trigger_text=loop.message`, and that is
+        # enough for a turn dispatched immediately. It is not enough when the session is
+        # busy: `sessions.enqueue(...)` is called with `attachments` only, and the drain
+        # reconstructs from `item[1]` -- the text alone. So a queued nudge arrives as
+        # expanded text with no raw instruction, and a variable's VALUE can select a
+        # skill. Every channel dispatcher has this shape; the dashboard path does not,
+        # because it hands `trigger_text` straight to `_run_chat` without a queue.
+        #
+        # Compose time cannot know whether this turn will be queued, so the safe answer
+        # is the same either way. Lift to `loop.operator_authored` once channel queue
+        # entries carry `trigger_text` through enqueue and drain.
+        msg_body = await compose_nudge_body(
+            loop.message,
+            loop.stop_sentinel_path,
+            loop.slot_key,
+            loop.agent,
+            False,
+        )
         tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
         try:
             conversation_id = await transport.resolve_conversation(user_id)
@@ -5390,6 +5453,11 @@ class GatewayOrchestrator:
                 user_id=user_id,
                 conversation_id=conversation_id,
                 text=tagged,
+                # ``tagged`` wraps a body whose {{name}} tokens render_nudge_message
+                # already resolved using the loop's armed crew. Skill selection must
+                # read the loop's own instruction instead, or a variable's VALUE
+                # could pull in a skill the author never referenced.
+                trigger_text=loop.message,
             )
             await asyncio.wait_for(
                 dispatcher.handle_message(synthetic, interpret_commands=False),
@@ -5458,7 +5526,28 @@ class GatewayOrchestrator:
         # from that state rather than from transcript memory. Calling the bare
         # template substitution instead would silently opt this channel out of the
         # ledger — the one feature whose whole point is surviving context loss.
-        msg_body = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
+        # `False`, deliberately, where the other three fire paths pass
+        # `loop.operator_authored`.
+        #
+        # Expansion is only safe on a path that can hand skill selection the loop's RAW
+        # instruction: the Slack, Discord and dashboard synthetics all carry
+        # `trigger_text=loop.message` for exactly that reason, so a variable's VALUE
+        # cannot select a skill. `WebexInbound` has no `trigger_text` field, so this
+        # path has nothing to hand over -- and an expanded body would be matched
+        # against itself.
+        #
+        # So Webex stays fail-closed: its nudges render `{{name}}` literally rather
+        # than risk a value pulling in a skill body nobody referenced. `loop.agent` is
+        # still passed, since crew identity is correct regardless and costs nothing.
+        # Lift this to `loop.operator_authored` once `WebexInbound` carries trigger
+        # text through `handle_message`, which is the Webex channel's change to make.
+        msg_body = await compose_nudge_body(
+            loop.message,
+            loop.stop_sentinel_path,
+            loop.slot_key,
+            loop.agent,
+            False,
+        )
         tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
         # Imported HERE, not at module scope: this file is on the gateway boot
         # path, and it deliberately keeps every channel client behind
@@ -5568,7 +5657,13 @@ class GatewayOrchestrator:
                 loop.slot_key,
                 loop.id,
             )
-        msg = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
+        msg = await compose_nudge_body(
+            loop.message,
+            loop.stop_sentinel_path,
+            loop.slot_key,
+            loop.agent,
+            loop.operator_authored,
+        )
         tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg}"
         from kiro_crew.dashboard.chat import (
             _run_chat,  # circular import: gateway -> dashboard.chat -> gateway (chat dispatch references GatewayOrchestrator)
@@ -5616,7 +5711,7 @@ class GatewayOrchestrator:
             self.dashboard_state,
             slot,
             self.dashboard_state.run_background_turn(
-                slot, _run_chat(self.dashboard_state, slot, tagged)
+                slot, _run_chat(self.dashboard_state, slot, tagged, trigger_text=loop.message)
             ),
         )
         # Mirror dashboard /api/chat/send path so slot.running == True and sidebar
