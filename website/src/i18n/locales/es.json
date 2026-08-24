@@ -6716,6 +6716,11 @@
       "use_this_folder": "usar esta carpeta"
     },
     "terminalKeyBar": {
+      "paste": "Pegar",
+      "paste_clipboard_empty": "El portapapeles está vacío",
+      "paste_failed": "Error al pegar",
+      "paste_needs_https": "Pegar requiere una conexión segura (HTTPS)",
+      "paste_permission_needed": "Permite el acceso al portapapeles",
       "terminal_keys": "Teclas del terminal"
     },
     "themeEditor": {

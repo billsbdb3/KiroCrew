@@ -6716,6 +6716,11 @@
       "use_this_folder": "usar esta pasta"
     },
     "terminalKeyBar": {
+      "paste": "Colar",
+      "paste_clipboard_empty": "A área de transferência está vazia",
+      "paste_failed": "Falha ao colar",
+      "paste_needs_https": "Colar requer uma conexão segura (HTTPS)",
+      "paste_permission_needed": "Permita o acesso à área de transferência",
       "terminal_keys": "Teclas do terminal"
     },
     "themeEditor": {

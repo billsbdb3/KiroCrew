@@ -6626,6 +6626,11 @@
       "use_this_folder": "diesen Ordner verwenden"
     },
     "terminalKeyBar": {
+      "paste": "Einfügen",
+      "paste_clipboard_empty": "Zwischenablage ist leer",
+      "paste_failed": "Einfügen fehlgeschlagen",
+      "paste_needs_https": "Einfügen erfordert eine sichere (HTTPS) Verbindung",
+      "paste_permission_needed": "Zugriff auf die Zwischenablage erlauben",
       "terminal_keys": "Terminal-Tasten"
     },
     "themeEditor": {

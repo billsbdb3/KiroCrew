@@ -6716,6 +6716,11 @@
       "use_this_folder": "usa questa cartella"
     },
     "terminalKeyBar": {
+      "paste": "Incolla",
+      "paste_clipboard_empty": "Gli appunti sono vuoti",
+      "paste_failed": "Incollaggio non riuscito",
+      "paste_needs_https": "Incolla richiede una connessione sicura (HTTPS)",
+      "paste_permission_needed": "Consenti l’accesso agli appunti",
       "terminal_keys": "Tasti del terminale"
     },
     "themeEditor": {

@@ -6806,6 +6806,11 @@
       "use_this_folder": "использовать эту папку"
     },
     "terminalKeyBar": {
+      "paste": "Вставить",
+      "paste_clipboard_empty": "Буфер обмена пуст",
+      "paste_failed": "Не удалось вставить",
+      "paste_needs_https": "Для вставки требуется защищённое (HTTPS) соединение",
+      "paste_permission_needed": "Разрешите доступ к буферу обмена",
       "terminal_keys": "Клавиши терминала"
     },
     "themeEditor": {
