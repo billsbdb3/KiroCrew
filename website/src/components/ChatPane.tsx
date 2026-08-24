@@ -79,6 +79,7 @@ export default function ChatPane({
   const connectionsUiOn = useConnectionsUiEnabled()
   const [input, setInput] = useState('')
   const [pendingFiles, setPendingFiles] = useState<string[]>([])
+  const [uploadError, setUploadError] = useState('')
   const [agentBtnRect, setAgentBtnRect] = useState<DOMRect | null>(null)
   const [modelBtnRect, setModelBtnRect] = useState<DOMRect | null>(null)
   const endRef = useRef<HTMLDivElement>(null)
@@ -271,7 +272,16 @@ export default function ChatPane({
   // File upload as a mutation (isPending replaces a manual `uploading` flag).
   const uploadMutation = useMutation({
     mutationFn: (files: File[]) => api.uploadFiles(files),
-    onSuccess: (res) => { if (res.paths?.length) setPendingFiles((prev) => [...prev, ...res.paths]) },
+    // api.uploadFiles does NOT throw on a server refusal (unsupported type,
+    // signature mismatch, over-cap): it resolves with { paths: [], error }.
+    // So a refusal lands here in onSuccess, not onError — surface res.error
+    // (matching ChatPage) instead of silently doing nothing. onError still
+    // covers the fetch-rejected path (connection dropped mid-transfer).
+    onSuccess: (res) => {
+      if (res.paths?.length) { setUploadError(''); setPendingFiles((prev) => [...prev, ...res.paths]) }
+      else if (res.error) setUploadError(i18nT('pages.chatPage.upload_failed_error', { error: res.error }))
+    },
+    onError: () => { setUploadError(i18nT('pages.chatPage.upload_failed_check_file_type_and_size_max_50_mb')) },
   })
   const uploadFiles = useCallback((files: File[]) => {
     if (!files.length || files.length > 20) return
@@ -600,6 +610,13 @@ export default function ChatPane({
               })
           }}
         />
+
+        {uploadError && (
+          <div className="mx-4 mt-2 mb-0 bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--danger) 45%, transparent)' }}>
+            <span className="text-sm text-text flex-1">{uploadError}</span>
+            <button onClick={() => setUploadError('')} aria-label={i18nT('pages.chatPage.dismiss_upload_error')} className="text-muted hover:text-text leading-none p-0.5"><X className="w-4 h-4" /></button>
+          </div>
+        )}
 
         <ChatInput
           value={input}
