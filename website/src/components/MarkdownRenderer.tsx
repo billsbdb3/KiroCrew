@@ -2676,6 +2676,146 @@ export function fixCjkAutolinkBoundaries(content: string): string {
   return out + content.slice(pos)
 }
 
+/**
+ * A `[text](https?://…?…)` span whose destination carries RAW spaces or tabs.
+ *
+ * CommonMark refuses whitespace inside an unbracketed link destination, so the
+ * whole span fails to parse as a link: the label renders as literal
+ * `[text](`-prefixed prose and GFM autolinks just the head of the URL — the
+ * href truncates at the first space (in practice the first unencoded query
+ * param value), which is how an agent-emitted pre-filled URL becomes
+ * unclickable.
+ *
+ * Three deliberate bounds, each the conservative direction:
+ *  - The head must carry a `?`, and the run's LAST chunk must contain a
+ *    `&name=` param start (see QUERY_CONTINUATION_RE below). An unencoded
+ *    QUERY STRING is the shape this pass exists for, and only a new param
+ *    opening in the final chunk proves the query spans every space to the
+ *    run's end. Without that proof — `[docs](https://x.com/a for the full
+ *    list)`, or `…?ref=1 for the full list` — the tail is PROSE after a
+ *    truncated link, and absorbing it into the href would delete visible
+ *    words and mint a dead URL, worse than the truncation it replaces. The
+ *    cost is that a spaced value in a SINGLE-param URL (`?title=a b`) is not
+ *    rescued: with no second param there is no evidence, and the issue's
+ *    reported shape carries several `&`-separated params.
+ *  - The label admits no brackets (`[^\][\n]`). A label that fails to close
+ *    makes every later `[` restart the scan over the same characters, which
+ *    is quadratic on `[`-heavy input — and a streaming message re-runs this
+ *    on every reparse. Excluding `[` makes each start position fail in O(1),
+ *    so the scan is linear; a nested-bracket label was never rescued before
+ *    and still is not.
+ *  - The chunks are `[^\s()]+`: a `(` or `)` inside the destination is
+ *    CommonMark's OTHER refusal (unbalanced parens), where the span's true
+ *    extent is genuinely ambiguous, so those spans are left alone.
+ *
+ * An uppercase scheme (`HTTPS://…`) is NOT rescued, and deliberately so: GFM
+ * autolinks the uppercase head (schemes are case-insensitive there), and the
+ * parse gate below sees that node as non-prose and skips the span. Reaching
+ * it would mean loosening the gate that protects every accepted span, for a
+ * casing agents do not emit.
+ */
+const BROKEN_LINK_DEST_RE =
+  /(\[[^\][\n]*\]\([ \t]*)(https?:\/\/[^\s()?]*\?[^\s()]*(?:[ \t]+[^\s()]+)+)[ \t]*\)/g
+
+/** A trailing `"…"` / `'…'` chunk at the end of a refused destination run.
+ *  Genuinely ambiguous: it is the author's TITLE in `[a](url x "t")` but QUERY
+ *  TEXT in `[a](https://x?q=crash when "Save As")`, and encoding or splitting
+ *  either reading corrupts the other. Same verdict as parens: no rescue. */
+const TRAILING_TITLE_RE = /[ \t]("[^"\n]*"|'[^'\n]*')$/
+
+/** Evidence that the run's FINAL chunk is still query string: it contains a
+ *  `&name=` param start (`&labels=bug` in `…?title=a b&labels=bug`). Only
+ *  that proves the whitespace before it belongs to a query VALUE — a last
+ *  chunk of plain words (`…?ref=1 for the full list`) is prose after a
+ *  truncated link, not a spaced value. */
+const QUERY_CONTINUATION_RE = /&[A-Za-z0-9_.~-]+=[^\s()]*$/
+
+/**
+ * Percent-encode raw whitespace inside a `[text](url)` destination that
+ * CommonMark REFUSED, so the link the author unambiguously delimited parses
+ * with its full URL.
+ *
+ * The author's own `](…)` delimiters prove the destination's extent, which is
+ * what makes this safe where the bare-URL case is not: a bare
+ * `https://… ?title=a b&c=d` run gives no evidence of where the URL ends, so
+ * it keeps GFM's stop-at-whitespace behaviour (the same call every other
+ * renderer makes).
+ *
+ * Gated on remark's OWN parse, exactly like `fixCjkAutolinkBoundaries`: a span
+ * is rewritten only when every character of it is PROSE in the parse — inline
+ * code, fenced/indented code, raw HTML, math, and (critically) every span that
+ * ALREADY parsed as a link are all off-limits by construction. That last
+ * exclusion is what protects the legal space-carrying forms — `<…>`-bracketed
+ * destinations and `[a](url "title")` titles — without this function having to
+ * re-derive CommonMark's grammar: if remark accepted it, it is not broken, and
+ * it is never touched.
+ *
+ * Scheme-confined to `http(s)://` by the regex, so no rewrite can widen the
+ * scheme surface — a `javascript:` destination never matches, and encoding
+ * spaces cannot mint a new scheme. Same-line only (`[^\][\n]` / `[ \t]`): a
+ * destination interrupted by a newline may be a paragraph boundary, and a cut
+ * is the risky direction.
+ *
+ * Image spans (`![alt](url a b)`) are IN scope: the leading `!` sits outside
+ * the match, the rescue makes the image parse, and a well-formed remote image
+ * already fetches on render — no boundary moves. A destination whose run ends
+ * in a quoted chunk (`[a](url x "t")`) is DECLINED: that chunk is the
+ * author's title in one reading and query text (`?title=Crash when "Save
+ * As"`) in the other, and either guess corrupts the other reading. An empty
+ * label (`[](url a b)`) is skipped: the rescued anchor would have no
+ * accessible name and nothing visible to click.
+ *
+ * NOT safe when `data-sourcepos` is in play: `%20` is three characters where
+ * the space was one, which shifts every later column on the line. The caller
+ * gates on that (see MarkdownBlock), mirroring `fixCjkAutolinkBoundaries`.
+ */
+export function fixUnencodedLinkDestinations(content: string): string {
+  if (!content.includes('](') || !content.includes('://')) return content
+  BROKEN_LINK_DEST_RE.lastIndex = 0
+  if (!BROKEN_LINK_DEST_RE.test(content)) return content
+  const { nonProse } = autolinkLiteralSpans(content)
+  let out = ''
+  let pos = 0
+  BROKEN_LINK_DEST_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = BROKEN_LINK_DEST_RE.exec(content)) !== null) {
+    const start = m.index
+    const end = start + m[0].length
+    // An escaped `[` is a literal bracket the author wrote as prose; encoding
+    // inside it would visibly rewrite their text, not repair a link. The
+    // CLOSER gets the same check: `[a\](…)` is a literal `]` to CommonMark,
+    // so no link was ever delimited there either.
+    if (isEscapedAt(content, start)) continue
+    if (isEscapedAt(content, start + m[1].lastIndexOf(']'))) continue
+    // `[](url …)` would rescue an anchor with no accessible name and nothing
+    // visible to click — leave the refused span as the prose it renders as.
+    if (m[1].startsWith('[]')) continue
+    // Any masked character means remark already owns this span — it parsed as
+    // a real link (a legal title form), or it sits inside code/HTML/math.
+    let masked = false
+    for (let i = start; i < end; i++) {
+      if (nonProse[i]) { masked = true; break }
+    }
+    if (masked) continue
+    // A trailing quoted chunk is undecidable: the author's title in
+    // `[a](url x "t")`, but query TEXT in `?title=Crash when "Save As"` —
+    // treating it as a title would truncate that query out of the href.
+    // Decline the span entirely, the same verdict parens get.
+    if (TRAILING_TITLE_RE.test(m[2])) continue
+    // The final chunk must PROVE it is still query string (`&name=…`): a
+    // last chunk of plain words is prose after a truncated link, and
+    // absorbing prose deletes visible words and mints a dead URL.
+    const chunks = m[2].split(/[ \t]+/)
+    if (!QUERY_CONTINUATION_RE.test(chunks[chunks.length - 1])) continue
+    const destStart = start + m[1].length
+    out += content.slice(pos, destStart)
+    out += m[2].replace(/[ \t]/g, (ch) => (ch === ' ' ? '%20' : '%09'))
+    pos = destStart + m[2].length
+  }
+  if (pos === 0) return content
+  return out + content.slice(pos)
+}
+
 export function fixCodeFences(s: string): string {
   // Escape bare "N." lines so markdown doesn't render them as ordered lists.
   // CommonMark: 0-3 leading spaces = list item, 4+ = indented code block.
@@ -2853,7 +2993,12 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
   // would anchor a comment to the wrong occurrence — so that surface keeps the
   // unfixed (but coordinate-accurate) render.
   const fenced = fixCodeFences(clean)
-  const prepared = sourcePos ? fenced : fixCjkAutolinkBoundaries(fenced)
+  // `fixUnencodedLinkDestinations` runs BEFORE the CJK pass: repairing a
+  // refused `[text](url)` turns the URL's autolinked head back into a real
+  // link node, so the CJK boundary pass must judge the repaired shape, not
+  // the broken one. Both passes shift columns, so both are gated off in
+  // sourcePos mode together.
+  const prepared = sourcePos ? fenced : fixCjkAutolinkBoundaries(fixUnencodedLinkDestinations(fenced))
   const md = (
     <MdSourceCtx.Provider value={prepared}>
       <ReactMarkdown remarkPlugins={softBreaks ? REMARK_PLUGINS_WITH_BREAKS : REMARK_PLUGINS} rehypePlugins={rehypePlugins} urlTransform={urlTransform} components={MD_COMPONENTS}>
