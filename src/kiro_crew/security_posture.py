@@ -1058,6 +1058,21 @@ _REDACTION_SINKS: tuple[tuple[str, str, str], ...] = (
         "substitute for redaction. `rating` (a fixed frontend enum) is not run "
         "through this pass.",
     ),
+    (
+        "Auto Triage Pipeline dashboard strings",
+        "apps/builtins/auto_triage_pipeline/backend/pipeline_fold.py",
+        "Every string this read-only fold hands to its routes -- issue titles, "
+        "assignee and author logins, labels, event names, slot keys -- funnels "
+        "through one `_printable` helper before serialization, and the routes render "
+        "it in the dashboard. The titles and labels are NOT our text: they come from "
+        "the forge, where any user can open an issue and write anything in the "
+        "title, so this is a dashboard-bound sink for attacker-controlled text. "
+        "`_printable` runs the shared credential + exfiltration-URL chain FIRST, "
+        "then neutralizes control and bidirectional-override characters, and "
+        "truncates LAST -- redaction has to precede truncation, because cutting "
+        "first can split a credential so only its tail is left to match and the head "
+        "survives into the output.",
+    ),
 )
 
 # Modules that call a redactor but are NOT an output egress boundary, so they do

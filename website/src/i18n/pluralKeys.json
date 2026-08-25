@@ -1,4 +1,8 @@
 [
+  "apps.autoTriagePipeline.global.resumed_times",
+  "apps.autoTriagePipeline.global.step_heading",
+  "apps.autoTriagePipeline.global.turns_n",
+  "apps.autoTriagePipeline.global.unparseable",
   "apps.codeReviewSage.codeReviewSagePage.open_pr",
   "apps.codeReviewSage.codeReviewSagePage.pattern",
   "apps.codeReviewSage.components.addReposModal.contributed_events",
