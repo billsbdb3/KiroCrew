@@ -1429,11 +1429,18 @@ type ThinkingAnchor = { tool: string; text?: undefined; ts?: undefined } | { too
  *  it in the old list and re-inserted just before that row again. Returns
  *  `incoming` unchanged (reference-equal) when there is nothing to preserve.
  *
- *  A block with NO recorded anchor (nothing followed it in the old list — the
- *  live turn's in-flight reasoning, or a scan cut short by a turn boundary) is
- *  appended at the tail: the tail IS its position. A block whose anchor MISSES
- *  its lookup is dropped or kept by where the anchor sits relative to the
- *  region the PURE server page (`coverageSource`) actually covers:
+ *  A block with NO recorded anchor because nothing followed it in the old list
+ *  (the live turn's in-flight reasoning) is appended at the tail: the tail IS
+ *  its position. A block whose anchor scan was CUT SHORT by a turn-boundary
+ *  user row (a turn stopped mid-reasoning, or one that emitted no tool call
+ *  and no answer text) is also anchorless, but its turn is OVER — it is kept
+ *  at the tail only while the pure server page does not cover that boundary
+ *  row; once it does, the block is dropped like a covered anchored miss
+ *  (#5815), since keeping it stranded one permanent chip per stopped turn
+ *  below unrelated newer turns, re-appended on every refresh. A block whose
+ *  anchor MISSES its lookup is dropped or kept by where the anchor sits
+ *  relative to the region the PURE server page (`coverageSource`) actually
+ *  covers:
  *
  *  - **Inside the covered region** (at or before the last `existing` row that
  *    `incoming` recognizably contains), with a server-confirmed anchor (a
@@ -1519,13 +1526,26 @@ function mergePreservedThinking<M extends { role: string; content: string; cls?:
     if (m.content) return [`txt:${m.role}:${m.content.trimEnd()}`]
     return []
   }
-  const preserved: Array<{ msg: M; anchor: ThinkingAnchor | null; anchorIdx: number; confirmed: boolean }> = []
+  const preserved: Array<{ msg: M; anchor: ThinkingAnchor | null; anchorIdx: number; confirmed: boolean; boundaryIdx: number; boundaryCovered: boolean }> = []
+  // Strongest-identity set over `existing`, used only to resolve an optimistic
+  // steer bubble below: a persisted user row already present in `existing`
+  // (an older duplicate-text message) must not vouch for the bubble.
+  let existingIdsMemo: Set<string> | null = null
+  const existingIds = (): Set<string> => {
+    if (!existingIdsMemo) {
+      existingIdsMemo = new Set<string>()
+      for (const m of existing) for (const id of coverageIds(m)) existingIdsMemo.add(id)
+    }
+    return existingIdsMemo
+  }
   for (let i = 0; i < existing.length; i++) {
     const m = existing[i]
     if (m.role !== 'thinking' || !m.content) continue
     let anchor: ThinkingAnchor | null = null
     let anchorIdx = -1
     let confirmed = false
+    let boundaryIdx = -1
+    let boundaryCovered = false
     for (let j = i + 1; j < existing.length; j++) {
       const cand = existing[j]
       const tid = toolAnchorId(cand)
@@ -1541,13 +1561,58 @@ function mergePreservedThinking<M extends { role: string; content: string; cls?:
         break
       }
       // A confirmed steer does not end this block's turn, so the row after it is
-      // still its anchor. Breaking here instead leaves `anchor` null, and an
-      // unanchored block is appended at the tail — below the answer and its
-      // footer — where the forward scan can never reach an anchorable row again,
-      // so it stays there and is re-appended on every later refresh.
-      if (isTurnBoundaryUser(cand)) break
+      // still its anchor. Breaking here instead would record a turn boundary for
+      // a block whose turn is NOT over — misplacing it at the tail, and (once
+      // the page covers the steer row) dropping reasoning that has a real
+      // anchor further down.
+      //
+      // Record WHICH row ended the scan: an anchorless block with a recorded
+      // boundary belongs to a FINISHED turn (stopped mid-reasoning, or a
+      // reasoning-only turn that emitted no tool call and no text), not to the
+      // live tail, and the tail-keep below uses that to decide whether the
+      // block's turn is inside the covered region and therefore over (#5815).
+      //
+      // An OPTIMISTIC steer bubble is AMBIGUOUS: sent while the turn ran, it
+      // was either accepted INTO the turn (persisted with `meta.steer`, its
+      // `steer_push` echo clears the flag — not a boundary; the turn keeps
+      // emitting rows past it, so treating it as one would drop pre-steer
+      // reasoning whose real anchor is one reconciliation away) or it raced
+      // `chat_done` and took the NEW-TURN path (persisted as a PLAIN user
+      // row, and no echo ever clears the bubble — a genuine boundary that
+      // must resolve NOW: the very refresh that shows the persisted row also
+      // repositions this block below it, after which no scan can ever find a
+      // boundary again and the chip strands permanently). The pure page
+      // disambiguates: a persisted NON-steer user row matching the bubble's
+      // text, whose identity is NEW to `existing` (an older duplicate-text
+      // row must not vouch — it is already in both lists), proves the
+      // new-turn path AND is itself the coverage evidence — UNLESS the page
+      // ALSO holds a persisted STEER row with that text: then the bubble is
+      // (or cannot be told apart from) that accepted steer whose echo was
+      // missed, and the plain match may just be a later turn reusing the
+      // same words. The refresh replacing the bubble with the persisted
+      // steer row re-anchors this block through the confirmed-steer path on
+      // its own, so vouching here would delete reasoning one refresh early.
+      // A steer-text match or no match keeps the block: unresolved is the
+      // safe direction, and its client-minted ts never feeds the eviction
+      // fallback.
+      if (isTurnBoundaryUser(cand)) {
+        if (!(cand.meta?.steer && cand.meta?.optimistic)) {
+          boundaryIdx = j
+        } else {
+          const txt = cand.content.trimEnd()
+          let plainNewMatch = false
+          let steerMatch = false
+          for (const r of coverageSource) {
+            if (r.role !== 'user' || r.content.trimEnd() !== txt) continue
+            if (r.meta?.steer) { steerMatch = true; break }
+            if (!coverageIds(r).some(id => existingIds().has(id))) plainNewMatch = true
+          }
+          if (plainNewMatch && !steerMatch) boundaryCovered = true
+        }
+        break
+      }
     }
-    preserved.push({ msg: m, anchor, anchorIdx, confirmed })
+    preserved.push({ msg: m, anchor, anchorIdx, confirmed, boundaryIdx, boundaryCovered })
   }
   if (!preserved.length) return incoming
   // Coverage cut: index of the last `existing` row whose identity the PURE
@@ -1606,21 +1671,44 @@ function mergePreservedThinking<M extends { role: string; content: string; cls?:
     result.push(item)
   }
   for (let p = 0; p < preserved.length; p++) {
-    // The tail keeps: anchorless blocks (nothing followed them — the tail IS
-    // their position), blocks whose anchor row was never server-confirmed (a
-    // racing mid-turn refresh can miss those without the block being stale),
-    // and blocks whose anchor sits PAST the coverage cut (newer than
-    // everything the snapshot contains — the snapshot is old, not the block).
-    // Only a server-confirmed anchor INSIDE the covered region that missed
-    // its lookup has no position in this list (bounded page / rewritten
-    // history) — drop it rather than stranding it at the tail below
-    // unrelated turns (#5798).
+    // The tail keeps: truly anchorless blocks (nothing followed them AT ALL —
+    // the live turn's in-flight reasoning, whose tail IS its position), blocks
+    // whose anchor row was never server-confirmed (a racing mid-turn refresh
+    // can miss those without the block being stale), and blocks whose anchor
+    // sits PAST the coverage cut (newer than everything the snapshot contains
+    // — the snapshot is old, not the block).
+    //
+    // Two shapes are droppable via coverage, both meaning "this block's turn
+    // is over and the snapshot covers it, yet holds no position for the
+    // block":
+    //  - a server-confirmed anchor INSIDE the covered region that missed its
+    //    lookup (bounded page / rewritten history) — dropping it rather than
+    //    stranding it at the tail below unrelated turns is #5798;
+    //  - an anchorless block whose scan was TERMINATED by a turn-boundary
+    //    user row inside the covered region (the turn was stopped
+    //    mid-reasoning, or emitted no tool call and no answer text). The
+    //    boundary row is a persisted user message, so the snapshot covering
+    //    it proves the server's full account of that finished turn — which
+    //    contains no reasoning (reasoning is client-only). Keeping the block
+    //    teleported it to the transcript tail, below unrelated turns, and
+    //    re-appended it there on every later refresh — one permanent stray
+    //    chip per stopped turn (#5815). Dropping matches a page reload.
+    //    A boundary past the cut (or unresolved, coveredIdx < 0 without the
+    //    eviction proof) keeps the block: the snapshot may simply predate it.
+    // A third shape, `boundaryCovered`, is resolved at scan time: an
+    // optimistic steer bubble proven by the pure page to have taken the
+    // NEW-TURN path (its persisted non-steer copy is in the page and new to
+    // `existing`) — the same finished-turn evidence, established directly
+    // rather than through the index cut, because the bubble's client-minted
+    // identity can never appear in a server page.
     if (used.has(p)) continue
-    const { anchor, anchorIdx, confirmed } = preserved[p]
-    const insideCoverage = anchorIdx >= 0 && anchorIdx <= coveredIdx
-    const anchorMs = anchorIdx >= 0 ? transcriptTsMs(existing[anchorIdx]?.ts) : null
-    const evicted = coveredIdx < 0 && oldestPageMs !== null && anchorMs !== null && anchorMs < oldestPageMs
-    const droppable = anchor !== null && confirmed && (insideCoverage || evicted)
+    const { anchor, anchorIdx, confirmed, boundaryIdx, boundaryCovered } = preserved[p]
+    const posIdx = anchor !== null ? anchorIdx : boundaryIdx
+    const insideCoverage = posIdx >= 0 && posIdx <= coveredIdx
+    const posMs = posIdx >= 0 ? transcriptTsMs(existing[posIdx]?.ts) : null
+    const evicted = coveredIdx < 0 && oldestPageMs !== null && posMs !== null && posMs < oldestPageMs
+    const droppable = boundaryCovered
+      || ((anchor !== null ? confirmed : boundaryIdx >= 0) && (insideCoverage || evicted))
     if (!droppable) result.push({ ...preserved[p].msg })
   }
   return result
