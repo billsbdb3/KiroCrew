@@ -757,7 +757,7 @@ async def _stream_task(
                 finally:
                     agent._approval_future = None
 
-                if decision not in ("approved", "rejected", "trust"):
+                if decision not in ("approved", "rejected", "rejected_once", "trust"):
                     decision = "rejected"
 
                 sel().log_tool_invocation(

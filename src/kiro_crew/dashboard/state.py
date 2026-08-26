@@ -5767,11 +5767,19 @@ class DashboardState:
             return True
         return False
 
-    def resolve_approval(self, approval_id: str, approved: bool) -> bool:
+    def resolve_approval(
+        self, approval_id: str, approved: bool, *, decision_override: str | None = None
+    ) -> bool:
         """Resolve a pending approval. Returns False if not found.
 
         State-level futures receive ``bool`` (consumed by gateway, which converts to str).
-        Slot-level futures receive ``str`` ("approved"/"rejected", consumed by channel.py).
+        Slot-level futures receive ``str`` ("approved"/"rejected"/"rejected_once",
+        consumed by channel.py and chat_runner).
+
+        When *decision_override* is supplied it is used as the slot-level future
+        result instead of the standard "approved"/"rejected" mapping. This allows
+        callers to pass "rejected_once" so that the chat_runner can distinguish
+        a single-tool denial from a full batch rejection.
 
         This scans slot-level futures by bare id-match with NO session-identity
         check, so it is safe only for callers that legitimately own the id
@@ -5779,7 +5787,7 @@ class DashboardState:
         addresses one slot but may hold a colliding id from another MUST use
         :meth:`resolve_state_approval` instead (see the slot-approve handler).
         """
-        decision = "approved" if approved else "rejected"
+        decision = decision_override or ("approved" if approved else "rejected")
         if self.resolve_state_approval(approval_id, approved):
             return True
         # Also check slot-level approval futures (chat tool approvals)
