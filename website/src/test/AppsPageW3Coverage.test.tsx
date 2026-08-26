@@ -283,7 +283,7 @@ describe('AppsPage — enable path', () => {
     await catalogReady()
     const row = await browseRow('Pets')
     fireEvent.click(within(row).getByRole('button', { name: /^Enable/ }))
-    expect(await screen.findByText('Trust Pets to run its own code?')).toBeInTheDocument()
+    expect(await screen.findByText('Trust “Pets” to run its own code?')).toBeInTheDocument()
     // A consent prompt is not an error — the error card must stay away.
     expect(screen.queryByText(/Failed to enable/)).toBeNull()
   })
@@ -295,7 +295,7 @@ describe('AppsPage — enable path', () => {
     const row = await browseRow('Pets')
     fireEvent.click(within(row).getByRole('button', { name: /^Enable/ }))
     expect(await screen.findByText('gateway is busy')).toBeInTheDocument()
-    expect(screen.queryByText('Trust Pets to run its own code?')).toBeNull()
+    expect(screen.queryByText('Trust “Pets” to run its own code?')).toBeNull()
   })
 
   it('falls back to the generic enable message when the failure carries no text', async () => {
@@ -711,7 +711,7 @@ describe('AppsPage — Library enable and update', () => {
     await screen.findByText('No apps available')
     goLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Enable' }))
-    expect(await screen.findByText('Trust Local App to run its own code?')).toBeInTheDocument()
+    expect(await screen.findByText('Trust “Local App” to run its own code?')).toBeInTheDocument()
     expect(screen.getByText('https://github.com/z/secretary')).toBeInTheDocument()
   })
 })
