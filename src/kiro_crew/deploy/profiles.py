@@ -78,7 +78,12 @@ _NOTE_MAX = 256
 
 # Same shapes handlers.py enforces for the legacy single-profile config — these
 # values flow into subprocess argv (--profile/--region) on every aws call.
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# '+' admitted for IAM Identity Center derived profiles
+# ("<account>+<permission-set>", #6051); first char excludes '-' so a name is
+# never option-shaped, and \Z rejects trailing newlines. Also used by
+# discover_aws_profiles() to filter `aws configure list-profiles` lines
+# (stripped before matching, so the anchor change is behavior-neutral there).
+_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.+][A-Za-z0-9_.+-]{0,127}\Z")
 PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_PROFILE_RE)
 # Multi-segment to admit GovCloud (us-gov-west-1) alongside standard regions;
 # max_len=32 keeps the backtracking surface negligible.

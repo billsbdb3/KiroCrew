@@ -107,7 +107,7 @@ def ensure_lambda_oac(profile, region):
 
 def _validate_args(profile: str, region: str, dist_id: str, slug: str) -> None:
     """Validate all argv before any aws call. Exit 2 on mismatch."""
-    _PROFILE_RE = re.compile(r"^[a-zA-Z0-9._:/-]+$")
+    _PROFILE_RE = re.compile(r"^[a-zA-Z0-9._:/+-]+$")
     _REGION_RE = re.compile(r"^[a-z]{2}-[a-z]+-\d+$")
     _DIST_ID_RE = re.compile(r"^[A-Z0-9]{13,14}$")
     _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
