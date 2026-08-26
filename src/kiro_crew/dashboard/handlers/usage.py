@@ -204,13 +204,8 @@ def slot_spend(days: int = SPEND_WINDOW_DAYS) -> dict[str, dict[str, float]]:
                     # Per-row timestamp cutoff: the shard file date is a coarse
                     # filter (a shard can span midnight), so rows older than the
                     # cutoff must still be excluded individually.
-                    ts_raw = str(obj.get("ts") or "")
-                    try:
-                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if ts_epoch < cutoff:
+                    ts_epoch = _parse_row_ts(str(obj.get("ts") or ""))
+                    if ts_epoch is None or ts_epoch < cutoff:
                         continue
                     slot = str(obj.get("slot") or "")
                     if not slot or not is_session_slot(slot):
@@ -409,14 +404,9 @@ def context_occupancy(days: int = 14) -> dict[str, Any]:
                     window = _coerce_int(obj.get("context_window"))
                     if used <= 0 or window <= 0:
                         continue
-                    ts_epoch = 0.0
-                    ts_raw = obj.get("ts") or ""
-                    try:
-                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if ts_epoch < cutoff:
+                    ts_raw = str(obj.get("ts") or "")
+                    ts_epoch = _parse_row_ts(ts_raw)
+                    if ts_epoch is None or ts_epoch < cutoff:
                         continue
                     slot = str(obj.get("slot") or "unknown")
                     # Before the percentile sample, not after: the spread and the
@@ -520,19 +510,69 @@ TURN_USAGE_FIELDS: tuple[str, ...] = (
 )
 
 
+def _parse_row_dt(raw: Any) -> datetime | None:
+    """A row's timestamp as a ``datetime``, or ``None`` when unparseable.
+
+    THE one spelling for reading a stored row timestamp (``Z`` rewritten to
+    ``+00:00`` for py3.10's ``fromisoformat``; a naive stamp left naive so a
+    caller's ``.timestamp()`` reads it in local time): every reader of the same
+    rows derives from this helper, because two readers that disagree about
+    which rows a window contains produce numbers that cannot be reconciled.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        ts_str = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        return datetime.fromisoformat(ts_str)
+    except ValueError:
+        return None
+
+
 def _parse_row_ts(raw: str) -> float | None:
     """A shard row's ``ts`` as an epoch, or ``None`` when unparseable.
 
-    The SAME spelling as this module's other shard-ts readers (``Z`` rewritten
-    to ``+00:00`` for py3.10's ``fromisoformat``; a naive stamp interpreted in
-    local time via ``.timestamp()``): two readers of the same rows must not
-    disagree about which rows a window contains.
+    ``timestamp()`` is guarded too: a parseable-but-extreme stamp (year 1)
+    raises ``ValueError`` on local-time conversion, and a corrupt row must
+    never take a read path down.
     """
-    try:
-        ts_str = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
-        return datetime.fromisoformat(ts_str).timestamp()
-    except (ValueError, TypeError, AttributeError):
+    dt = _parse_row_dt(raw)
+    if dt is None:
         return None
+    try:
+        return dt.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _parse_row_day(raw: Any) -> str | None:
+    """A row timestamp's LOCAL calendar day (``YYYY-MM-DD``), or ``None``.
+
+    Same guard rationale as :func:`_parse_row_ts`: ``astimezone()`` performs
+    the same local-time conversion and raises on the same extreme stamps.
+    """
+    dt = _parse_row_dt(raw)
+    if dt is None:
+        return None
+    try:
+        return dt.astimezone().strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _usage_number(value: Any) -> int | float | None:
+    """A shard row's numeric field, or ``None`` when it is not a usable number.
+
+    ints are accepted directly: ``math.isfinite`` would convert to float first
+    and an oversized int raises ``OverflowError`` (a corrupt row must never 500
+    a read path). bool is an int subclass and is not a count.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
 
 
 def slot_turn_usage(
@@ -592,16 +632,8 @@ def slot_turn_usage(
                         "model": str(obj.get("model") or ""),
                     }
                     for field in TURN_USAGE_FIELDS:
-                        value = obj.get(field)
-                        # ints are accepted directly: math.isfinite would convert
-                        # to float first and an oversized int raises OverflowError
-                        # (a corrupt row must never 500 the endpoint). bool is an
-                        # int subclass and is not a count.
-                        if isinstance(value, bool):
-                            continue
-                        if isinstance(value, int) or (
-                            isinstance(value, float) and math.isfinite(value)
-                        ):
+                        value = _usage_number(obj.get(field))
+                        if value is not None:
                             row[field] = value
                     turns.append(row)
         except (OSError, UnicodeDecodeError):
@@ -614,6 +646,9 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
 
     Reads the ``ctx_blocks`` / ``phase`` fields ``persist_token_record`` writes
     each turn and returns them in chronological order, plus per-block totals.
+    Each turn also carries the row's ``credits`` and ``duration_ms`` when the
+    shard recorded usable numbers: injection and billing live on the same row,
+    so the drill-down answers "what was injected and what it cost" in one read.
 
     Kept out of the OTEL pipeline for the same reason as
     :func:`context_occupancy`: this is per-session, per-turn detail, and slot
@@ -655,17 +690,24 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
                         continue
                     for label, size in blocks.items():
                         totals[label] = totals.get(label, 0) + size
-                    turns.append(
-                        {
-                            "ts": str(obj.get("ts") or ""),
-                            "phase": str(obj.get("phase") or ""),
-                            "blocks": blocks,
-                            "total_chars": sum(blocks.values()),
-                            "context_used": _coerce_int(obj.get("context_used")),
-                            "context_window": _coerce_int(obj.get("context_window")),
-                            "model": str(obj.get("model") or ""),
-                        }
-                    )
+                    turn_row: dict[str, Any] = {
+                        "ts": str(obj.get("ts") or ""),
+                        "phase": str(obj.get("phase") or ""),
+                        "blocks": blocks,
+                        "total_chars": sum(blocks.values()),
+                        "context_used": _coerce_int(obj.get("context_used")),
+                        "context_window": _coerce_int(obj.get("context_window")),
+                        "model": str(obj.get("model") or ""),
+                    }
+                    # The same shard row also carries the turn's billing; the
+                    # trace returns it rather than making the panel walk the
+                    # shards a second time through the usage-turns reader and
+                    # re-join what was never apart.
+                    for field in ("credits", "duration_ms"):
+                        value = _usage_number(obj.get(field))
+                        if value is not None:
+                            turn_row[field] = value
+                    turns.append(turn_row)
         except (OSError, UnicodeDecodeError):
             continue
 
@@ -760,12 +802,8 @@ def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
                     if not isinstance(obj, dict) or obj.get("_type") != "tokens":
                         continue
                     ts_raw = str(obj.get("ts") or "")
-                    try:
-                        ts_str = ts_raw[:-1] + "+00:00" if ts_raw.endswith("Z") else ts_raw
-                        ts_epoch = datetime.fromisoformat(ts_str).timestamp()
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if ts_epoch < prior_cutoff:
+                    ts_epoch = _parse_row_ts(ts_raw)
+                    if ts_epoch is None or ts_epoch < prior_cutoff:
                         continue
 
                     credits = float(obj.get("credits") or 0.0)
@@ -1494,19 +1532,11 @@ def _parse_token_history() -> dict[str, Any]:
                         continue
                     if not isinstance(obj, dict) or obj.get("_type") != "tokens":
                         continue
-                    day = None
-                    if "ts" in obj:
-                        try:
-                            ts_str = obj["ts"]
-                            if ts_str.endswith("Z"):
-                                ts_str = ts_str[:-1] + "+00:00"
-                            ts_dt = datetime.fromisoformat(ts_str)
-                            if ts_dt.timestamp() < cutoff:
-                                continue
-                            day = ts_dt.astimezone().strftime("%Y-%m-%d")
-                        except (ValueError, TypeError, AttributeError):
-                            pass
-                    if not day:
+                    ts_epoch = _parse_row_ts(str(obj.get("ts") or ""))
+                    if ts_epoch is None or ts_epoch < cutoff:
+                        continue
+                    day = _parse_row_day(obj.get("ts"))
+                    if day is None:
                         continue
                     inp = obj.get("input", 0)
                     out = obj.get("output", 0)
@@ -1665,7 +1695,10 @@ def _parse_sessions() -> dict:
     try:
         entries = list(sessions_dir.iterdir())
     except OSError as exc:
-        return {"error": f"Cannot read sessions directory: {exc}"}
+        # The OSError carries a filesystem path; keep it server-side and return
+        # a generic message (the ``error`` field is rendered verbatim in the UI).
+        logger.warning("usage: cannot read sessions directory: %s", exc)
+        return {"error": "cannot read sessions directory", "code": "sessions_dir_unreadable"}
 
     for f in entries:
         if f.suffix != ".jsonl":
@@ -1695,14 +1728,8 @@ def _parse_sessions() -> dict:
                         continue
                     if not isinstance(obj, dict):
                         continue
-                    if day is None and "timestamp" in obj:
-                        try:
-                            ts_str = obj["timestamp"]
-                            if ts_str.endswith("Z"):
-                                ts_str = ts_str[:-1] + "+00:00"
-                            day = datetime.fromisoformat(ts_str).astimezone().strftime("%Y-%m-%d")
-                        except (ValueError, TypeError, AttributeError):
-                            pass
+                    if day is None:
+                        day = _parse_row_day(obj.get("timestamp"))
                     kind = obj.get("kind", "")
                     if kind in ("Prompt", "AssistantMessage"):
                         msgs += 1
