@@ -56,6 +56,8 @@
     "memory_unavailable": "メモリ: 利用不可",
     "metrics_are_stale_latest_fetch_failed": "メトリクスが古く、最新の取得に失敗しました",
     "metrics_unavailable": "メトリクス利用不可",
+    "n_more_other": "ほか{{count}}件",
+    "notification_count_other": "{{count}} 件の通知",
     "resource_critical": "Critical",
     "resource_posture_tooltip_critical": "Host memory is critically low ({{gb}} GB free). Avoid heavy parallel work.",
     "resource_posture_tooltip_tight": "Host memory is tight ({{gb}} GB free). Heavy work may be slower.",
@@ -82,6 +84,7 @@
     "search_sessions_files_and_commands": "セッション、ファイル、コマンドを検索",
     "show_fewer_apps": "表示するアプリを減らす",
     "show_less": "表示を減らす",
+    "show_more_apps_other": "さらに{{count}}個のアプリを表示",
     "signed_in_with": "{{provider}} でサインイン済み",
     "skip_to_content": "コンテンツにスキップ",
     "social_login": "ソーシャルログイン",
@@ -1689,6 +1692,7 @@
         "path_to_folder": "/パス/フォルダー"
       },
       "searchPanel": {
+        "capped": "（上限あり）",
         "close_esc": "閉じる (Esc)",
         "close_search": "検索を閉じる",
         "comma_separated_glob_patterns": "カンマ区切りのグロブパターン",
@@ -2050,6 +2054,7 @@
         "prList": {
           "clear_search": "検索をクリア",
           "closed_merged_prs_are_capped_at_the_100_most_rec": "閉じられた/マージ済みPRは最後に更新された100件に限定されます。完全にリポジトリ全体を検索するには「me」フィルターをオンにしてください",
+          "file_changed_other": "{{count}} 個のファイルが変更されました",
           "loading_the_rest": "残りを読み込んでいます…",
           "pr_other": "{{count}}個のPR",
           "re_fetch_from": "{{label}} を {{provider}} から再取得",
@@ -2500,6 +2505,8 @@
             "labels": "ラベル",
             "looking_for_labels_this_repo_is_missing": "このリポジトリにないラベルを検索中…",
             "none_the_repo_s_taxonomy_already_covers_what_its": "なし。リポジトリのタクソノミーは、オープン Issue が必要とするものをすでにカバーしています。",
+            "open_issue_other": "{{count}}個の未解決Issue",
+            "open_with_description_other": "{{description}} — 未解決{{count}}件",
             "propose_labels_this_repo_is_missing_from_its_ope": "リポジトリがオープン Issue から取得する必要があるラベルを提案",
             "read_only_repo_needs_triage_push_access": "読み取り専用リポジトリ。トリアージ/プッシュアクセスが必要です",
             "suggest_again": "もう一度提案",
@@ -2522,6 +2529,7 @@
         },
         "taggingView": {
           "analyzing": "分析中…",
+          "apply_suggestion_other": "{{count}} 件の提案を適用",
           "applying": "適用中…",
           "applying_is_disabled_until_they_load_because_a_s": "リポジトリが不要になったラベルに名前を付けているため、\n            読み込みまでは適用が無効になります。バッチ全体の入力が却下されます。",
           "applying_needs_write_access": "適用には書き込みアクセスが必要です",
@@ -2533,6 +2541,8 @@
           "created_but_settings_not_updated": "「{{name}}」を GitHub 上に作成しましたが、このリポジトリのローカルトリアージ設定を更新できませんでした：{{error}}",
           "defines_no_labels_yet_so_there_is_nothing_to_ass": "まだラベルを定義していないため、割り当てるものがありません。\n            上記でいくつかを提案し、必要なものを作成してから、ここに戻ってラベルを提案してください。",
           "every_open_issue_in": "内のすべてのオープン Issue",
+          "labelled_issue_other": "{{count}}個のIssueにラベルを付けました。",
+          "labelled_issue_with_failures_other": "{{count}}個のIssueにラベルを付けました。{{failed}}個は更新できませんでした（下の行を参照）。",
           "loading_the_untagged_queue": "タグなしキューを読み込み中…",
           "newest_first": "最新のものから",
           "read_only_repo_needs_triage_or_push_access": "読み取り専用リポジトリ。トリアージまたはプッシュアクセスが必要です",
@@ -4561,7 +4571,7 @@
     "colChecks": "チェック",
     "colPr": "プルリクエスト",
     "colVerdict": "状態",
-    "commitConfirm": "この変更を {{branch}} にコミットしてプッシュしますか？公開したコミットは取り消せません。",
+    "commitConfirm": "この変更を 「{{branch}}」 にコミットしてプッシュしますか？公開したコミットは取り消せません。",
     "commitFailed": "コミットは拒否されました。",
     "commitFinding": "ブランチにコミット",
     "currentRepo": "対象",
@@ -7120,6 +7130,8 @@
       "sign_in_body": "Tailscale は実行中ですが、このコンピューターはまだネットワークにサインインしていません。スマートフォンで使用しているアカウントでサインインしてから、再確認してください。",
       "enable_magicdns_title": "MagicDNS をオンにする",
       "enable_magicdns_body": "このコンピューターはサインイン済みですが、ネットワークにこのコンピューター用の MagicDNS 名がないため、スマートフォンから指定できるアドレスがありません。Tailscale 管理コンソールで MagicDNS を有効にしてから、再確認してください。",
+      "enable_https_title": "Tailscale で HTTPS 証明書を有効にする",
+      "enable_https_body": "Serve が証明書を発行する前に、tailnet 管理者による 1 回限りの承認が必要です。Tailscale 管理コンソールで HTTPS を有効にしてから、再確認してください。",
       "trust_off_title": "このコンピューターのネットワーク名によるアクセスを許可する",
       "trust_off_body": "ダッシュボードは認識できないアドレスからのリクエストを拒否します。スマートフォンからアクセスできるよう、このコンピューター自身のプライベートネットワーク名を許可してください。これによりインターネットへのポートは開かれず、サインイン方法も変わりません。",
       "restart_gateway_title": "完了するには Kiro Crew を再起動してください",
@@ -7133,8 +7145,6 @@
       "copy": "コピー",
       "copy_link": "リンクをコピー",
       "download": "Tailscale をダウンロード",
-      "enable_trust": "許可する",
-      "publish_action": "スマートフォンアクセスを有効化",
       "show_qr": "QR コードを表示",
       "hide_qr": "非表示",
       "stop": "オフにする",
@@ -7143,12 +7153,15 @@
       "qr_warning": "{{minutes}} 分以内にスキャンしてください。このコードにはサインインリンクが含まれており — 入手した人は誰でも {{hours}} 時間ダッシュボードを開けます。共有したりスクリーンショットを投稿したりしないでください。",
       "keep_awake_note": "スマートフォンアクセスがオンの間、ダッシュボードにアクセスできるよう、このコンピューターはスリープしません。画面はオフになる場合があります。",
       "open_dns_admin": "Tailscale の DNS 設定を開く",
+      "open_https_admin": "Tailscale の HTTPS 設定を開く",
       "install_teaser": "スマートフォンで使う",
       "install_teaser_hint": "Tailscale が必要",
-      "restart_action": "今すぐ再起動",
-      "restarting": "再起動中です。このページは自動的に再接続します。",
       "no_peers": "この Tailscale ネットワークにはまだ他の端末が参加していないため、このアドレスを開ける端末がありません。スマートフォンに Tailscale をインストールし、同じアカウントでサインインしてください。",
-      "peers_offline": "他の端末はこのネットワークに参加していますが、現在どれもオンラインではないため、いずれかが接続するまでこのアドレスは読み込めません。"
+      "peers_offline": "他の端末はこのネットワークに参加していますが、現在どれもオンラインではないため、いずれかが接続するまでこのアドレスは読み込めません。",
+      "automatic_https": "この tailnet で HTTPS を有効にすると、Tailscale がプライベート証明書を自動で作成・更新します。",
+      "setting_up": "スマートフォンからのアクセスを設定中…",
+      "setup_action": "設定して QR を表示",
+      "setup_timeout": "スマートフォンアクセスの準備が完了しませんでした。設定を確認して、もう一度お試しください。"
     }
   },
   "hooks": {
@@ -7567,6 +7580,7 @@
       "v": "v",
       "installed_app_find_in_library_and_enable": "{{name}} をインストールしました。下でオンにして有効化してください。",
       "synced_from_its_source_directory": "{{name}} をソースディレクトリから同期しました。",
+      "updated_app_other": "{{count}} アプリを更新しました。",
       "updated_from_the_registry": "{{name}} をレジストリから更新しました。"
     },
     "artifactDeployPage": {
@@ -9946,7 +9960,13 @@
         "undo": "元に戻す",
         "uninstall": "アンインストール",
         "unknown": "不明",
-        "declared": "宣言のみ"
+        "declared": "宣言のみ",
+        "sign_in_required": "サインインが必要",
+        "sign_in_required_help": "このサーバーは OAuth を使用しており、まだ誰もサインインしていません。<chatLink>チャットに移動し</chatLink>、新しいセッションを開始して任意のメッセージを送信すると、チャットでサインインの承認を求められます。 その後、プローブしてこの一覧を更新します。",
+        "oauth_not_a_static_token": "このサーバーは OAuth でサインインするため、静的な Authorization ヘッダーでは接続できません。このサーバーを削除してヘッダーなしで再追加し、有効にしてから、新しいチャットセッションを開始してサインインしてください。",
+        "sign_in_required_next": "承認したら、この表の上にある「MCP サーバーをプローブ」ボタンを使用します。行は「サインイン済み」に変わります。",
+        "signed_in": "サインイン済み",
+        "signed_in_help": "{{provider}} のサインインは Kiro CLI が保持しています。プローブはそのトークンなしで実行されるため、{{productName}} はサインインが有効なままかどうかを確認できません。"
       },
       "memoryGraphTab": {
         "all_count": "すべて（{{count}}）",
@@ -11716,8 +11736,8 @@
           "revoke_disables": "{{name}} は信頼されなくなり、オフに切り替えられました。",
           "change_failed": "この変更は反映されませんでした：{{detail}}",
           "unknown_error": "不明なエラー",
-          "revoke_confirm_title": "{{name}} の信頼を解除しますか？",
-          "revoke_confirm_body": "{{name}} はオフに切り替えられ、動作を停止します。インストールされたままなので、後で再び信頼できます。",
+          "revoke_confirm_title": "「{{name}}」 の信頼を解除しますか？",
+          "revoke_confirm_body": "「{{name}}」 はオフに切り替えられ、動作を停止します。インストールされたままなので、後で再び信頼できます。",
           "revoke_confirm_ok": "信頼を解除してオフにする",
           "allow_all_confirm_body": "すべてのサードパーティアプリを信頼すると、インストールしたどのアプリも Kiro Crew の内部で独自のコードを実行でき、Kiro Crew と同じアクセス権 — あなたのファイル、保存された認証情報、およびインターネット — を持ちます。一度に1つのアプリだけを信頼する方が安全です。",
           "allow_all_confirm_ack": "インストールする各サードパーティアプリが、Kiro Crew のアクセス権で独自のコードを実行できるようになることを理解しました。",
@@ -12220,7 +12240,7 @@
         "delete": "Delete…",
         "deleting": "削除中…",
         "delete_crew": "Delete {{name}}",
-        "confirm_delete_of": "Confirm deleting {{name}}",
+        "confirm_delete_of": "「{{name}}」を削除しますか？",
         "delete_warning": "Delete terminates the EC2 instance and ends its charges. This cannot be undone.",
         "before_you_start": "Before you start — your AWS setup",
         "checking": "Checking…",
@@ -12738,6 +12758,9 @@
     }
   },
   "utils": {
+    "agentSwitchFeedback": {
+      "turn_in_flight": "ターンが進行中です — 完了してからもう一度お試しください。"
+    },
     "channelOrigin": {
       "direct_message": "ダイレクトメッセージ"
     },
