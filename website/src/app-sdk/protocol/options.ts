@@ -41,6 +41,19 @@ export function parseOptions(content: string): ParsedOptions {
 export interface FollowUpDerivation {
   followUpOptions: string[]
   followUpIsPlan: boolean
+  /**
+   * Identity of the assistant row the options were derived from — `meta.mid`
+   * when present, else the row's `ts`, else an index fallback. `null` when no
+   * options are on offer (streaming, question pending, user boundary, none).
+   *
+   * Consumers that must know whether the CHIPS THEMSELVES changed — not just
+   * their labels — compare this instead of the option labels: consecutive
+   * plan footers are byte-identical (`[OPTION: Go | Go All | Cancel]`), so a
+   * label key cannot distinguish stage 2's fresh offer from stage 1's stale
+   * one after a single-write transcript hydration. The plan-dispatch latch
+   * (usePlanActionMutation) is acknowledgement-gated on exactly this value.
+   */
+  followUpSourceKey: string | null
 }
 
 /**
@@ -76,15 +89,22 @@ export function deriveFollowUpOptions(
   isStreaming: boolean,
   questionPending = false,
 ): FollowUpDerivation {
-  if (isStreaming || questionPending) return { followUpOptions: [], followUpIsPlan: false }
+  if (isStreaming || questionPending) return { followUpOptions: [], followUpIsPlan: false, followUpSourceKey: null }
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
-    if (m.role === 'user' || m.role === 'queued') return { followUpOptions: [], followUpIsPlan: false }
+    if (m.role === 'user' || m.role === 'queued') return { followUpOptions: [], followUpIsPlan: false, followUpSourceKey: null }
     if (isSystemNoticeKind(m.kind ?? (m.meta?.kind as string | undefined))) continue
     if (m.role === 'assistant' && m.content) {
       const { options, isPlan } = parseOptions(m.content)
-      return { followUpOptions: options, followUpIsPlan: isPlan }
+      // Row identity, stable across pagination (mid/ts/clientTs belong to
+      // the row — the store stamps meta.clientTs on any row lacking a server
+      // ts, so the index fallback is a last resort for fixture-grade rows,
+      // and a history prepend cannot re-key a real row).
+      const followUpSourceKey = options.length > 0
+        ? ((m.meta?.mid as string | undefined) ?? m.ts ?? (m.meta?.clientTs as string | undefined) ?? `idx:${i}`)
+        : null
+      return { followUpOptions: options, followUpIsPlan: isPlan, followUpSourceKey }
     }
   }
-  return { followUpOptions: [], followUpIsPlan: false }
+  return { followUpOptions: [], followUpIsPlan: false, followUpSourceKey: null }
 }

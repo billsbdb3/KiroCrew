@@ -51,6 +51,7 @@ vi.mock('../api/client', () => ({
     setSlotColor: vi.fn().mockResolvedValue({ ok: true }),
     setSlotFolder: vi.fn().mockResolvedValue({ ok: true }),
     dashboardConfig: vi.fn().mockResolvedValue({ quick_send: false }),
+    planAction: vi.fn().mockResolvedValue({ ok: true }),
   },
   SEARCH_MIN_CHARS: 2,
 }))
@@ -70,23 +71,31 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatPage from '../pages/ChatPage'
+import { releasePlanLatches } from '../hooks/usePlanActionMutation'
 import { api } from '../api/client'
 
 /** The marker has to close its own line for OPTION_MARKER_RE to match. */
 const ASSISTANT_WITH_OPTIONS = 'Ready to proceed.\n\n[OPTIONS: Deploy | Roll back | Retry]'
 
-function makeStore() {
+/** A plan needs BOTH the header and a stage line for parseOptions to set isPlan;
+ *  the footer mirrors the plan pipeline's normalized template exactly. */
+const ASSISTANT_WITH_PLAN = '📋 Plan for: ship it\n\nStage 1: build the thing\n\n[OPTION: Go | Go All | Cancel]'
+
+/** Plan-SHAPED but carrying non-protocol labels — must keep the composer path. */
+const ASSISTANT_PLAN_SHAPED_CUSTOM = '📋 Plan for: ship it\n\nStage 1: build the thing\n\n[OPTIONS: Approve it | Revise stage 2]'
+
+function makeStore(content = ASSISTANT_WITH_OPTIONS, mode = '') {
   return configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
     preloadedState: {
       dashboard: {
         status: null, connected: true,
-        slots: [{ key: 'chat-1', messages: 1, running: false, mode: '', project: '/repo', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined }],
+        slots: [{ key: 'chat-1', messages: 1, running: false, mode, project: '/repo', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined }],
         unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
         subagentRunning: {}, subagentDetails: {}, subagentText: {},
       } as unknown as RootState['dashboard'],
       chat: {
-        activeSlot: 'chat-1', messages: [{ role: 'assistant', content: ASSISTANT_WITH_OPTIONS, cls: '' }],
+        activeSlot: 'chat-1', messages: [{ role: 'assistant', content, cls: '' }],
         slotRunning: false, slotStopping: false, slotState: 'idle',
         history: [], historyHasMore: false, pendingInput: null,
         subagents: {}, toolLog: [], activityOpen: false, activityTab: 'tools',
@@ -102,12 +111,12 @@ function makeStore() {
 }
 
 /** Render with real timers so the queries settle, then hand back to the caller. */
-async function renderPage() {
+async function renderPage(content = ASSISTANT_WITH_OPTIONS, mode = '', settleChip = 'Deploy') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   await act(async () => {
     render(
       <QueryClientProvider client={qc}>
-        <Provider store={makeStore()}>
+        <Provider store={makeStore(content, mode)}>
           <ThemeProvider>
             <MemoryRouter><ChatPage /></MemoryRouter>
           </ThemeProvider>
@@ -115,7 +124,7 @@ async function renderPage() {
       </QueryClientProvider>,
     )
   })
-  await waitFor(() => expect(screen.getByRole('button', { name: 'Deploy' })).toBeTruthy())
+  await waitFor(() => expect(screen.getByRole('button', { name: settleChip })).toBeTruthy())
 }
 
 const composer = () => screen.getByLabelText('Message input') as HTMLTextAreaElement
@@ -230,5 +239,39 @@ describe('ChatPage follow-up option toggle', () => {
     })
     expect(api.sendChat).not.toHaveBeenCalled()
     expect(composer().value).toBe('Deploy, Roll back')
+  })
+})
+
+describe('ChatPage plan follow-ups (issue #5893 parity)', () => {
+  // LOAD-BEARING: plan dispatches here go through the hook's MODULE-LEVEL
+  // per-slot latches, which survive vi.clearAllMocks() — and a SUCCESSFUL
+  // dispatch stays latched until the transcript acknowledges, which these
+  // static-store tests never simulate. Both tests use the fixed key
+  // 'chat-1', so the latches are reset explicitly per test; without that,
+  // the first dispatch would silently drop every later one in this file.
+  beforeEach(() => { releasePlanLatches('chat-1') })
+
+  it('a plan chip in orchestrator mode dispatches the plan action and never touches the composer', async () => {
+    await renderPage(ASSISTANT_WITH_PLAN, 'orchestrator', 'Go')
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Go') })
+    expect(api.planAction).toHaveBeenCalledTimes(1)
+    expect(api.planAction).toHaveBeenCalledWith('chat-1', 'Go')
+    expect(composer().value).toBe('')
+    expect(api.sendChat).not.toHaveBeenCalled()
+  })
+
+  it('a plan-shaped message with NON-protocol labels keeps the composer path (allowlist gate)', async () => {
+    // The endpoint accepts only go / go all / cancel; a plan-shaped message
+    // quoting a plan while offering its own choices must compose text, not
+    // fire a dispatch the server would 400 (which also skips the append —
+    // a dead chip). This pins the allowlist ON THE MAIN SURFACE, so a future
+    // server-side action added without updating isPlanAction fails a test
+    // here instead of silently degrading to composer text.
+    await renderPage(ASSISTANT_PLAN_SHAPED_CUSTOM, 'orchestrator', 'Approve it')
+    vi.useFakeTimers()
+    await act(async () => { clickOption('Approve it') })
+    expect(composer().value).toBe('Approve it')
+    expect(api.planAction).not.toHaveBeenCalled()
   })
 })
