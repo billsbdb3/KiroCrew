@@ -246,6 +246,7 @@ from kiro_crew.dashboard.chat_utils import (  # noqa: E402
     _POSTTOKEN_RECOVER_MSG,
     _PROMISE_ONLY_CONTINUE_MSG,
     _SYNTHETIC_RECOVERY_MSGS,
+    CRON_NOTIFICATION_KIND,
     SUBAGENT_COMPLETION_KIND,
     SYNTHETIC_RECOVERY_KIND,
     RecoveryPayload,
@@ -4175,6 +4176,9 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
     """
     if not slot._pending_steers:
         return
+    # circular import: session_control imports this package's modules at module level.
+    from kiro_crew.dashboard.session_control import containment_meta
+
     requeued = slot._pending_steers[:]
     slot._pending_steers.clear()
     for steer_msg in reversed(requeued):
@@ -4191,11 +4195,29 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         # when several queued items are merged into one — which is the only way the
         # steer's caller can tell "already persisted by the drain" from "consumed by
         # the turn" after both bookkeeping lists have emptied.
-        _meta: dict | None = None
+        #
+        # Stamp the containment snapshot too (#5911): a requeued steer is plain
+        # user speech re-entering the queue, and this requeue is the last moment
+        # its admission is re-affirmed — a link appearing between here and the
+        # drain must drop it like any other queued prompt, while a session that
+        # was ALREADY channel-born keeps its steers.
+        _meta: dict = containment_meta(state, slot)
         _did = getattr(slot, "_steer_delivery_ids", {}).pop(steer_msg, "")
         if _did:
-            _meta = {"steer_delivery_id": _did}
-        qid = slot.queue_insert(0, steer_msg, meta=_meta)
+            _meta["steer_delivery_id"] = _did
+        # Provenance is derivable, not guessed: `steer_into_running_turn` has
+        # exactly one caller (the api_chat composer branch), and app isolation
+        # confines app-surface requests to app-scoped slots — so every steer
+        # into a NON-app slot came from the authenticated human composer. That
+        # provenance is what exempts the requeued card from the LINKED drop,
+        # exactly as the composer's own queued
+        # fallback is exempt; an app slot's steers stay unexempted (False).
+        qid = slot.queue_insert(
+            0,
+            steer_msg,
+            meta=_meta,
+            directive_user_origin=not bool(getattr(slot, "_app", "")),
+        )
         try:
             content, _ = redact_exfiltration_urls(steer_msg)
             content, _ = redact_credentials(content)
@@ -4364,8 +4386,115 @@ def _has_user_queued_followup(slot: "_ChatSlot") -> bool:
     return any(not _queue_entry_is_orchestration(q) for q in getattr(slot, "_queue", []))
 
 
+def _drop_stale_admissions(state: DashboardState, slot: _ChatSlot) -> None:
+    """Drop queued entries whose admission-time containment no longer holds (#5911).
+
+    Authorization is decided when a prompt is ADMITTED (`authorize_target` for
+    `session_send`, the authenticated composer for a human typing into a busy
+    session), but delivery happens later, at this drain — and the target-side
+    containment those decisions rest on can change in between: a target
+    authorized while unlinked can be given a channel or mirror link before its
+    queue drains, and the queued prompt would then execute and republish to an
+    audience its admission never contemplated.
+
+    Producers of plain (user-speech) entries stamp the containment snapshot at
+    enqueue (`session_control.containment_meta`); this sweep recomputes the same
+    constraints and drops any entry for which a constraint holds NOW that did
+    not hold at admission — including a WORKSPACE change, which swaps the
+    memory/lessons/project context under a waiting prompt. An unmarked plain
+    entry fails closed against the boolean constraint set, so an untagged
+    producer can never ride a queued prompt past a boundary the tagged paths
+    respect.
+
+    Entries carrying `_directive_user_origin` (authenticated-human provenance)
+    are exempt from the LINKED constraint only: the author typed into the
+    session's own surface and linking it is that owner's deliberate act, so
+    composer input into a just-linked session is designed behaviour. A NEW
+    outbound mirror still drops them — the author does not control mirror
+    links — as do all other constraints (see
+    `session_control.newly_held_constraints`).
+
+    Structural exemption is narrow: cron notifications and sub-agent
+    completions only (`CRON_NOTIFICATION_KIND` / `SUBAGENT_COMPLETION_KIND`) —
+    runner machinery minted fresh by trusted internal producers, which
+    channel-born sessions receive by design. Synthetic-recovery entries are
+    NOT exempt: a recovery replays externally admitted content verbatim, so it
+    is re-validated like any plain entry against the admission stamp its
+    requeue recorded (`_queue_recovery`), failing closed when unmarked.
+
+    Runs at the top of the drain with no suspension point between the snapshot
+    and the dequeue (everything below is synchronous on the event loop), so the
+    decision cannot go stale before the surviving entry becomes a turn. A drop
+    is never silent: the queue card is retracted, a visible notice naming the
+    changed constraint lands in the transcript, and the drop is written to the
+    SEL.
+    """
+    if not slot._queue:
+        return
+    # circular import: session_control imports this package's modules at module level.
+    from kiro_crew.dashboard import session_control as _sc
+
+    now = _sc.containment_snapshot(state, slot, on_probe_failure=True)
+    _mirror_unverified = bool(now.get("mirror_unverified"))
+    doomed: list[tuple[dict, list[str]]] = []
+    for q in slot._queue:
+        # Exempt ONLY cron notifications and sub-agent completions: both are
+        # minted fresh by trusted internal producers for THIS slot's own turn
+        # lifecycle, and channel-born sessions receive them by design. A
+        # synthetic-recovery entry is deliberately NOT exempt — it replays
+        # externally admitted content verbatim under a fresh queue id, so an
+        # exemption would let the retry ride past a link that appeared during
+        # the recovery window. Every recovery producer stamps admission context
+        # at requeue (`_queue_recovery`, the manual continue), so a recovery in
+        # a channel-born session still drains: its stamp records linked=True.
+        if q.get("kind") in (CRON_NOTIFICATION_KIND, SUBAGENT_COMPLETION_KIND):
+            continue
+        changed = _sc.newly_held_constraints(
+            now,
+            q.get("meta"),
+            directive_user_origin=q.get("_directive_user_origin") is True,
+        )
+        if changed:
+            doomed.append((q, changed))
+    for q, changed in doomed:
+        slot.queue_remove_by_id(q["id"])
+        # The broadcast is unconditional: the frontend's queue card was created
+        # by the producer's queue_push, not by a transcript placeholder row, so
+        # gating retraction on the (rare) placeholder existing would leave a
+        # card on screen for a message the server discarded. The placeholder
+        # removal is the separate, best-effort half.
+        _remove_queued_by_id(slot.messages, q["id"])
+        state.broadcast_ws("queue_pop", {"slot": slot.key, "content": "", "queue_id": q["id"]})
+        slot.append(
+            "notice",
+            "⚠️ Queued message dropped: "
+            + _sc.describe_containment_change(changed, mirror_unverified=_mirror_unverified)
+            + " after it was queued, so the authorization that admitted it no longer holds.",
+            "msg msg-info",
+        )
+        _sc.audit_queued_drop(slot, q["id"], changed)
+        _log = logger.warning if _mirror_unverified and "mirrored" in changed else logger.info
+        _log(
+            "Dropped queued entry %s for slot %s at drain re-validation " "(newly held: %s%s)",
+            q["id"],
+            slot.key,
+            ",".join(changed),
+            (
+                "; mirror probe FAILED — refusal is fail-closed, not an observed link"
+                if _mirror_unverified and "mirrored" in changed
+                else ""
+            ),
+        )
+
+
 async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> bool:
     """Dequeue and start one ready Kiro turn, preserving queue semantics."""
+
+    # FIRST, before anything reads the queue: re-assert each entry's
+    # admission-time containment and drop what no longer qualifies (#5911).
+    # Everything below — the note flush peeking at queue[0], the user-intervention
+    # purge, the dequeue itself — must see only entries that may still deliver.
+    _drop_stale_admissions(state, slot)
 
     # Above the dequeue, so a held note's visible line lands before this turn's
     # user row: its context half drains inside _run_chat via drain_pending_context.
@@ -4562,6 +4691,25 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
     # completion never merges (it drains alone and breaks any user-message
     # merge), so a merged row cannot carry them in the first place.
     _drained_ids: list[str] = []
+    # circular import: session_control imports this package's modules at module level.
+    from kiro_crew.dashboard.session_control import (
+        QUEUED_CONTAINMENT_META_KEY,
+        audit_queued_allow,
+    )
+
+    # The ALLOW side of the drain's permission decision (#5911): these entries
+    # passed re-validation and are now becoming a turn. Audited at consumption —
+    # not per sweep pass — so an entry that waits across several drains yields
+    # one row when it actually executes. Exempt kinds were never subject to the
+    # decision, so they are not counted as one.
+    _revalidated_ids = [
+        item["id"]
+        for item in consumed
+        if item.get("kind") not in (CRON_NOTIFICATION_KIND, SUBAGENT_COMPLETION_KIND)
+    ]
+    if _revalidated_ids:
+        audit_queued_allow(slot, _revalidated_ids)
+
     for item in consumed:
         _item_meta = item.get("meta")
         if isinstance(_item_meta, dict):
@@ -4571,7 +4719,12 @@ async def _start_next_queued_turn(state: DashboardState, slot: _ChatSlot) -> boo
             _many = _item_meta.get("steer_delivery_ids")
             if isinstance(_many, list):
                 _drained_ids.extend(x for x in _many if isinstance(x, str) and x)
-            _drained_meta.update(_item_meta)
+            # The admission-time containment snapshot (#5911) is queue plumbing,
+            # consumed by _drop_stale_admissions above; it says nothing about the
+            # ROW, so it must not ride into the persisted transcript meta.
+            _drained_meta.update(
+                (k, v) for k, v in _item_meta.items() if k != QUEUED_CONTAINMENT_META_KEY
+            )
     if _drained_ids:
         _drained_meta.pop("steer_delivery_id", None)
         _drained_meta["steer_delivery_ids"] = _drained_ids
@@ -5140,13 +5293,25 @@ async def _run_chat(
         kind: str,
         payload: str = "",
     ) -> str:
-        """Queue a retry without losing a producer's consumption settlement."""
+        """Queue a retry without losing a producer's consumption settlement.
+
+        Stamps FRESH admission context (#5911): a recovery entry replays
+        externally admitted content verbatim under a new queue id, so without
+        its own stamp the drain would either wave it past a link that appeared
+        during the retry window (exemption) or destroy every recovery in a
+        channel-born session (fail-closed). The requeue is the moment its
+        admission is re-affirmed, and the turn's directive provenance rides
+        along so the audience exemption follows the original author.
+        """
+        # circular import: session_control imports this package's modules at module level.
+        from kiro_crew.dashboard.session_control import containment_meta
 
         return slot.queue_insert(
             index,
             content,
             kind=kind,
             payload=payload,
+            meta=containment_meta(state, slot),
             on_consumed=_on_consumed if not _consumed_reported else None,
             on_irreversibly_consumed=(
                 _on_irreversibly_consumed if not _irreversible_consumption_reported else None
@@ -9406,7 +9571,12 @@ async def _run_chat(
                 slot._fallback_candidate_idx = 0
                 slot._fallback_walked = []
             else:
-                slot.queue_insert(
+                # Through _queue_recovery like every other retry (#5911): a direct
+                # queue_insert carries no admission stamp, so the drain's
+                # fail-closed re-check would destroy this fallback-model retry in
+                # every channel-linked or unattended session — exactly the
+                # long-running jobs most likely to hit throttle fallback.
+                _queue_recovery(
                     0,
                     message,
                     kind=SYNTHETIC_RECOVERY_KIND,

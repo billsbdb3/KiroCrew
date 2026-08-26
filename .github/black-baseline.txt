@@ -212,7 +212,6 @@ src/kiro_crew/dashboard/chat_folder_suggest.py
 src/kiro_crew/dashboard/chat_folders.py
 src/kiro_crew/dashboard/chat_fork.py
 src/kiro_crew/dashboard/chat_nav.py
-src/kiro_crew/dashboard/chat_orchestrator.py
 src/kiro_crew/dashboard/chat_persistence.py
 src/kiro_crew/dashboard/chat_slack.py
 src/kiro_crew/dashboard/chat_title.py
@@ -799,7 +798,6 @@ test/test_governance_chokepoints.py
 test/test_governance_policy.py
 test/test_governance_policy_viewer.py
 test/test_handler_cron_list.py
-test/test_handler_link_intercept.py
 test/test_handlers_channel_clear_context.py
 test/test_handlers_channel_presets.py
 test/test_handlers_files_upload.py
@@ -1155,9 +1153,7 @@ test/test_slack_dashboard_live_sync.py
 test/test_slack_events_coverage.py
 test/test_slack_gateway.py
 test/test_slack_gateway_coverage.py
-test/test_slack_handler_coverage.py
 test/test_slack_handler_coverage_branches.py
-test/test_slack_handler_more_coverage.py
 test/test_slack_home_tab.py
 test/test_slack_inline_stop.py
 test/test_slack_interactions_coverage.py

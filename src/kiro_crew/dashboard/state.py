@@ -4473,7 +4473,14 @@ class _ChatSlot:
         ``running == False`` within a single loop iteration.
         """
         if self.running:
-            self.queue_append(prompt)
+            # circular import: session_control imports this module at module level.
+            from kiro_crew.dashboard.session_control import containment_meta
+
+            # Stamp the containment constraints holding at ADMISSION, so the
+            # queue drain can re-assert them at delivery (issue #5911): a target
+            # that gains a channel/mirror link while this prompt waits must not
+            # execute it under the weaker constraints that admitted it.
+            self.queue_append(prompt, meta=containment_meta(state, self))
             return False
         self.append("user", prompt, "msg msg-u")
         task = asyncio.create_task(run_chat_coro(state, self, prompt))

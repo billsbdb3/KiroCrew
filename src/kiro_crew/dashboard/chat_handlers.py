@@ -412,8 +412,12 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         and state.subagents is not None
         and state.subagents.running_agents_for(f"dashboard:{slot.key}")
     ):
+        # circular import: session_control imports this package's modules at module level.
+        from kiro_crew.dashboard.session_control import containment_meta
+
         qid = slot.queue_append(
             message,
+            meta=containment_meta(state, slot),
             directive_user_origin=not bool(request_app),
         )
         _c, _ = redact_exfiltration_urls(message)
@@ -2657,7 +2661,21 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
         # cleanly that it was "interrupted before it finished" sends it looking
         # for half-done work that does not exist.
         resume = _MANUAL_RESUME_MSG if _is_interrupted(slot) else _MANUAL_CONTINUE_MSG
-        slot.queue_insert(0, resume, kind=SYNTHETIC_RECOVERY_KIND)
+        # circular import: session_control imports this package's modules at module level.
+        from kiro_crew.dashboard.session_control import containment_meta
+
+        # Admission stamp + provenance (#5911): recovery-kind entries are subject
+        # to drain re-validation like any other externally admitted content, and
+        # provenance follows the CALLER — the same request-identity split as
+        # api_chat. An app hitting Continue on its own slot must not gain the
+        # authenticated-human flag that gates session-mutating effects.
+        slot.queue_insert(
+            0,
+            resume,
+            kind=SYNTHETIC_RECOVERY_KIND,
+            meta=containment_meta(state, slot),
+            directive_user_origin=not bool(request.get("app", "")),
+        )
 
     sel().log_tool_invocation(
         session_key=_history_key_for(name),
