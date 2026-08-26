@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from collections.abc import Callable
@@ -14,14 +15,19 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import model_registry
+from kiro_crew.config.loader import config_dir
 from kiro_crew.cron import CronStoreBusy, is_valid_timezone
+from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.dashboard.cron_inject import (
     hydrate_slot_from_history,
     inject_cron_result_to_dashboard,
 )
 from kiro_crew.dashboard.state import DashboardState, SlotOrigin
+from kiro_crew.executors import discovery_executor
 from kiro_crew.history import is_incognito_transcript
+from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
 from kiro_crew.llm_helpers import run_bg_oneliner
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.validation import (
@@ -29,10 +35,11 @@ from kiro_crew.validation import (
     CHANNEL_ID_RE,
     CHANNEL_MAX_LEN,
     LEARN_ADD_SCHEMA,
-    MAX_MEDIUM_STRING,
+    MAX_CRON_MESSAGE,
     MAX_SHORT_STRING,
     SLACK_THREAD_TS_RE,
     ValidationError,
+    normalize_lesson_category,
     validate_string_field,
     validate_tool_args,
 )
@@ -44,6 +51,7 @@ from ._shared import (
     _get_memory,
     _is_restricted_session,
     _probe_persisted_session,
+    _redact_memory_field,
 )
 
 logger = logging.getLogger(__name__)
@@ -194,7 +202,7 @@ async def api_crons_create(request: web.Request) -> web.Response:
     # CRON_ADD_SCHEMA so the REST + tool paths validate identically.
     try:
         name = validate_string_field(body, "name", required=True, max_len=MAX_SHORT_STRING)
-        message = validate_string_field(body, "message", max_len=MAX_MEDIUM_STRING)
+        message = validate_string_field(body, "message", max_len=MAX_CRON_MESSAGE)
         schedule = validate_string_field(body, "schedule", max_len=100)
         cron_expr = validate_string_field(body, "cron", max_len=100) or None
         channel = validate_string_field(body, "channel", max_len=CHANNEL_MAX_LEN) or None
@@ -295,7 +303,9 @@ async def api_cron_delete(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     job_id = request.match_info["job_id"]
     try:
-        ok = await state.crons.remove_job_async(job_id)
+        ok = await state.crons.remove_job_async(
+            job_id, actor="dashboard", source="api_cron_delete"
+        )
     except CronStoreBusy:
         return web.json_response(_CRON_BUSY_BODY, status=_CRON_BUSY_STATUS)
     if ok:
@@ -347,7 +357,9 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
         # back on the loop (asyncio.create_task needs it): moving it off-loop
         # would raise AFTER the on-disk delete and leave the scheduler timer
         # cancelled.
-        deleted, failed = await state.crons.remove_jobs(unique_ids)
+        deleted, failed = await state.crons.remove_jobs(
+            unique_ids, actor="dashboard", source="api_cron_batch_delete"
+        )
     except Exception:
         # The batch itself raised (unexpected) — report everything as failed.
         logger.warning("Batch delete failed", exc_info=True)
@@ -365,16 +377,6 @@ async def api_cron_batch_delete(request: web.Request) -> web.Response:
                 "History cleanup failed for cron %s (job already removed)",
                 job_id, exc_info=True,
             )
-    # SEL audit: a destructive batch action must record who/what/when + the
-    # affected resources and outcome. Cron IDs are non-sensitive (no
-    # creds/PII), so logging them is compliant.
-    _sel().log_api_access(
-        caller="dashboard",
-        operation="cron.batch_delete",
-        outcome="ok" if deleted else "failed",
-        source="api_cron_batch_delete",
-        resources=f"requested={unique_ids} deleted={deleted} failed={failed}",
-    )
     if deleted:
         state.push_refresh("crons")
     # ok reflects whether anything was actually deleted — consistent with the
@@ -405,6 +407,32 @@ async def api_cron_update(request: web.Request) -> web.Response:
     ):
         if key in body:
             kwargs[key] = body[key]
+    # name routes through the same validator as POST (type check +
+    # sanitize_string + length cap) so the two REST surfaces cannot diverge:
+    # PATCH previously passed it through entirely unvalidated, letting a
+    # non-string or oversize name persist verbatim into crons.json.
+    if "name" in kwargs:
+        try:
+            kwargs["name"] = validate_string_field(
+                body, "name", max_len=MAX_SHORT_STRING
+            )
+        except ValidationError as exc:
+            return web.json_response(
+                {"error": str(exc), "code": "invalid_name"}, status=400
+            )
+    # message routes through the same validator as POST (type check +
+    # sanitize_string + length cap) so the two REST surfaces cannot diverge:
+    # PATCH previously passed it through entirely unvalidated. Sanitizing here
+    # also keeps length measured post-normalization, matching create.
+    if "message" in kwargs:
+        try:
+            kwargs["message"] = validate_string_field(
+                body, "message", max_len=MAX_CRON_MESSAGE
+            )
+        except ValidationError as exc:
+            return web.json_response(
+                {"error": str(exc), "code": "invalid_message"}, status=400
+            )
     # folder_id must be a string (or null → ""): a non-string JSON value
     # would be persisted verbatim into the schema and corrupt reads.
     if "folder_id" in kwargs:
@@ -644,6 +672,153 @@ async def api_cron_history_detail(request: web.Request) -> web.Response:
     return web.json_response(detail)
 
 
+# Ceiling on the script source returned by GET /api/crons/{id}/script. Cron
+# scripts are hand- or LLM-authored helpers of a few KB; anything near this
+# ceiling is not a cron script, so the view truncates rather than streaming an
+# unbounded file into the dashboard.
+_SCRIPT_SOURCE_MAX_BYTES = 256 * 1024
+
+# The read below traverses the O_NOFOLLOW + fd-real-path chokepoint in hooks
+# (safe_read_file_bytes_nolink), which has no Windows implementation
+# (_fd_real_path returns None there -> fail-closed on every read). Gate with an
+# honest 501 rather than an opaque refusal, mirroring the theme-pack routes.
+_SCRIPT_SOURCE_WIN_UNSUPPORTED = os.name == "nt"
+
+
+def _read_script_source_sync(script_spec: object) -> tuple[dict[str, Any] | None, tuple[str, str] | None]:
+    """Resolve a job's stored ``script`` spec and read its source (blocking).
+
+    Returns ``(payload, None)`` on success or ``(None, (message, code))`` on
+    refusal. Runs in a worker thread — resolution stats the filesystem and the
+    read is synchronous file IO, neither of which may run on the event loop.
+
+    The path is derived exclusively from the job's own stored ``script`` field
+    (never from the client), re-validated by ``resolve_script_path`` (existence,
+    sensitivity, containment under ``<config_dir>/crons/``), and then read
+    through ``safe_read_file_bytes_nolink`` pinned to that same root so a
+    symlink or hardlink swapped in after the by-name check is rejected, never
+    dereferenced.
+
+    INVARIANT: no persisted job state may produce a 500 from this endpoint.
+    ``script_spec`` comes from ``crons.json``, which is agent- and hand-editable
+    JSON — its value can be any JSON type and any string shape. Every failure
+    to resolve it, of any kind, is therefore a 4xx refusal, never a crash:
+    the spec is validated as a string up front, and the resolution step is
+    wrapped fail-closed (``FileNotFoundError`` stays distinct only to give the
+    honest 404).
+    """
+    if not isinstance(script_spec, str):
+        # Truthy non-string ``script`` in crons.json (number, list, object):
+        # the handler's ``if not job.script`` gate passes it through, and the
+        # resolver would crash on it. Refuse, same code as any bad path.
+        return None, ("script path refused", "script_path_refused")
+    try:
+        file_path, func_name = resolve_script_path(script_spec)
+    except FileNotFoundError:
+        return None, ("script file not found", "script_not_found")
+    except Exception:
+        # Fail-closed catch-all, deliberate: malformed spec (ValueError), a
+        # path escaping the crons root (PermissionError), symlink-loop
+        # resolution failures (RuntimeError on some Python versions,
+        # OSError/ELOOP on others), and any failure mode not yet enumerated —
+        # the spec is untrusted persisted data, so an unanticipated exception
+        # type must degrade to the same refusal as an anticipated one, never
+        # to a 500. The refusal does not echo resolution detail (the spec
+        # string is already visible on the job record; the resolved path is
+        # not the client's business).
+        return None, ("script path refused", "script_path_refused")
+    crons_root = str((config_dir() / "crons").resolve())
+    truncated = False
+    try:
+        data = safe_read_file_bytes_nolink(
+            file_path, within_root=crons_root, max_bytes=_SCRIPT_SOURCE_MAX_BYTES
+        )
+    except FileTooLargeError:
+        data = safe_read_file_bytes_nolink(
+            file_path,
+            within_root=crons_root,
+            max_bytes=_SCRIPT_SOURCE_MAX_BYTES,
+            allow_truncate=True,
+        )
+        truncated = True
+    if data is None:
+        # Fail-closed refusal from the chokepoint (swapped symlink, hardlink,
+        # non-regular file, unverifiable containment). 4xx, never a 500.
+        return None, ("script unreadable", "script_read_refused")
+    # Scripts under crons/ are LLM-writeable by design, so treat their content
+    # like any other agent-influenced text shown in the dashboard: strip raw
+    # credential patterns and exfiltration URLs before it leaves the backend.
+    # The file and function names come from the same stored spec, so they get
+    # the identical treatment — a credential-shaped name must not ride out on
+    # the metadata fields either.
+    source = redact_credentials(redact_exfiltration_urls(data.decode("utf-8", errors="replace"))[0])[0]
+    file_name = redact_credentials(redact_exfiltration_urls(os.path.basename(file_path))[0])[0]
+    func = redact_credentials(redact_exfiltration_urls(func_name)[0])[0]
+    return {
+        "source": source,
+        "file": file_name,
+        "function": func,
+        "truncated": truncated,
+    }, None
+
+
+async def api_cron_script_source(request: web.Request) -> web.Response:
+    """GET /api/crons/{id}/script — read-only source of a script cron's callable.
+
+    The job id is the only caller-supplied input; the file path is derived
+    server-side from the stored job record (see ``_read_script_source_sync``).
+    """
+    state: DashboardState = request.app["state"]
+    job_id = request.match_info["job_id"]
+    # Freshness-guaranteed lookup, same rationale as api_cron_run: the job may
+    # have been minted by another process and not yet be in the cache snapshot.
+    job = await state.crons.get_job_async(job_id)
+    if not job:
+        return web.json_response({"error": "job not found", "code": "job_not_found"}, status=404)
+    if not job.script:
+        return web.json_response(
+            {"error": "job has no script", "code": "no_script"}, status=404
+        )
+    if _SCRIPT_SOURCE_WIN_UNSUPPORTED:
+        return web.json_response(
+            {
+                "error": "script source view is not yet supported on Windows",
+                "code": "unsupported_platform",
+            },
+            status=501,
+        )
+    payload, err = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), _read_script_source_sync, job.script
+    )
+    if err is not None:
+        message, code = err
+        # SEL audit: a refused read of an on-disk script is a guarded-path
+        # permission decision (containment escape, symlink swap, unresolvable
+        # spec) and must leave an audit record, same as an allowed read below.
+        _sel().log_api_access(
+            caller="dashboard",
+            operation="cron.script_source",
+            outcome="denied",
+            source="api_cron_script_source",
+            resources=f"job_id={job_id} code={code}",
+        )
+        # Literal statuses per branch (not a computed ``status=`` expression) so
+        # the error-code contract ratchet can see each site is coded.
+        if code == "script_not_found":
+            return web.json_response({"error": message, "code": code}, status=404)
+        return web.json_response({"error": message, "code": code}, status=422)
+    # _read_script_source_sync returns exactly one of (payload, err) non-None.
+    assert payload is not None
+    _sel().log_api_access(
+        caller="dashboard",
+        operation="cron.script_source",
+        outcome="ok",
+        source="api_cron_script_source",
+        resources=f"job_id={job_id} truncated={payload['truncated']}",
+    )
+    return web.json_response(payload)
+
+
 async def api_cron_history_all(request: web.Request) -> web.Response:
     """GET /api/crons/history — unified history across all jobs, enriched with job_name."""
     state: DashboardState = request.app["state"]
@@ -686,37 +861,34 @@ async def _recognize_session(
     operation: str,
     *,
     blocks_persisted_mode: Callable[[str], bool],
-    error_codes: bool = False,
 ) -> web.Response | None:
-    """Session-recognition gate shared by the lessons routes.
+    """Session-recognition gate shared by the lessons and memory routes.
 
     Applies one slot / restricted-key / channel-namespace / persisted-JSONL
-    cascade to every caller so the create and delete routes cannot diverge.
+    cascade to every caller so the mutating routes cannot diverge.
     Returns a refusal :class:`web.Response`, or ``None`` when the session is
     recognised. Every decision — allow or deny — emits a SEL audit event
     under *operation*.
 
     ``blocks_persisted_mode`` is the per-route policy for the
-    archived-session recovery path: create blocks every private mode (the
-    canonical ``history.is_incognito_transcript`` classifier); delete blocks
-    only ``temporary``. A ``None``
+    archived-session recovery path: writes block every private mode (the
+    canonical ``history.is_incognito_transcript`` classifier); lesson delete
+    blocks only ``temporary``. A ``None``
     (unreadable or ambiguous) persisted mode always fails closed regardless
-    of policy. ``error_codes`` controls whether the 400 refusal bodies carry
-    the machine-readable ``code`` field (the delete route's error contract;
-    the create route's 400 responses predate it and stay code-less); the 403
-    refusal carries ``restricted_session`` on both routes.
+    of policy. Every refusal body carries a machine-readable ``code`` field
+    (``missing_session_key`` / ``unknown_session`` on the 400s,
+    ``restricted_session`` on the 403), so clients dispatch on the
+    identifier rather than the prose.
     """
     if not sk:
         _sel().log_api_access(
             caller="anonymous", operation=operation, outcome="denied",
             source="dashboard", resources="missing_session_key",
         )
-        if error_codes:
-            return web.json_response(
-                {"error": "missing X-Session-Key", "code": "missing_session_key"},
-                status=400,
-            )
-        return web.json_response({"error": "missing X-Session-Key"}, status=400)
+        return web.json_response(
+            {"error": "missing X-Session-Key", "code": "missing_session_key"},
+            status=400,
+        )
     if sk == "dashboard:ui":
         # Browser UI's static key — implicitly trusted, but the allow
         # decision itself is still an authorization outcome and must be
@@ -780,12 +952,10 @@ async def _recognize_session(
                 caller=sk, operation=operation, outcome="denied",
                 source="dashboard", resources="unknown_session",
             )
-            if error_codes:
-                return web.json_response(
-                    {"error": "unknown session", "code": "unknown_session"},
-                    status=400,
-                )
-            return web.json_response({"error": "unknown session"}, status=400)
+            return web.json_response(
+                {"error": "unknown session", "code": "unknown_session"},
+                status=400,
+            )
         if persisted_mode is None or blocks_persisted_mode(persisted_mode):
             # Archiving a tab drops the slot AND discards its
             # ``_restricted_keys`` entry while leaving the transcript —
@@ -895,6 +1065,10 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # omitted the kwarg -- so every NOT-clause sent to this route, from the
     # learn_add MCP tool, the dashboard, or the CLI, was silently lost.
     negative = cleaned.get("negative") or None
+    # Restricts the lesson to one repository; absent means it applies everywhere.
+    # Both write paths carry it, so the JSONL fallback store gates identically to
+    # the vector store rather than injecting a scoped lesson the other withholds.
+    repo_scope = cleaned.get("repo_scope") or None
     # Write to vector store if available, else JSONL
     vs = _get_memory(state).vector_store
     if vs:
@@ -916,7 +1090,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # for a lesson that was actually saved (and re-saved on every retry).
         # Writing first, then sweeping in the background, keeps the slow LLM call
         # off the request path.
-        wrote = await asyncio.to_thread(
+        result = await asyncio.to_thread(
             vs.write_lesson,
             rule,
             category,
@@ -924,19 +1098,23 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             "user_explicit",
             rule_emb,
             rule_emb_generation,
+            repo_scope,
         )
-        # Sweep ONLY when the lesson actually landed. write_lesson returns False
-        # for a value its preflight refuses (reachable now that ``negative`` is
-        # forwarded here at all -- this call site passed a literal None before) and
-        # for a dedup refusal. The return value used to be discarded, so a refused
-        # write still ran the sweep below, and _resolve_and_supersede would
-        # delete_semantic an older contradicted lesson whose "replacement" was never
-        # stored -- destroying a lesson on a request that persisted nothing, under
-        # HTTP 200. Superseding on the authority of a write that did not happen is
-        # wrong for BOTH False cases, so gate on the result rather than the cause.
-        if wrote:
+        # Sweep ONLY when the lesson actually landed. The write declines for a value
+        # its preflight refuses (reachable now that ``negative`` is forwarded here at
+        # all -- this call site passed a literal None before) and for a dedup refusal.
+        # The result used to be discarded, so a refused write still ran the sweep
+        # below, and _resolve_and_supersede would delete_semantic an older
+        # contradicted lesson whose "replacement" was never stored -- destroying a
+        # lesson on a request that persisted nothing, under HTTP 200. Superseding on
+        # the authority of a write that did not happen is wrong for every declining
+        # outcome, so gate on ``wrote`` rather than on the cause.
+        outcome = result.outcome.value
+        reason = result.reason
+        stored = result.stored
+        if result.wrote:
             candidates = await asyncio.to_thread(
-                vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb
+                vs.find_contradiction_candidates, rule, 0.4, 0.85, rule_emb, repo_scope
             )
             if candidates:
                 # Fire-and-forget via this module's _background_tasks
@@ -954,6 +1132,7 @@ async def api_lessons_create(request: web.Request) -> web.Response:
             rule=rule,
             category=category,
             negative=negative,
+            repo_scope=repo_scope,
             ts=datetime.now(timezone.utc).isoformat(),
         )
         store = _get_lessons(state, cleaned.get("workspace")) if scope == "workspace" else (
@@ -963,9 +1142,39 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # NOT-clause has to attach it rather than be skipped as a duplicate.
         # Off the loop because it reads the file and rewrites it whole -- the
         # same reason dashboard/ws.py offloads load_all.
-        await asyncio.to_thread(store.save_or_enrich, lesson)
+        #
+        # This store answers with the same three words the vector store's outcome uses
+        # (inserted / enriched / unchanged) and validates no content, so it has no
+        # refusing outcome to report. Its value is echoed as-is: ``state.lessons`` is a
+        # real ``LessonStore`` at every construction site, and its ``save_or_enrich``
+        # is annotated ``-> str`` with three string-literal returns, so there is
+        # nothing here for a filter to catch. ``test_lesson_write_outcome`` pins
+        # LessonWriteOutcome's wire values against those three words, so the two
+        # stores cannot drift apart in silence.
+        outcome = await asyncio.to_thread(store.save_or_enrich, lesson)
+        reason = None
+        stored = True
+    # Refreshed unconditionally, and deliberately so. An earlier revision of this
+    # change gated the push on the write having landed, which is wrong: a DECLINING
+    # outcome can still have mutated the store. ``write_lesson``'s second pass
+    # DELETES a row it supersedes and keeps scanning, so with a containment chain
+    # (A inside R inside B) whose rows are visited A-first -- and the scan order is
+    # effectively random, since get_lessons orders by md5 key -- A is removed and the
+    # call then returns ``deduped`` for B. The store changed while ``wrote`` is False,
+    # so gating on it left connected dashboards showing a lesson that is gone.
+    # Reporting mutation separately would buy nothing over refreshing always: an extra
+    # refresh on a no-op re-submit costs a redundant list fetch, a missed one shows
+    # deleted data.
     state.push_refresh("lessons")
-    return web.json_response({"ok": True})
+    # ``ok`` answers the question the caller actually asked -- is the lesson I
+    # submitted in the store -- so it stays true for a no-op re-submit (it is stored,
+    # there was simply nothing to write) and turns false when a dedup rule or
+    # validation kept it out. It used to be an unconditional true, which told the
+    # caller its lesson was saved even when the store had refused the value; the
+    # ``learn_add`` tool and the CLI both reported "Saved" on that response.
+    # ``outcome`` and ``reason`` are additive, so a client that only reads ``ok``
+    # keeps working.
+    return web.json_response({"ok": stored, "outcome": outcome, "reason": reason})
 
 
 async def api_lessons_delete(request: web.Request) -> web.Response:
@@ -990,7 +1199,6 @@ async def api_lessons_delete(request: web.Request) -> web.Response:
     refusal = await _recognize_session(
         state, sk, "lessons.delete",
         blocks_persisted_mode=_is_temporary_transcript,
-        error_codes=True,
     )
     if refusal is not None:
         return refusal
@@ -1058,11 +1266,27 @@ async def api_crons(request: web.Request) -> web.Response:
             "created_ts": j.created_ts or None,
             "last_status": j.last_status,
             "agent": redact_credentials(redact_exfiltration_urls(j.agent_id or "")[0])[0] or None,
+            # The crews a sequence job actually wakes. Serialized because
+            # `agent_sequence` takes PRECEDENCE over `agent_id` at run time, so a
+            # consumer reading only `agent` would attribute such a job to the
+            # wrong crew (an empty `agent_id` reads as "the default crew").
+            "agent_sequence": [
+                redact_credentials(redact_exfiltration_urls(a or "")[0])[0]
+                for a in (j.agent_sequence or [])
+            ],
             "model": redact_credentials(redact_exfiltration_urls(j.model or "")[0])[0] or None,
             "channel": redact_credentials(redact_exfiltration_urls(j.channel or "")[0])[0] or None,
             "approval_mode": redact_credentials(redact_exfiltration_urls(j.approval_mode or "")[0])[
                 0
             ]
+            or None,
+            # The chat session that owns this job. Ownership decides chat-side
+            # reachability: cron_list only shows a session its own jobs, so a job
+            # whose key is empty (None here) is invisible to every chat session
+            # and manageable only from this page or the CLI. Raw value on
+            # purpose — the frontend decides presentation, and a derived
+            # "reachable" boolean would be a second encoding of the same fact.
+            "session_key": redact_credentials(redact_exfiltration_urls(j.session_key or "")[0])[0]
             or None,
             "silent": j.silent,
             "strict_schedule": j.strict_schedule,
@@ -1101,19 +1325,13 @@ async def api_crons(request: web.Request) -> web.Response:
 # Serializes all cron-folder mutations (create/rename/delete) so concurrent
 # requests cannot race on the in-memory list + disk persist cycle. The lock is
 # created lazily and re-created if the running event loop changes (Python 3.10
-# binds a Lock to the loop it first waits on) — mirrors _get_config_lock in
-# agents.py.
-_cron_folders_lock: asyncio.Lock | None = None
-_cron_folders_lock_loop: asyncio.AbstractEventLoop | None = None
+# binds a Lock to the loop it first waits on) — loop-bound via the shared
+# LoopBoundLock (#4800).
+_cron_folders_lock = LoopBoundLock()
 
 
-def _get_cron_folders_lock() -> asyncio.Lock:
-    """Return a cron-folders lock bound to the current event loop."""
-    global _cron_folders_lock, _cron_folders_lock_loop
-    loop = asyncio.get_running_loop()
-    if _cron_folders_lock is None or _cron_folders_lock_loop is not loop:
-        _cron_folders_lock = asyncio.Lock()
-        _cron_folders_lock_loop = loop
+def _get_cron_folders_lock() -> LoopBoundLock:
+    """Return the cron-folders lock (loop-bound; rebinds per running loop)."""
     return _cron_folders_lock
 
 
@@ -1158,6 +1376,10 @@ async def api_cron_folders_update(request: web.Request) -> web.Response:
     """PATCH /api/cron-folders/{folder_id} — rename a cron folder."""
     state: DashboardState = request.app["state"]
     folder_id = request.match_info["folder_id"]
+    if not folder_id or len(folder_id) > MAX_SHORT_STRING:
+        return web.json_response(
+            {"error": "invalid folder_id format", "code": "invalid_folder_id"}, status=400
+        )
     try:
         body = await request.json()
     except Exception:
@@ -1192,6 +1414,10 @@ async def api_cron_folders_delete(request: web.Request) -> web.Response:
     """DELETE /api/cron-folders/{folder_id} — delete folder and clear assignments."""
     state: DashboardState = request.app["state"]
     folder_id = request.match_info["folder_id"]
+    if not folder_id or len(folder_id) > MAX_SHORT_STRING:
+        return web.json_response(
+            {"error": "invalid folder_id format", "code": "invalid_folder_id"}, status=400
+        )
     async with _get_cron_folders_lock():
         try:
             found = await asyncio.to_thread(state.delete_cron_folder, folder_id)
@@ -1220,17 +1446,52 @@ async def api_lessons(request: web.Request) -> web.Response:
         )
         return web.json_response({"lessons": []})
     workspace = request.query.get("workspace")
+
+    def _safe_lesson(rule: object, category: object, ts: object) -> dict:
+        """One sanitization chokepoint for every branch of this endpoint.
+
+        Lesson rows can carry consolidation (LLM) or import output: normalize
+        the category through the shared helper (display policy, strict=False)
+        so this surface cannot drift from the write-path rules, and redact
+        BOTH prose fields via the shared chain like every other agent-derived
+        string this handler returns -- an imported row can carry a credential
+        in either field. The JSONL store loads ``rule`` without type
+        validation, so a malformed row can carry a non-string here; stringify
+        before the redaction rather than crashing the endpoint.
+        """
+        if not isinstance(rule, str):
+            rule = str(rule)
+        safe_rule = _redact_memory_field(rule)
+        safe_category = _redact_memory_field(
+            normalize_lesson_category(category, strict=False)
+        )
+        return {"rule": safe_rule, "category": safe_category, "ts": ts}
+
     # Read from vector store if it has lessons, else JSONL
     vs = _get_memory(state).vector_store
     vs_lessons = await asyncio.to_thread(vs.get_lessons) if vs else None
     if vs_lessons:
+        # Deferred import: ``vector_memory`` pulls snowballstemmer plus the
+        # optional numpy/faiss imports, and this helper is the handler's only
+        # use of it, on one dashboard read path.
+        from kiro_crew.vector_memory import _lesson_display_text
+
         data = []
         for e in vs_lessons[-50:]:
             try:
-                rule = json.loads(e["value_json"])
+                decoded = json.loads(e["value_json"])
             except (json.JSONDecodeError, TypeError):
                 continue
-            data.append({"rule": rule, "category": "knowledge", "ts": e.get("updated_at", "")})
+            # Rendered text for either storage shape: mapping-shaped rows
+            # (write_lesson's format and the onboarding import's) would otherwise
+            # ship a nested object where the dashboard expects a string. A row with
+            # no lesson shape falls back to str() rather than being dropped, so it
+            # stays listed and therefore deletable -- delete_lesson needs a
+            # substring, and this list is the only surface that can show it. The
+            # memory graph applies the same policy for the same reason.
+            rule = _lesson_display_text(decoded) or str(decoded)
+            raw_category = decoded.get("category") if isinstance(decoded, dict) else None
+            data.append(_safe_lesson(rule, raw_category, e.get("updated_at", "")))
     else:
         # Merge global + workspace-scoped lessons
         global_lessons = state.lessons.load_all()
@@ -1241,7 +1502,5 @@ async def api_lessons(request: web.Request) -> web.Response:
             for le in ws_lessons:
                 if le.rule.lower().strip() not in seen:
                     global_lessons.append(le)
-        data = [
-            {"rule": le.rule, "category": le.category, "ts": le.ts} for le in global_lessons[-50:]
-        ]
+        data = [_safe_lesson(le.rule, le.category, le.ts) for le in global_lessons[-50:]]
     return web.json_response({"lessons": data})

@@ -33,7 +33,28 @@ def _load_selector():
 
 @pytest.fixture(scope="module")
 def selector():
-    return _load_selector()
+    """The selector module, with ``collect`` memoized for the module's lifetime.
+
+    ``collect`` rglobs and regex-scans every ``test_*.py`` under all three
+    testpath roots -- ~3s a call -- and this module calls it once per parametrized
+    guard over only three distinct answers. The memo key carries ``_is_windows()``
+    because the Windows filter is applied inside ``collect``:
+    ``test_posix_scope_is_unfiltered`` patches that seam between two
+    ``collect("backend")`` calls and must still see two different scopes.
+    """
+    module = _load_selector()
+    memo: dict[tuple[str, bool], list[str]] = {}
+    uncached = module.collect
+
+    def collect(surface: str) -> list[str]:
+        key = (surface, module._is_windows())
+        if key not in memo:
+            memo[key] = uncached(surface)
+        # A copy, so a caller that sorts or filters in place cannot poison the memo.
+        return list(memo[key])
+
+    module.collect = collect
+    return module
 
 
 def test_script_exists_and_is_executable() -> None:
@@ -237,6 +258,7 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
         "test_harness.py",
         "test_sandbox_argv.py",
         "test_sandbox_cc_mode.py",
+        "test_sandbox_hardlink_scan.py",
         "test_sandbox_nested_tier.py",
         "test_pid_lifecycle.py",
         "test_pid_sweep_helpers.py",

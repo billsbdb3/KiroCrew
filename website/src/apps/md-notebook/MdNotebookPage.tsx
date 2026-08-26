@@ -5,7 +5,8 @@
  * Search swaps the tree for flat ranked results; clearing restores the tree.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useIsMobile } from '../../hooks/useIsMobile'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import type { CSSProperties } from 'react'
 import {
@@ -32,16 +33,23 @@ import {
   DEFAULT_AUTO_SYNC_MINS,
   DEFAULT_SORT,
   DEFAULT_SYNC_SHORTCUT,
+  DOC_BODY_LINE_HEIGHT,
+  DOC_BODY_PX,
+  DOC_H1_PX,
+  DOC_HEADING_WEIGHTS,
   FONT_BODY,
   FONT_MONO,
+  HEADER_CONTROLS_GAP,
+  LEGACY_LS,
   LS,
-  MAX_AUTO_SYNC_MINS,
-  MIN_AUTO_SYNC_MINS,
+  MENU_SECTION_LABEL,
   PANEL_DEFAULT_WIDTH,
   PANEL_MAX_WIDTH,
   PANEL_MIN_WIDTH,
+  RAIL_TYPE,
   SAVE_DEBOUNCE_MS,
   SORTS,
+  TITLE_MIN_WIDTH,
   collapsedKey,
   pinnedKey,
 } from './constants'
@@ -55,14 +63,18 @@ import { ConfirmDialog } from './ConfirmDialog'
 import { InlineLink } from './bits'
 import { SettingsBar, SettingsPage } from './SettingsPage'
 import Clickable from '../../components/Clickable'
+import ReadingWidthToggle from '../../components/ReadingWidthToggle'
 import { NoteRow, flattenVisibleNotes, orderNotes, renderTree } from './NoteRow'
 import {
   FM_RE,
   agoBucket,
   buildTree,
+  clampAutoSyncMins,
+  clearPref,
   loadPref,
   matchesShortcut,
   neighborAfterDelete,
+  noteDirPath,
   savePref,
   shiftListItem,
   targetsSameNote,
@@ -103,6 +115,28 @@ const iconBtn: CSSProperties = {
   color: 'var(--muted)',
   cursor: 'pointer',
   flexShrink: 0,
+}
+
+/**
+ * Ref callback reporting an element's box on attach and on every resize.
+ *
+ * Used where a layout decision is arithmetic on real widths rather than a CSS
+ * expression, so it needs the numbers: `onMeasure` must be stable.
+ */
+function useMeasuredBox(onMeasure: (el: HTMLElement) => void) {
+  const observer = useRef<ResizeObserver | null>(null)
+  return useCallback(
+    (el: HTMLElement | null) => {
+      observer.current?.disconnect()
+      observer.current = null
+      if (!el) return
+      const measure = () => onMeasure(el)
+      measure()
+      observer.current = new ResizeObserver(measure)
+      observer.current.observe(el)
+    },
+    [onMeasure],
+  )
 }
 
 export default function MdNotebookPage() {
@@ -158,6 +192,18 @@ export default function MdNotebookPage() {
     loadPref<'folders' | 'list'>('mdnb-list-view', 'folders'),
   )
   const [panelOpen, setPanelOpen] = useState(() => loadPref<boolean>(LS.panelOpen, true))
+  const isMobile = useIsMobile()
+  // The panel is a fixed 260px `flexShrink: 0` column, so at 390px it left the
+  // editor 130px. `panelOpen` already exists but is a stored DESKTOP preference,
+  // so it arrives open on a phone. While narrow the panel is a drawer that starts
+  // closed and owns the pane when opened -- derived, never written back, or a
+  // phone visit would silently change what the desktop shows.
+  const [narrowPanelOpen, setNarrowPanelOpen] = useState(false)
+  // With no note open the pane has nothing to show but the list, and the empty
+  // state's copy points at the + button INSIDE the drawer -- so a closed drawer
+  // there instructs an action whose control is off-screen. Forced open until a
+  // note is picked, which is also when `openNote` closes it again.
+  const panelShown = isMobile ? (narrowPanelOpen || !activePath) : panelOpen
   const [panelW, setPanelW] = useState(() => {
     const w = loadPref<number>(LS.panelWidth, PANEL_DEFAULT_WIDTH)
     return w >= PANEL_MIN_WIDTH && w <= PANEL_MAX_WIDTH ? w : PANEL_DEFAULT_WIDTH
@@ -165,29 +211,209 @@ export default function MdNotebookPage() {
   const [activeVaultId, setActiveVaultId] = useState<string | null>(() =>
     loadPref<string | null>(LS.activeVault, null),
   )
-  const [autoSync, setAutoSync] = useState(() => loadPref<boolean>(LS.autoSync, false))
-  const [autoSyncMins, setAutoSyncMins] = useState(() =>
-    loadPref<number>(LS.autoSyncMins, DEFAULT_AUTO_SYNC_MINS),
-  )
+  // Server-owned, so they start at the defaults and are replaced by the seed
+  // effect below once `GET /settings` answers. Deliberately NOT read from
+  // localStorage: the backend runs its own sync loop against these values, and a
+  // per-browser copy would disagree with what it is actually doing.
+  const [autoSync, setAutoSync] = useState(false)
+  const [autoSyncMins, setAutoSyncMins] = useState(DEFAULT_AUTO_SYNC_MINS)
+  // A failed settings WRITE, surfaced next to the controls in Settings. The
+  // editor's own `error` banner does not render while Settings is open, so
+  // reusing it would drop the report of a click that did not take effect.
+  const [settingsWriteError, setSettingsWriteError] = useState<string | null>(null)
   const [autoCommit, setAutoCommit] = useState(() =>
     loadPref<boolean>(LS.autoCommit, DEFAULT_AUTO_COMMIT),
   )
   const [syncShortcut, setSyncShortcut] = useState<Shortcut>(() =>
     loadPref<Shortcut>(LS.syncShortcut, DEFAULT_SYNC_SHORTCUT),
   )
+  // Lifts the reading-column cap on the note body. Per device, not per vault or
+  // per note: it answers "how wide is this display", which is a property of the
+  // screen the user is reading on.
+  const [fullWidth, setFullWidth] = useState(() => loadPref<boolean>(LS.fullWidth, false))
   // True while Settings is capturing a shortcut, so the keys being recorded do
   // not also fire a sync.
   const recordingShortcutRef = useRef(false)
 
-  const setAutoSyncPref = useCallback((on: boolean) => {
-    setAutoSync(on)
-    savePref(LS.autoSync, on)
+  /**
+   * Persist part of the sync settings, reporting a rejection instead of dropping
+   * it. Returns whether the server took the value, so a caller can roll its
+   * optimistic local state back on failure. On success it invalidates the
+   * settings query so the cache refetches the server's authoritative state.
+   */
+  const qc = useQueryClient()
+  // Live mirrors of the two editable settings so a write can snapshot the FULL
+  // desired state at the moment it is sent, not the value captured when a
+  // debounce timer was armed — otherwise a delayed autoSyncMins write would
+  // carry a stale autoSync and could revert a toggle the user made in between.
+  const autoSyncRef = useRef(autoSync)
+  const autoSyncMinsRef = useRef(autoSyncMins)
+  useEffect(() => {
+    autoSyncRef.current = autoSync
+  }, [autoSync])
+  useEffect(() => {
+    autoSyncMinsRef.current = autoSyncMins
+  }, [autoSyncMins])
+  // Single-flight serialization: each write chains onto the previous so only one
+  // PUT is ever in flight from this tab and they reach the server in the order
+  // the user made the gestures. That, plus sending the full desired state, is
+  // what stops a single tab racing itself; ordering ACROSS tabs is the server's
+  // job (it applies writes in arrival order under its settings lock). The client
+  // supplies no ordering token — a per-tab counter cannot form a global order.
+  const writeChainRef = useRef<Promise<unknown>>(Promise.resolve())
+  // How many settings writes this tab has in flight or debounced. The settings
+  // poll reconciles the editable controls to server truth only while this is 0
+  // (see the seed effect), so a refetch never yanks a value the user is mid-way
+  // through changing.
+  const writePendingRef = useRef(0)
+  // The server's authoritative interval (updated on every settings response), so
+  // a rejected interval write rolls the field back to server truth.
+  const serverMinsRef = useRef(autoSyncMins)
+  const putSyncSettings = useCallback(
+    async (patch: { autoSync?: boolean; autoSyncMins?: number }): Promise<boolean> => {
+      setSettingsWriteError(null)
+      // Snapshot the FULL desired state from the live refs — a winning write must
+      // carry both fields so it never drops the one it did not change.
+      const bodyToSend = {
+        autoSync: patch.autoSync ?? autoSyncRef.current,
+        autoSyncMins: patch.autoSyncMins ?? autoSyncMinsRef.current,
+      }
+      writePendingRef.current += 1
+      const run = writeChainRef.current.then(() => notesApi.saveSettings(bodyToSend))
+      // Keep the chain alive on failure so a later write still runs.
+      writeChainRef.current = run.then(
+        () => undefined,
+        () => undefined,
+      )
+      try {
+        await run
+        // Converge the fresh-forever settings cache to the server's ACTUAL state
+        // by refetching, so every later read agrees with what the backend stored.
+        void qc.invalidateQueries({ queryKey: ['md-notebook', 'settings'] })
+        return true
+      } catch (e) {
+        setSettingsWriteError(
+          i18nT('apps.mdNotebook.settings.prefsSaveFailed', {
+            message: e instanceof Error ? e.message : String(e),
+          }),
+        )
+        return false
+      } finally {
+        writePendingRef.current -= 1
+      }
+    },
+    [qc],
+  )
+
+  const setAutoSyncPref = useCallback(
+    (on: boolean) => {
+      // Roll the toggle back if the write is rejected: otherwise a failed enable
+      // leaves the control (and the foreground timer it gates) showing ON while
+      // the server kept it OFF.
+      const prev = autoSync
+      setAutoSync(on)
+      // A switch produces one value per gesture, so it writes straight through.
+      void putSyncSettings({ autoSync: on }).then(ok => {
+        if (!ok) setAutoSync(prev)
+      })
+    },
+    [autoSync, putSyncSettings],
+  )
+  // The interval's number input fires on EVERY keystroke, so typing "45" would
+  // PUT 4 and then 45 — and 4 is a real cadence the backend would start syncing
+  // on. Debounced with the same timer-in-a-ref shape the note save uses, rather
+  // than a new dependency.
+  const minsTimer = useRef<number | null>(null)
+  const pendingMins = useRef<number | null>(null)
+  const setAutoSyncMinsPref = useCallback(
+    (n: number) => {
+      const v = clampAutoSyncMins(n)
+      setAutoSyncMins(v)
+      pendingMins.current = v
+      if (minsTimer.current !== null) window.clearTimeout(minsTimer.current)
+      minsTimer.current = window.setTimeout(() => {
+        minsTimer.current = null
+        pendingMins.current = null
+        // Roll the field back to the server's value if the write is rejected —
+        // otherwise a typed interval the server refused stays displayed as if it
+        // had been saved (the toggle already rolls back the same way).
+        void putSyncSettings({ autoSyncMins: v }).then(ok => {
+          if (!ok) setAutoSyncMins(serverMinsRef.current)
+        })
+      }, SAVE_DEBOUNCE_MS)
+    },
+    [putSyncSettings],
+  )
+  // Leaving the app inside the debounce window would silently discard a value the
+  // user watched land in the field, so a pending write is sent rather than
+  // cancelled. Routed through the same write chain (after any in-flight write,
+  // never concurrent with it) and carrying the FULL desired state, so it obeys
+  // the same single-flight ordering as every other write. Fire-and-forget: there
+  // is no section left to report a failure in.
+  useEffect(
+    () => () => {
+      if (minsTimer.current === null) return
+      window.clearTimeout(minsTimer.current)
+      const v = pendingMins.current
+      if (v === null) return
+      const body = { autoSync: autoSyncRef.current, autoSyncMins: v }
+      writeChainRef.current = writeChainRef.current
+        .then(() => notesApi.saveSettings(body))
+        .then(
+          () => undefined,
+          () => undefined,
+        )
+    },
+    [],
+  )
+  /** Lift or restore the reading-column cap, remembered for this device. */
+  const toggleFullWidth = useCallback(() => {
+    setFullWidth(on => {
+      savePref(LS.fullWidth, !on)
+      return !on
+    })
   }, [])
-  const setAutoSyncMinsPref = useCallback((n: number) => {
-    const v = Math.min(MAX_AUTO_SYNC_MINS, Math.max(MIN_AUTO_SYNC_MINS, Math.round(n) || DEFAULT_AUTO_SYNC_MINS))
-    setAutoSyncMins(v)
-    savePref(LS.autoSyncMins, v)
-  }, [])
+
+  // The rendered body caps its width directly; the raw textarea cannot cap its
+  // own content box, so it centres its text with side padding instead (see the
+  // override at that style block).
+  const columnMaxWidth = fullWidth ? undefined : `${COLUMN_MAX_WIDTH}px`
+
+  // The title band shares its row with the floating header controls, so a long
+  // first line could run beneath them. Both boxes are measured rather than
+  // guessed: the cluster's width is content-driven (the sync label varies by
+  // locale and state) and the band's width is the pane's, which the user drags.
+  const [headerControls, setHeaderControls] = useState({ width: 0, height: 0 })
+  const [headerBandWidth, setHeaderBandWidth] = useState(0)
+  const onMeasureControls = useCallback(
+    (el: HTMLElement) => setHeaderControls({ width: el.offsetWidth, height: el.offsetHeight }),
+    [],
+  )
+  const onMeasureBand = useCallback((el: HTMLElement) => setHeaderBandWidth(el.offsetWidth), [])
+  const headerControlsRef = useMeasuredBox(onMeasureControls)
+  const headerBandRef = useMeasuredBox(onMeasureBand)
+
+  // Clearance is arithmetic on those two widths, not a CSS expression, so the
+  // narrow case is readable in a unit test. `titleClearance` is the extra right
+  // padding the title reserves beyond the regular pad; `stackTitle` says the
+  // pane is too narrow to seat both on one row, so the title drops below the
+  // cluster instead of being squeezed into a column of single letters (the
+  // title wraps on any character, so a squeeze degrades far worse than a
+  // stack).
+  const { titleClearance, stackTitle } = useMemo(() => {
+    if (!headerBandWidth || !headerControls.width) return { titleClearance: 0, stackTitle: false }
+    const blockWidth = fullWidth ? headerBandWidth : Math.min(headerBandWidth, COLUMN_MAX_WIDTH)
+    // Both edges in band coordinates: the block is centred, the cluster is
+    // anchored to the band's right edge.
+    const titleRight = (headerBandWidth + blockWidth) / 2 - COLUMN_PAD_X
+    const clusterLeft = headerBandWidth - COLUMN_PAD_X - headerControls.width
+    const clearance = Math.max(0, titleRight + HEADER_CONTROLS_GAP - clusterLeft)
+    const titleWidth = blockWidth - COLUMN_PAD_X * 2 - clearance
+    return titleWidth < TITLE_MIN_WIDTH
+      ? { titleClearance: 0, stackTitle: true }
+      : { titleClearance: clearance, stackTitle: false }
+  }, [fullWidth, headerBandWidth, headerControls.width])
+
   const setSyncShortcutPref = useCallback((sc: Shortcut) => {
     setSyncShortcut(sc)
     savePref(LS.syncShortcut, sc)
@@ -217,7 +443,15 @@ export default function MdNotebookPage() {
       )
     }
   }, [])
-  const [lastSync, setLastSync] = useState<number | null>(null)
+  /**
+   * Last conflict-free sync per vault id, as the server reports it.
+   *
+   * Keyed by vault rather than held as one value so switching vaults shows each
+   * one's own time instead of the last one looked at, and sourced from the server
+   * so a sync the BACKEND performed on its own timer still ages the label — a
+   * page-written timestamp could only ever record syncs this tab ran itself.
+   */
+  const [lastSyncByVault, setLastSyncByVault] = useState<Record<string, number>>({})
 
   const saveTimer = useRef<number | null>(null)
   const contentRef = useRef('')
@@ -286,6 +520,68 @@ export default function MdNotebookPage() {
   // this is false, so a delete cannot be offered before the backend has said it
   // trashes rather than unlinks.
   const canTrash = (health?.features ?? []).includes('trash')
+
+  // ---- sync settings ----------------------------------------------------
+  // React Query for the read, like every other server read here, so it is cached
+  // and shares the app's query-key namespace. The controls below then work off
+  // local state seeded from it: a refetch must not yank a value out from under a
+  // keystroke mid-edit.
+  const { data: settingsData, error: settingsLoadError } = useQuery({
+    queryKey: ['md-notebook', 'settings'],
+    queryFn: () => notesApi.settings(),
+    retry: false,
+    // Poll so a sync the BACKEND ran (this page never initiates auto-sync) ages
+    // the "Synced N ago" label and surfaces the server-owned lastSync without an
+    // interaction. Only server-owned fields (lastSync, seq) are re-applied on a
+    // refetch — the editable controls are seeded once (below), so the poll never
+    // yanks the toggle or interval field mid-edit.
+    refetchInterval: 60_000,
+  })
+  /**
+   * A failed READ matters as much as a failed write: it leaves the page showing
+   * the defaults, which is a different setting from the user's own, so the switch
+   * would claim auto sync is off while the backend keeps pushing. Write errors win
+   * because they report the more recent action.
+   */
+  const settingsError =
+    settingsWriteError ?? (settingsLoadError instanceof Error ? settingsLoadError.message : null)
+
+  const legacyCleared = useRef(false)
+  useEffect(() => {
+    const s = settingsData?.settings
+    // Guard the shape, do not just truthiness-check `settingsData`: a malformed or
+    // older backend response without `settings` must degrade to the defaults the
+    // controls already hold, not crash the whole Notes page reading `s.autoSync`.
+    if (!s) return
+    // `lastSync` is SERVER-OWNED and moves as the background loop syncs, so merge
+    // it on EVERY response. Merge rather than replace so a just-set per-vault
+    // stamp from `runSync` is not dropped by a slightly older read.
+    setLastSyncByVault(prev => ({ ...prev, ...(s.lastSync ?? {}) }))
+    // The server's authoritative interval, tracked on every response, so a
+    // REJECTED interval write can roll the field back to server truth.
+    serverMinsRef.current = clampAutoSyncMins(s.autoSyncMins)
+    // Clear the dead localStorage prefs exactly once. `autoSync`/`autoSyncMins`
+    // used to live here; they are server-owned now and the old values are NEVER
+    // read for migration — a stale `mdnb-auto-sync=true` must not re-authorize
+    // unattended push for a user who had turned it off.
+    if (!legacyCleared.current) {
+      legacyCleared.current = true
+      clearPref(LEGACY_LS.autoSync)
+      clearPref(LEGACY_LS.autoSyncMins)
+    }
+    // Reconcile the EDITABLE controls to the server's value on every response —
+    // so another tab's enable/disable/interval change, and the refetch after our
+    // own write, both reach this tab — but ONLY while this tab has no write in
+    // flight and no interval keystroke pending. Skipping then is what keeps the
+    // poll from yanking a value the user is mid-way through changing; the write
+    // already in flight (or about to fire) carries the newer intent.
+    if (writePendingRef.current > 0 || minsTimer.current !== null) return
+    setAutoSync(s.autoSync)
+    // CLAMPED, not only on write: a stored 0 — written before the clamp existed,
+    // or by an older backend — must not surface as a real cadence. 0 means "no
+    // interval expressed" and lands on the default.
+    setAutoSyncMins(clampAutoSyncMins(s.autoSyncMins))
+  }, [settingsData])
 
   const loadVaults = useCallback(async () => {
     try {
@@ -426,6 +722,8 @@ export default function MdNotebookPage() {
       if (dirtyRef.current) return
       pathRef.current = path
       setActivePath(path)
+      // Close the drawer on pick, or the full-width list is a one-way door.
+      if (isMobile) setNarrowPanelOpen(false)
       savePref(LS.openNote, path)
       setContent(doc.content)
       contentRef.current = doc.content
@@ -439,14 +737,15 @@ export default function MdNotebookPage() {
       if (openSeqRef.current !== seq) return
       setError(e instanceof Error ? e.message : String(e))
     }
-  }, [flushSave])
+  }, [flushSave, isMobile])
 
   // Load the note list whenever the vault changes, then restore the open note.
   useEffect(() => {
     vaultRef.current = activeVaultId
     if (!activeVaultId) return
     savePref(LS.activeVault, activeVaultId)
-    setLastSync(loadPref<number | null>(`mdnb-last-sync-${activeVaultId}`, null))
+    // No last-sync read here: it is server state, held per vault in
+    // `lastSyncByVault`, so switching vaults needs no local lookup.
     // Pins are per-vault, so they are re-read here rather than carried over —
     // a path pinned in one vault means nothing in another. Collapsed folders
     // are per-vault for the same reason: the trees are unrelated.
@@ -853,6 +1152,11 @@ export default function MdNotebookPage() {
     [flushSave, loadNotes, openNote, repointPin, visibleNotePaths],
   )
 
+  // Deliberately does NOT catch, same reasoning as `savePat` below: it is
+  // only ever invoked from SettingsPage's Remove-confirm button, which
+  // catches this rejection itself and reports it inline, next to the button
+  // that produced it — the shared `error` banner below only renders in the
+  // main-editor branch and is invisible while Settings is open.
   const forgetVault = useCallback(
     async (id: string) => {
       // Forgetting the ACTIVE vault clears the editor below, so persist first —
@@ -863,24 +1167,26 @@ export default function MdNotebookPage() {
         await flushSave()
         if (dirtyRef.current) return
       }
-      try {
-        await notesApi.forgetVault(id)
-        if (id === vaultRef.current) {
-          pathRef.current = null
-          setActivePath(null)
-          setContent('')
-          contentRef.current = ''
-          setNotes([])
-          restored.current = false
-        }
-        await loadVaults()
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e))
+      await notesApi.forgetVault(id)
+      if (id === vaultRef.current) {
+        pathRef.current = null
+        setActivePath(null)
+        setContent('')
+        contentRef.current = ''
+        setNotes([])
+        restored.current = false
       }
+      await loadVaults()
     },
     [loadVaults, flushSave],
   )
 
+  // Deliberately does NOT catch, unlike its siblings above (removeNote etc.)
+  // that swallow into the shared `error` banner: that banner only renders in
+  // the main-editor branch, invisible while Settings is open, so a failure
+  // here needs to surface right next to the button the user clicked instead.
+  // SettingsPage's Save/Clear handlers catch this rejection themselves and
+  // report it inline.
   const savePat = useCallback(
     async (value: string) => {
       const r = await notesApi.setPat(value)
@@ -913,14 +1219,21 @@ export default function MdNotebookPage() {
       // while the user's unsaved edit sits unreconciled in the editor — backing
       // up content they did not choose. `finally` still clears the spinner.
       if (dirtyRef.current) return
-      const { result } = await notesApi.sync(vaultRef.current)
+      // Captured, not re-read: the reply's `lastSync` belongs to the vault this
+      // run synced, and a vault switch during the round trip would otherwise
+      // stamp the new vault's label with the old vault's time.
+      const vault = vaultRef.current
+      if (!vault) return
+      const { result, lastSync: syncedAt } = await notesApi.sync(vault)
       // Only a conflict-free run counts as synced — with conflicts nothing was
-      // pushed, so reporting success would mislead.
-      if (!result.conflicts.length && vaultRef.current) {
-        const now = Date.now()
-        setLastSync(now)
-        savePref(`mdnb-last-sync-${vaultRef.current}`, now)
-      } else if (result.conflicts.length) {
+      // pushed, so reporting success would mislead. The server says so too by
+      // sending a null `lastSync`; the check is kept here so the label cannot
+      // claim a sync even if a backend reports both.
+      if (!result.conflicts.length) {
+        if (typeof syncedAt === 'number') {
+          setLastSyncByVault(prev => ({ ...prev, [vault]: syncedAt }))
+        }
+      } else {
         setError(
           i18nT('apps.mdNotebook.banner.syncConflict', {
             paths: result.conflicts.map(c => c.path).join(', '),
@@ -953,12 +1266,14 @@ export default function MdNotebookPage() {
     return () => window.removeEventListener('keydown', onKey, true)
   }, [syncShortcut])
 
-  // Auto sync on a timer: the same bidirectional operation as the button.
-  useEffect(() => {
-    if (!autoSync || !activeVaultId) return
-    const id = window.setInterval(() => void runSyncRef.current(), autoSyncMins * 60_000)
-    return () => window.clearInterval(id)
-  }, [autoSync, autoSyncMins, activeVaultId])
+  // No foreground auto-sync timer. Auto sync runs entirely in the app BACKEND
+  // (syncer.py), which re-reads settings.json every few seconds and pushes every
+  // writable vault on the configured interval — so it keeps working with the tab
+  // closed, and it stops within one tick when the user turns auto sync off in ANY
+  // tab. A page-scoped timer here would be redundant with it and, because this
+  // page's autoSync state is seeded once, would keep pushing this vault after a
+  // revocation made in another tab. The manual Sync button/shortcut below is the
+  // only page-initiated sync.
 
   // Periodic autosave: commit pending edits to LOCAL git history, never push.
   // Separate from auto sync on purpose — a commit stays on this machine, so it is
@@ -1103,11 +1418,12 @@ export default function MdNotebookPage() {
   )
 
   const togglePanel = useCallback(() => {
+    if (isMobile) { setNarrowPanelOpen(v => !v); return }
     setPanelOpen(v => {
       savePref(LS.panelOpen, !v)
       return !v
     })
-  }, [])
+  }, [isMobile])
 
   const startResize = useCallback(
     (e: React.PointerEvent) => {
@@ -1165,11 +1481,16 @@ export default function MdNotebookPage() {
   }
 
   const activeVault = vaults.find(v => v.id === activeVaultId) ?? vaults[0]
+  // Directory of the open note, which is what resolves its relative image
+  // sources. Derived here rather than in `Preview` because the vault's local
+  // path lives in this page's state, not in the note body.
+  const noteDir = noteDirPath(activeVault, activePath)
   // `pending` means "differs from the last commit", which is only actionable when
   // there is a remote the note has not reached yet. On a local-only vault it has
   // no destination, clears itself on the next autosave, and reads as "not saved"
   // — so the row shows nothing.
   const showSyncBadge = !activeVault?.localOnly
+  const lastSync = activeVaultId ? (lastSyncByVault[activeVaultId] ?? null) : null
   const ago = lastSync ? agoBucket(lastSync) : null
   // A local-only vault has no remote, so the button commits to local git history
   // and nothing else — label it for what it does, and drop the "Synced N ago"
@@ -1245,7 +1566,7 @@ export default function MdNotebookPage() {
         className="pi-morph mdnb-collapse"
         onClick={togglePanel}
         aria-label={
-          panelOpen
+          panelShown
             ? i18nT('apps.mdNotebook.panel.hide')
             : i18nT('apps.mdNotebook.panel.show')
         }
@@ -1274,13 +1595,13 @@ export default function MdNotebookPage() {
           transition: 'color .15s, background .15s',
         }}
       >
-        {panelOpen ? <PanelLeftLight size={16} /> : <PanelLeftSolid size={16} />}
+        {panelShown ? <PanelLeftLight size={16} /> : <PanelLeftSolid size={16} />}
       </button>
 
-      {panelOpen && (
+      {panelShown && (
         <div
           style={{
-            width: `${panelW}px`,
+            width: isMobile ? '100%' : `${panelW}px`,
             flexShrink: 0,
             position: 'relative',
             display: 'flex',
@@ -1334,7 +1655,7 @@ export default function MdNotebookPage() {
             >
               <span
                 style={{
-                  fontSize: '14px',
+                  ...RAIL_TYPE.panelTitle,
                   fontWeight: 500,
                   color: 'var(--muted)',
                   letterSpacing: '.04em',
@@ -1409,7 +1730,7 @@ export default function MdNotebookPage() {
                       padding: '5px 8px',
                       borderRadius: '6px',
                       cursor: 'pointer',
-                      fontSize: '13px',
+                      ...RAIL_TYPE.row,
                       color: v.id === activeVaultId ? 'var(--text)' : 'var(--muted)',
                     }}
                   >
@@ -1439,7 +1760,7 @@ export default function MdNotebookPage() {
                     padding: '5px 8px',
                     borderRadius: '6px',
                     cursor: 'pointer',
-                    fontSize: '13px',
+                    ...RAIL_TYPE.row,
                     color: 'var(--muted)',
                   }}
                 >
@@ -1474,7 +1795,7 @@ export default function MdNotebookPage() {
                 border: '1px solid var(--border)',
                 borderRadius: '8px',
                 padding: '0 10px',
-                fontSize: '12px',
+                ...RAIL_TYPE.row,
                 color: 'var(--text)',
                 fontFamily: FONT_BODY,
               }}
@@ -1510,7 +1831,7 @@ export default function MdNotebookPage() {
                 >
                   <div
                     style={{
-                      fontSize: '10px',
+                      ...MENU_SECTION_LABEL,
                       textTransform: 'uppercase',
                       letterSpacing: '.04em',
                       color: 'var(--muted)',
@@ -1536,7 +1857,7 @@ export default function MdNotebookPage() {
                         padding: '5px 8px',
                         borderRadius: '6px',
                         cursor: 'pointer',
-                        fontSize: '12px',
+                        ...RAIL_TYPE.row,
                         color: view === v ? 'var(--text)' : 'var(--muted)',
                       }}
                     >
@@ -1549,7 +1870,7 @@ export default function MdNotebookPage() {
                   <div style={{ height: '1px', background: 'var(--border)', margin: '4px 0' }} />
                   <div
                     style={{
-                      fontSize: '10px',
+                      ...MENU_SECTION_LABEL,
                       textTransform: 'uppercase',
                       letterSpacing: '.04em',
                       color: 'var(--muted)',
@@ -1575,7 +1896,7 @@ export default function MdNotebookPage() {
                         padding: '5px 8px',
                         borderRadius: '6px',
                         cursor: 'pointer',
-                        fontSize: '12px',
+                        ...RAIL_TYPE.row,
                         color: sortKey === key ? 'var(--text)' : 'var(--muted)',
                       }}
                     >
@@ -1621,7 +1942,7 @@ export default function MdNotebookPage() {
                     />
                   ))
                 : (
-                    <div style={{ padding: '10px', fontSize: '11px', color: 'var(--muted)' }}>
+                    <div style={{ padding: '10px', ...RAIL_TYPE.secondary, color: 'var(--muted)' }}>
                       {i18nT('apps.mdNotebook.panel.noMatches')}
                     </div>
                   )
@@ -1675,6 +1996,7 @@ export default function MdNotebookPage() {
           autoSync={autoSync}
           autoSyncMins={autoSyncMins}
           autoCommit={autoCommit}
+          syncPrefsError={settingsError}
           shortcut={syncShortcut}
           onClose={() => setSettingsOpen(false)}
           onSwitchVault={id => {
@@ -1698,8 +2020,9 @@ export default function MdNotebookPage() {
         />
       ) : (
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-        <div style={{ position: 'relative' }}>
+        <div ref={headerBandRef} style={{ position: 'relative' }}>
           <div
+            ref={headerControlsRef}
             style={{
               position: 'absolute',
               top: '24px',
@@ -1708,6 +2031,18 @@ export default function MdNotebookPage() {
               display: 'flex',
               gap: '4px',
               alignItems: 'center',
+              // The cluster's width is content-driven (the sync label varies by
+              // locale and state), so on a pane too narrow to seat it in one
+              // row it would poke past the left edge and `overflow-x-hidden`
+              // would clip the view controls. Cap it to the measured band and
+              // wrap instead: every control stays reachable, and the wrapped
+              // height flows into the stacking arithmetic above, which already
+              // drops the title below whatever the cluster occupies.
+              maxWidth: headerBandWidth
+                ? `${Math.max(0, headerBandWidth - COLUMN_PAD_X * 2)}px`
+                : undefined,
+              flexWrap: 'wrap',
+              justifyContent: 'flex-end',
             }}
           >
             {/* Rendered / raw switch */}
@@ -1749,6 +2084,16 @@ export default function MdNotebookPage() {
                 </button>
               ))}
             </div>
+            {/* Reading column / full width. A sibling of the rendered-raw switch
+                because both answer "how do I want to read this note". The
+                control itself is `ReadingWidthToggle`, the component an artifact
+                already uses for this exact choice, so the two views cannot drift
+                apart on label, pressed state or accent. Only the stored
+                preference is this view's own (`LS.fullWidth`): a note and an
+                artifact are different reading surfaces, often open at the same
+                time in two panes, and one shared key would silently reflow the
+                other. */}
+            <ReadingWidthToggle value={fullWidth ? 'full' : 'md'} onToggle={toggleFullWidth} />
             <button
               type="button"
               onClick={() => void runSync()}
@@ -1803,9 +2148,13 @@ export default function MdNotebookPage() {
             style={{
               margin: '0 auto',
               width: '100%',
-              maxWidth: `${COLUMN_MAX_WIDTH}px`,
+              maxWidth: columnMaxWidth,
               boxSizing: 'border-box',
-              padding: `24px ${COLUMN_PAD_X}px 14px`,
+              // Stacked: the title clears the cluster from below, so the top
+              // pad carries the cluster's own height and the row is free.
+              padding: stackTitle
+                ? `${24 + headerControls.height + 8}px ${COLUMN_PAD_X}px 14px`
+                : `24px ${COLUMN_PAD_X + titleClearance}px 14px ${COLUMN_PAD_X}px`,
             }}
           >
             {activePath ? (
@@ -1815,7 +2164,16 @@ export default function MdNotebookPage() {
                 mb="0"
               />
             ) : (
-              <div style={{ fontSize: '23px', fontWeight: 700, color: 'var(--muted)' }}>
+              <div
+                style={{
+                  // The placeholder alternates with `InlineTitle` in this exact
+                  // slot, so it takes the same derived size: a literal here is
+                  // the same drift, one branch away.
+                  fontSize: `${DOC_H1_PX}px`,
+                  fontWeight: DOC_HEADING_WEIGHTS[0],
+                  color: 'var(--muted)',
+                }}
+              >
                 {i18nT('apps.mdNotebook.title')}
               </div>
             )}
@@ -1985,8 +2343,13 @@ export default function MdNotebookPage() {
                 paddingRight: `max(${COLUMN_PAD_X}px, calc((100% - ${
                   COLUMN_MAX_WIDTH - COLUMN_PAD_X * 2
                 }px) / 2))`,
-                fontSize: '13px',
-                lineHeight: 1.55,
+                // Full width drops the centring measure. Declared after the two
+                // above so it overrides them, leaving their expression untouched.
+                ...(fullWidth
+                  ? { paddingLeft: `${COLUMN_PAD_X}px`, paddingRight: `${COLUMN_PAD_X}px` }
+                  : {}),
+                fontSize: `${DOC_BODY_PX}px`,
+                lineHeight: DOC_BODY_LINE_HEIGHT,
                 fontFamily: FONT_MONO,
               }}
             />
@@ -1997,13 +2360,14 @@ export default function MdNotebookPage() {
               style={{
                 margin: '0 auto',
                 width: '100%',
-                maxWidth: `${COLUMN_MAX_WIDTH}px`,
+                maxWidth: columnMaxWidth,
                 boxSizing: 'border-box',
                 padding: `14px ${COLUMN_PAD_X}px 32px`,
               }}
             >
               <Preview
                 content={content}
+                noteDir={noteDir}
                 onToggleCheckbox={toggleCheckbox}
                 editRange={editBlock}
                 onStartEdit={startBlockEdit}

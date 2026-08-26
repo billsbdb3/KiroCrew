@@ -786,6 +786,11 @@ class TestRegistryAndProvenanceBoundary:
         monkeypatch.setattr(registry, "_load_external_registries", _no_external_registries)
         monkeypatch.setattr(registry, "list_installed_apps", lambda: [])
         monkeypatch.setattr(registry, "_resolve_manifest", _identity_manifest)
+        # Isolate from the official catalog: list_registry now materialises its
+        # git entries as installable rows via a fresh network fetch. Without this
+        # the listing picks up whatever the live catalog serves, which is neither
+        # deterministic nor what this test is about.
+        monkeypatch.setattr(registry.official_catalog, "fetch_inventory_entries", lambda: [])
         monkeypatch.setattr(execution, "third_party_execution_allowed", lambda: False)
 
         async def _unexpected_spawn(*args, **kwargs):

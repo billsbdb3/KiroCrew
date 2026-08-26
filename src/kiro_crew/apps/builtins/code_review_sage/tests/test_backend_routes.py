@@ -23,6 +23,7 @@ import pytest
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew.apps.builtins.code_review_sage.tests.fixtures import SYMLINKS_OK
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
 _ROUTES = _APP_ROOT / "backend" / "routes.py"
@@ -36,6 +37,15 @@ from sage_lib import report as R  # noqa: E402
 from sage_lib import review_driver as _rd  # noqa: E402
 from sage_lib import review_pool as _rp  # noqa: E402
 from sage_lib.review_driver import _all_delivered  # noqa: E402
+
+
+async def _noop_save() -> None:
+    """Stand-in for ``routes._save_runs``, which is a coroutine.
+
+    The registry write is offloaded to a worker thread because its owner-only
+    lockdown spawns ``icacls`` on Windows, so a plain ``lambda: None`` stub is
+    not awaitable and the patched call site would raise instead of no-op.
+    """
 
 
 def _load_routes_module():
@@ -63,7 +73,7 @@ class TestRunsPersistence(unittest.TestCase):
 
     def test_save_then_load_roundtrip(self):
         self.mod._RUNS = [{"run_id": "a1", "status": "done", "changes": ["CR-1"]}]
-        self.mod._save_runs()
+        asyncio.run(self.mod._save_runs())
         self.assertTrue(self.mod._runs_file().is_file())
         self.mod._RUNS = []  # simulate a fresh process
         self.mod._load_runs()
@@ -72,7 +82,7 @@ class TestRunsPersistence(unittest.TestCase):
 
     def test_orphaned_running_becomes_interrupted_on_load(self):
         self.mod._RUNS = [{"run_id": "b2", "status": "running", "changes": ["CR-9"]}]
-        self.mod._save_runs()
+        asyncio.run(self.mod._save_runs())
         self.mod._RUNS = []
         self.mod._load_runs()  # simulates a gateway restart
         self.assertEqual(self.mod._RUNS[0]["status"], "interrupted")
@@ -86,8 +96,83 @@ class TestRunsPersistence(unittest.TestCase):
     )
     def test_runs_file_is_0600(self):
         self.mod._RUNS = [{"run_id": "c3", "status": "done"}]
-        self.mod._save_runs()
+        asyncio.run(self.mod._save_runs())
         self.assertEqual(oct(self.mod._runs_file().stat().st_mode)[-3:], "600")
+
+    def test_a_planted_tmp_symlink_is_not_followed(self):
+        """The review worker writes into this tree and is prompt-injectable, so it
+        must not be able to steer the registry write at an arbitrary file.
+
+        A predictable ``runs.json.tmp`` was guessable: planting a symlink there
+        made the gateway's own ``touch`` / lockdown / write land on the target,
+        permission-changing and overwriting a user-owned file outside the sandbox.
+        The randomly-named O_EXCL temp cannot open a path that already exists.
+        """
+        outsider = Path(self.tmp) / "precious.txt"
+        outsider.write_text("do not touch", encoding="utf-8")
+        runs = self.mod._runs_file()
+        runs.parent.mkdir(parents=True, exist_ok=True)
+        planted = runs.with_name(runs.name + ".tmp")
+        try:
+            os.symlink(outsider, planted)
+        except (OSError, NotImplementedError) as exc:  # pragma: no cover
+            self.skipTest(f"symlink creation unavailable on this host: {exc}")
+
+        self.mod._RUNS = [{"run_id": "d4", "status": "done"}]
+        asyncio.run(self.mod._save_runs())
+
+        self.assertEqual(outsider.read_text(encoding="utf-8"), "do not touch",
+                         "the planted symlink was followed and its target rewritten")
+        self.assertIn("d4", runs.read_text(encoding="utf-8"))
+
+    def test_the_predictable_tmp_name_is_never_used(self):
+        """Symlink-free twin of the test above, so the invariant is also covered on
+        Windows -- where creating a symlink needs a privilege CI does not grant, yet
+        which is the platform this whole change targets.
+
+        Anything the worker can pre-place at the guessable path must survive: if the
+        write still used ``<name>.tmp`` this file would be silently clobbered.
+        """
+        runs = self.mod._runs_file()
+        runs.parent.mkdir(parents=True, exist_ok=True)
+        squatter = runs.with_name(runs.name + ".tmp")
+        squatter.write_text("planted", encoding="utf-8")
+
+        self.mod._RUNS = [{"run_id": "e5", "status": "done"}]
+        asyncio.run(self.mod._save_runs())
+
+        self.assertEqual(squatter.read_text(encoding="utf-8"), "planted",
+                         "the write still targets the predictable <name>.tmp path")
+        self.assertIn("e5", runs.read_text(encoding="utf-8"))
+
+    def test_the_lockdown_never_runs_on_the_event_loop(self):
+        """The owner-only lockdown spawns ``icacls`` on Windows, so persisting the
+        registry must not block the single gateway loop -- a freeze there stalls
+        every chat turn and the liveness heartbeat, not just this write.
+
+        Asserted structurally rather than by timing, so it holds regardless of how
+        fast the syscall happens to be on this host. The thread is RECORDED and
+        compared afterwards rather than asserted inside the patch: ``_save_runs``
+        deliberately swallows every exception, so an ``AssertionError`` raised in
+        there would be logged and the test would pass on a real regression.
+        """
+        seen: dict[str, int] = {}
+
+        def _record_thread(payload: str) -> None:
+            seen["write"] = threading.get_ident()
+
+        async def _drive() -> None:
+            seen["loop"] = threading.get_ident()
+            with unittest.mock.patch.object(self.mod, "_write_runs", _record_thread):
+                await self.mod._save_runs()
+
+        self.mod._RUNS = [{"run_id": "d4", "status": "done"}]
+        asyncio.run(_drive())
+        self.assertIn("write", seen, "_write_runs was never reached")
+        self.assertNotEqual(
+            seen["write"], seen["loop"],
+            "_write_runs ran on the event-loop thread; the icacls spawn inside it "
+            "would freeze the gateway")
 
 
 class TestRecordReviewedDelivery(unittest.TestCase):
@@ -675,6 +760,7 @@ class TestAdoptionRefusesAPlantedLink:
     link across, and must not leave one behind to retry.
     """
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_symlink_is_refused_and_removed(self, tmp_path):
 
         store.ensure_layout(tmp_path)
@@ -732,7 +818,7 @@ class TestRetentionKeepsActiveRuns(unittest.IsolatedAsyncioTestCase):
         self.mod._RUNS[:] = []
 
     async def _record_many(self, statuses):
-        with unittest.mock.patch.object(self.mod, "_save_runs", lambda: None), \
+        with unittest.mock.patch.object(self.mod, "_save_runs", _noop_save), \
                 unittest.mock.patch.object(self.mod.store, "remove_run_dir",
                                   lambda rid, *a, **k: self.removed.append(rid)):
             for i, st in enumerate(statuses):
@@ -754,7 +840,7 @@ class TestRetentionKeepsActiveRuns(unittest.IsolatedAsyncioTestCase):
         # Evicting it deletes the subtree mid-delivery and loses the record of what
         # landed. The delete handler already refused this; retention did not.
         cap = self.mod._RUNS_MAX
-        with unittest.mock.patch.object(self.mod, "_save_runs", lambda: None), \
+        with unittest.mock.patch.object(self.mod, "_save_runs", _noop_save), \
                 unittest.mock.patch.object(self.mod.store, "remove_run_dir",
                                            lambda rid, *a, **k: self.removed.append(rid)):
             await self.mod._record({"run_id": "run-0", "status": "done",
@@ -770,7 +856,7 @@ class TestRetentionKeepsActiveRuns(unittest.IsolatedAsyncioTestCase):
         # The guard must not pin the run forever: once posting clears, it is
         # terminal and reclaimable on the next _record.
         cap = self.mod._RUNS_MAX
-        with unittest.mock.patch.object(self.mod, "_save_runs", lambda: None), \
+        with unittest.mock.patch.object(self.mod, "_save_runs", _noop_save), \
                 unittest.mock.patch.object(self.mod.store, "remove_run_dir",
                                            lambda rid, *a, **k: self.removed.append(rid)):
             done = {"run_id": "run-0", "status": "done", "posting": True}
@@ -909,6 +995,7 @@ class TestPublishRefusesAPlantedDestinationLink:
             "counts": {"red": 0, "yellow": 1},
         }
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_link_is_replaced_not_followed(self, tmp_path):
 
         store.ensure_layout(tmp_path)
@@ -1042,6 +1129,7 @@ class TestPublishRefusesAPlantedSourceLink:
     direction.
     """
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_symlinked_record_is_not_published(self, tmp_path):
 
         store.ensure_layout(tmp_path)
@@ -1100,6 +1188,7 @@ class TestReportWritesRefusePlantedLinks:
             "generated_at": "2026-01-01T00:00:00Z",
         }
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     @pytest.mark.parametrize("name", [
         "focus-report.html", "rows.json", "report.json", "index.json",
     ])
@@ -1132,7 +1221,11 @@ class TestReportWritesRefusePlantedLinks:
             assert p.is_file(), f"{name} was not written"
             # The temp file is chmod'ed before it takes the real name, so the
             # mode must hold on the final path with no separate chmod step.
-            assert oct(p.stat().st_mode)[-3:] == "600", f"{name} is not 0600"
+            # Windows expresses the same owner-only lockdown as a DACL, which
+            # st_mode never reflects (it always reports 0o666), so the mode
+            # bits are only observable on POSIX.
+            if platform_compat.IS_POSIX:
+                assert oct(p.stat().st_mode)[-3:] == "600", f"{name} is not 0600"
         assert list(rd.glob("*.tmp")) == [], "a staging temp file survived"
 
 
@@ -1378,6 +1471,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         (rd / name).symlink_to(secret)
         return rd / name
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_html_link_is_not_read(self, tmp_path):
         from sage_lib import report
 
@@ -1385,6 +1479,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         assert link.is_file()          # the link resolves — it just must not be read
         assert report.read_within_reports(link, tmp_path, "run-r1") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_a_planted_index_link_is_not_read(self, tmp_path):
         from sage_lib import report
 
@@ -1401,6 +1496,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         got = report.read_within_reports(rd / "index.json", tmp_path, "run-r2")
         assert json.loads(got or "{}")["report_slug"] == "ok"
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_read_report_refuses_a_planted_report_json(self, tmp_path):
         """The consumer, not just the helper: a plant renders as no report."""
         from sage_lib import report
@@ -1408,6 +1504,7 @@ class TestReportsDirReadsDoNotFollowAPlant:
         self._plant(tmp_path, "report.json", json.dumps({"rows": ["leak"]}))
         assert report.read_report(tmp_path, "run-r1") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_set_report_slug_does_not_merge_a_planted_index(self, tmp_path):
         from sage_lib import report
 
@@ -1563,12 +1660,14 @@ class TestResultReadsDoNotFollowAPlantedLink:
         (rd / f"{results.safe_change_id(change_id)}.json").symlink_to(target)
         return rd
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_read_result_refuses_a_planted_record(self, tmp_path):
         from sage_lib import results
 
         self._plant(tmp_path, "victim", "CR-1", {"change_id": "ATTACKER"})
         assert results.read_result("CR-1", tmp_path, "victim") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_list_results_skips_a_planted_record(self, tmp_path):
         from sage_lib import results
 
@@ -1611,6 +1710,7 @@ class TestResultReadsDoNotFollowAPlantedLink:
         store.ensure_layout(tmp_path)
         assert results.read_result("CR-NONE", tmp_path, "empty") is None
 
+    @unittest.skipUnless(SYMLINKS_OK, "platform forbids unprivileged symlinks")
     def test_the_reviewed_index_is_guarded_too(self, tmp_path):
         """It decides which PRs count as reviewed, so a swap suppresses reviews."""
         from sage_lib import results, store
@@ -2535,3 +2635,306 @@ class TestReviewersSerialize:
         assert seen.get("concurrency") == 1, (
             "the backend must ask for one reviewer at a time; got "
             f"{seen.get('concurrency')!r}")
+
+
+class _FakeSessions:
+    """The two SessionManager methods the follow-up route uses."""
+
+    def __init__(self, mapped=None):
+        self.map: dict[str, tuple] = dict(mapped or {})
+        self.seeds: list[tuple] = []
+        # When set, a seeded entry is dropped on read-back — what the real
+        # session map does to an entry whose session files are gone.
+        self.drop_seeded = False
+
+    def resumable_sid(self, key):
+        entry = self.map.get(key)
+        return entry[0] if entry else None
+
+    def seed_conversation(self, key, sid, *, provider="", cwd=""):
+        self.seeds.append((key, sid, provider, cwd))
+        if not self.drop_seeded:
+            self.map[key] = (sid, provider, cwd)
+
+
+class _FakeState:
+    def __init__(self, sessions=None, folders=None, slots=None):
+        self.sessions = sessions
+        self._folders = list(folders or [])
+        self._slots = dict(slots or {})
+
+    async def mutate_folders(self, mutate):
+        _changed, value = mutate(self._folders)
+        return value
+
+
+class _Req:
+    def __init__(self, body=None, query=None):
+        self._body = body or {}
+        self.query = query or {}
+
+    async def json(self):
+        return self._body
+
+
+class TestFollowupRoutes(unittest.IsolatedAsyncioTestCase):
+    """Opening a follow-up must never hand back a session that resumed nothing.
+
+    The dashboard's fallback for a failed resume is to replay Kiro Crew's own
+    conversation log, and a follow-up slot has none — so a slot created without a
+    live mapping answers confidently with no idea what was reviewed. Every branch
+    here is about refusing that outcome rather than degrading into it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+        self.mod._RUNS = [{"run_id": "run1", "status": "done"}]
+        self.mod.is_app_enabled = lambda name: True
+        self.sessions_dir = Path(self.tmp) / "kiro-sessions"
+        self.sessions_dir.mkdir(parents=True)
+        self.mod.followup.kiro_sessions_dir = lambda: self.sessions_dir
+        store.ensure_layout()
+        store.ensure_run_layout("run1")
+
+    def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _record(self, sid="sid-1", change="GH-o-r-42"):
+        (self.sessions_dir / f"{sid}.json").write_text("{}", encoding="utf-8")
+        self.assertTrue(self.mod.followup.write_descriptor(
+            "run1", change, sid=sid, agent="sage-reviewer", cwd="/work"))
+
+    async def test_state_reports_not_resumable_with_a_reason(self):
+        resp = await self.mod._handle_chat_get(
+            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))
+        data = json.loads(resp.body)
+        self.assertFalse(data["resumable"])
+        self.assertEqual(data["reason"],
+                         self.mod.followup.ERR_NO_DESCRIPTOR)
+        self.assertTrue(data["slot_key"])
+
+    async def test_state_reports_resumable_once_recorded(self):
+        self._record()
+        resp = await self.mod._handle_chat_get(
+            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))
+        data = json.loads(resp.body)
+        self.assertTrue(data["resumable"])
+        self.assertEqual(data["reason"], "")
+
+    async def test_state_requires_both_ids(self):
+        resp = await self.mod._handle_chat_get(_Req(query={"run_id": "run1"}))
+        self.assertEqual(resp.status, 400)
+
+    async def test_start_refuses_a_deleted_run(self):
+        self._record()
+        self.mod._RUNS = []
+        resp = await self.mod._handle_followup_start(
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+        self.assertEqual(resp.status, 409)
+        self.assertEqual(json.loads(resp.body)["code"],
+                         self.mod.followup.ERR_RUN_GONE)
+
+    async def test_start_refuses_when_the_transcript_is_gone(self):
+        self._record()
+        (self.sessions_dir / "sid-1.json").unlink()
+        self.mod._APP_STATE["state"] = _FakeState(_FakeSessions())
+        resp = await self.mod._handle_followup_start(
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+        self.assertEqual(resp.status, 409)
+        self.assertEqual(json.loads(resp.body)["code"],
+                         self.mod.followup.ERR_TRANSCRIPT_GONE)
+
+    async def test_start_seeds_the_resume_and_returns_the_slot(self):
+        self._record()
+        sessions = _FakeSessions()
+        self.mod._APP_STATE["state"] = _FakeState(sessions)
+        resp = await self.mod._handle_followup_start(
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+        self.assertEqual(resp.status, 200)
+        data = json.loads(resp.body)
+        expected_key = self.mod.followup.slot_key("run1", "GH-o-r-42")
+        self.assertEqual(data["slot_key"], expected_key)
+        self.assertEqual(data["agent"], "sage-reviewer")
+        self.assertTrue(data["folder_id"])
+        self.assertTrue(data["title"].startswith("followup-pr#42"))
+        # Seeded under the session key a dashboard slot resolves its resume
+        # from, carrying the provider and cwd the review actually ran with: a
+        # provider mismatch makes the dashboard DISCARD the session id, and the
+        # cwd is what the reviewer's relative paths were written against.
+        self.assertEqual(
+            sessions.seeds,
+            [(f"dashboard:{expected_key}", "sid-1", "acp", "/work")])
+
+    async def test_start_does_not_reseed_an_existing_conversation(self):
+        """Re-seeding would point a follow-up conversation back at the review's
+        own starting transcript and discard everything discussed since."""
+        self._record()
+        key = self.mod.followup.slot_key("run1", "GH-o-r-42")
+        sessions = _FakeSessions({f"dashboard:{key}": ("later-sid", "acp", "/w")})
+        self.mod._APP_STATE["state"] = _FakeState(sessions)
+        resp = await self.mod._handle_followup_start(
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(sessions.seeds, [])
+
+    async def test_start_refuses_when_the_seed_does_not_stick(self):
+        """The session map self-prunes an entry whose files are gone, so the
+        read-back is the last check that there is anything to resume."""
+        self._record()
+        sessions = _FakeSessions()
+        sessions.drop_seeded = True
+        self.mod._APP_STATE["state"] = _FakeState(sessions)
+        resp = await self.mod._handle_followup_start(
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+        self.assertEqual(resp.status, 409)
+        self.assertEqual(json.loads(resp.body)["code"],
+                         self.mod.followup.ERR_TRANSCRIPT_GONE)
+
+    async def test_start_reports_unavailable_sessions_rather_than_pretending(self):
+        self._record()
+        self.mod._APP_STATE["state"] = _FakeState(None)
+        resp = await self.mod._handle_followup_start(
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+        self.assertEqual(resp.status, 503)
+
+    async def test_the_folder_is_adopted_not_duplicated(self):
+        self._record()
+        self._record(sid="sid-2", change="GH-o-r-43")
+        state = _FakeState(_FakeSessions())
+        self.mod._APP_STATE["state"] = state
+        first = json.loads((await self.mod._handle_followup_start(
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        second = json.loads((await self.mod._handle_followup_start(
+            _Req({"run_id": "run1", "change_id": "GH-o-r-43"}))).body)
+        self.assertEqual(first["folder_id"], second["folder_id"])
+        self.assertEqual(
+            [f["name"] for f in state._folders],
+            [self.mod.followup.FOLDER_NAME])
+
+    async def test_a_disabled_app_answers_nothing(self):
+        """Disabling an app withdraws its runtime, not just its UI — a request
+        already in flight is the one no teardown hook can reach."""
+        self._record()
+        self.mod.is_app_enabled = lambda name: False
+        self.mod._APP_STATE["state"] = _FakeState(_FakeSessions())
+        for resp in (
+            await self.mod._handle_chat_get(
+                _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"})),
+            await self.mod._handle_followup_start(
+                _Req({"run_id": "run1", "change_id": "GH-o-r-42"})),
+        ):
+            self.assertEqual(resp.status, 403)
+            self.assertEqual(json.loads(resp.body)["code"], "app_disabled")
+
+
+class TestFollowupRunLiveAndReentry(unittest.IsolatedAsyncioTestCase):
+    """A live run must not be offerable, and a returning user must see re-entry.
+
+    The mid-run window is the reachable one: a first pass writes a descriptor, the
+    panel offers it, and a successful second coverage pass then retires that
+    descriptor -- leaving an already-open conversation pointing at findings the run
+    replaced, with nothing saying so.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._old_home = os.environ.get("KIROCREW_HOME")
+        os.environ["KIROCREW_HOME"] = self.tmp
+        self.mod = _load_routes_module()
+        self.mod.is_app_enabled = lambda name: True
+        self.sessions_dir = Path(self.tmp) / "kiro-sessions"
+        self.sessions_dir.mkdir(parents=True)
+        self.mod.followup.kiro_sessions_dir = lambda: self.sessions_dir
+        store.ensure_layout()
+        store.ensure_run_layout("run1")
+        (self.sessions_dir / "sid-1.json").write_text("{}", encoding="utf-8")
+        self.mod.followup.write_descriptor(
+            "run1", "GH-o-r-42", sid="sid-1", agent="sage-reviewer", cwd="/work")
+        self.sessions = _FakeSessions()
+        self.state = _FakeState(self.sessions)
+        self.mod._APP_STATE["state"] = self.state
+
+    def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("KIROCREW_HOME", None)
+        else:
+            os.environ["KIROCREW_HOME"] = self._old_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, **over):
+        run = {"run_id": "run1", "status": "done"}
+        run.update(over)
+        self.mod._RUNS = [run]
+
+    async def test_a_running_run_is_not_offerable(self):
+        self._run(status="running")
+        data = json.loads((await self.mod._handle_chat_get(
+            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        self.assertFalse(data["resumable"])
+        self.assertEqual(data["reason"], self.mod.followup.ERR_RUN_LIVE)
+
+    async def test_a_posting_run_is_not_offerable_either(self):
+        """Posting happens AFTER a terminal status, so the status check alone
+        would let this through."""
+        self._run(status="done", posting=True)
+        data = json.loads((await self.mod._handle_chat_get(
+            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        self.assertFalse(data["resumable"])
+        self.assertEqual(data["reason"], self.mod.followup.ERR_RUN_LIVE)
+
+    async def test_start_refuses_while_the_run_is_live(self):
+        self._run(status="running")
+        resp = await self.mod._handle_followup_start(
+            _Req({"run_id": "run1", "change_id": "GH-o-r-42"}))
+        self.assertEqual(resp.status, 409)
+        self.assertEqual(json.loads(resp.body)["code"],
+                         self.mod.followup.ERR_RUN_LIVE)
+        self.assertEqual(self.sessions.seeds, [])
+
+    async def test_a_finished_run_is_offerable(self):
+        self._run(status="done")
+        data = json.loads((await self.mod._handle_chat_get(
+            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        self.assertTrue(data["resumable"])
+        self.assertEqual(data["reason"], "")
+
+    async def _open_flag(self):
+        data = json.loads((await self.mod._handle_chat_get(
+            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        return data["followup_open"]
+
+    async def test_reentry_is_reported_once_a_session_exists(self):
+        """Without this the panel invites a returning user to "open" a
+        conversation they already had, with no trace of it -- which reads as the
+        review having lost it."""
+        self._run(status="done")
+        key = self.mod.followup.slot_key("run1", "GH-o-r-42")
+        self.assertFalse(await self._open_flag())
+        self.state._slots[key] = object()
+        self.assertTrue(await self._open_flag())
+
+    async def test_a_surviving_mapping_is_not_an_existing_session(self):
+        """Closing a tab pops the slot but KEEPS its mapping, so a resume can
+        reload it later. Reading existence off the map therefore reported a closed
+        session as open, and the recreate that followed omitted the title and
+        folder -- leaving the session unfiled under the placeholder title.
+        """
+        self._run(status="done")
+        key = self.mod.followup.slot_key("run1", "GH-o-r-42")
+        self.sessions.map[f"dashboard:{key}"] = ("sid-1", "acp", "/work")
+        self.assertFalse(await self._open_flag())
+
+    async def test_reentry_is_false_when_state_is_unavailable(self):
+        self._run(status="done")
+        self.mod._APP_STATE["state"] = _FakeState(None)
+        self.assertFalse(await self._open_flag())
+        data = json.loads((await self.mod._handle_chat_get(
+            _Req(query={"run_id": "run1", "change_id": "GH-o-r-42"}))).body)
+        self.assertTrue(data["resumable"])

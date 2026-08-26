@@ -1,11 +1,13 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useEffect, useState } from 'react'
 import { Folder, File, Image, X, Plus } from 'lucide-react'
 import Clickable from '../../components/Clickable'
+import { useScrollEdges } from '../../hooks/useScrollEdges'
 import { IMAGE_EXTS } from './constants'
 import { extOf, basename } from './utils'
 import type { FolderTab, FileTab } from './types'
 
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 interface TabStripProps {
   folderTabs: FolderTab[]
   fileTabs: FileTab[]
@@ -20,34 +22,22 @@ interface TabStripProps {
 }
 
 export default function TabStrip({ folderTabs, fileTabs, activeFolderId, activeFileId, onActivateFolder, onActivateFile, onCloseFolder, onCloseFile, onNewFolder, onRenameFolder }: TabStripProps) {
+  // Only one rename input renders at a time, so a single instance is safe.
+  const ime = useImeGuard()
   const [renameId, setRenameId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
-  const scrollRef = useRef<HTMLDivElement>(null)
-  const [showFadeLeft, setShowFadeLeft] = useState(false)
-  const [showFadeRight, setShowFadeRight] = useState(false)
+  const [attachScroller, fades, remeasure] = useScrollEdges<HTMLDivElement>()
 
-  const updateFades = useCallback(() => {
-    const el = scrollRef.current
-    if (!el) return
-    setShowFadeLeft(el.scrollLeft > 4)
-    setShowFadeRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 4)
-  }, [])
-
-  useEffect(() => {
-    const el = scrollRef.current
-    if (!el) return
-    updateFades()
-    el.addEventListener('scroll', updateFades, { passive: true })
-    const resObs = new ResizeObserver(updateFades)
-    resObs.observe(el)
-    return () => { el.removeEventListener('scroll', updateFades); resObs.disconnect() }
-  }, [updateFades])
+  // Opening a file appends a tab: the strip keeps its own box, so no resize is
+  // observed and no scroll fires, and the cue would stay dark over tabs that
+  // just went off-screen.
+  useEffect(() => { remeasure() }, [folderTabs, fileTabs, remeasure])
 
   return (
     <div className="mc-fe-tabstrip-outer">
-      {showFadeLeft && <div className="mc-fe-tabstrip-fade mc-fe-fade-left" />}
-      {showFadeRight && <div className="mc-fe-tabstrip-fade mc-fe-fade-right" />}
-      <div className="mc-fe-tabs" ref={scrollRef}>
+      {fades.left && <div className="mc-fe-tabstrip-fade mc-fe-fade-left" />}
+      {fades.right && <div className="mc-fe-tabstrip-fade mc-fe-fade-right" />}
+      <div className="mc-fe-tabs" ref={attachScroller}>
         {folderTabs.map((t) => (
           <div
             key={t.id}
@@ -68,11 +58,11 @@ export default function TabStrip({ folderTabs, fileTabs, activeFolderId, activeF
                 value={renameDraft}
                 onChange={(e) => setRenameDraft(e.target.value)}
                 onClick={(e) => e.stopPropagation()}
-                onBlur={() => { onRenameFolder(t.id, renameDraft.trim()); setRenameId(null) }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') { onRenameFolder(t.id, renameDraft.trim()); setRenameId(null) }
-                  if (e.key === 'Escape') setRenameId(null)
-                }}
+                {...ime.bindEnter({
+                  onEnter: () => { onRenameFolder(t.id, renameDraft.trim()); setRenameId(null) },
+                  onEscape: () => setRenameId(null),
+                  onBlur: () => { onRenameFolder(t.id, renameDraft.trim()); setRenameId(null) },
+                })}
               />
             ) : (
               <span className="mc-fe-tab-label">{t.label || basename(t.rootPath) || '/'}</span>

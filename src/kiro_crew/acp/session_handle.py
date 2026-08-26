@@ -22,13 +22,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from kiro_crew import model_registry
+from kiro_crew.acp import kas_wire
 from kiro_crew.acp._dispatch import (
-    _token_count,
     build_permission_event,
     classify_notification,
     parse_metadata,
@@ -36,32 +36,39 @@ from kiro_crew.acp._dispatch import (
     parse_text_chunk,
     parse_usage_update,
     redact_text,
+    reject_option_id,
     set_mode_params,
     set_model_params,
 )
 from kiro_crew.acp.client import (
     AcpProcessDied,
     AcpTimeoutError,
-    _consume_future_exception,
     _effective_prompt_timeout_async,
     _is_safe_oauth_url,
     _is_tool_interrupted_marker,
     _raise_acp_error,
+    format_command_result,
+    parse_slash_command,
     prompt_timeout_for_ceiling,
     resolve_usable_model,
 )
 from kiro_crew.acp.liveness import (
     EVIDENCE_ESTABLISHED_FLAT,
+    EVIDENCE_SHELL_CHILD_ABSENT,
     VERDICT_DEAD,
     VERDICT_STUCK_INPUT,
     VERDICT_UNKNOWN,
     VERDICT_WORKING,
     LivenessOracle,
     ToolCallState,
+    _consume_future_exception,
+    boottime_now,
+    consult_offloaded,
 )
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
     EVENT_AGENT_SWITCHED,
     EVENT_CLEAR_STATUS,
     EVENT_COMPACTION_STATUS,
@@ -77,9 +84,11 @@ from kiro_crew.acp.types import (
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
     EVENT_TOOL_RESULT,
+    JSONRPC_METHOD_NOT_FOUND,
     METHOD_CANCEL,
     METHOD_COMMANDS_EXECUTE,
     METHOD_PROMPT,
+    METHOD_REQUEST_PERMISSION,
     METHOD_SET_CONFIG_OPTION,
     METHOD_SET_MODE,
     METHOD_SET_MODEL,
@@ -101,6 +110,7 @@ from kiro_crew.acp.types import (
 from kiro_crew.config.paths import kiro_sessions_dir
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.executors import subprocess_executor
+from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED, emit_counter
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -277,13 +287,19 @@ def _watchdog_evidence_class(evidence: str) -> str:
     evidence carries pids, byte deltas, and command fragments, so only its
     SHAPE is emitted. Buckets: ``established_flat`` (LLM-shaped — runtime-held
     backend socket, flat subtree), ``mcp_flat`` (opaque MCP tool, moving or
-    flat), ``shell`` (shell-child evidence), ``wait`` (the declared-duration
-    wait tool), ``degraded`` (everything else: sampling baseline, unreadable
-    /proc, no pid, oracle error — the oracle could not attest either way).
+    flat), ``shell_absent`` (shell tool in flight with nothing this dispatch
+    could have started still running), ``shell`` (other shell-child evidence),
+    ``wait`` (the declared-duration wait tool), ``degraded`` (everything else:
+    sampling baseline, unreadable /proc, no pid, oracle error — the oracle could
+    not attest either way).
     """
     e = evidence or ""
     if e.startswith(EVIDENCE_ESTABLISHED_FLAT):
         return "established_flat"
+    if e.startswith(EVIDENCE_SHELL_CHILD_ABSENT):
+        # Checked before the "shell child" substring below, which its evidence
+        # text also contains.
+        return "shell_absent"
     if "mcp subtree" in e:
         return "mcp_flat"
     if "shell child" in e:
@@ -300,6 +316,20 @@ def _watchdog_evidence_class(evidence: str) -> str:
 # AcpClient's _CANCEL_GRACE_SECS floor without the process-kill (which is
 # impossible on a multiplexed runtime).
 _CANCEL_GRACE_SECS = 10.0
+# Commands that must stay on the PROMPT transport even where native
+# commands/execute is available: kiro-cli 2.14.0 exits rc=0 WITHOUT a response
+# on commands/execute for these (live-probe recorded in compact()'s docstring;
+# the probe covered the string form, and no probe exists for their object
+# form), and session.py's compaction flow additionally depends on watching
+# compaction status mid-PROMPT-stream. Routing them natively would leave the
+# dispatch loop draining an unanswered request until its deadline.
+_PROMPT_TRANSPORT_COMMANDS = frozenset({"compact", "help"})
+# Native command turns are bounded like send_command's 60s RPC wait, not like
+# a chat turn: commands/execute answers in well under a second, and neither
+# turn watchdog arms on a command turn (no text chunk streamed, no tool
+# dispatched), so an unanswered request would otherwise drain silently for the
+# full chat-turn ceiling (hours) while holding the session's turn slot.
+_COMMAND_TURN_TIMEOUT_SECS = 60.0
 # Post-compaction metadata grace: kiro-cli emits fresh _kiro.dev/metadata with
 # the real post-compaction contextUsagePercentage ~1s after the completed
 # status (live-probe confirmed). Mirrors AcpClient's constant.
@@ -339,6 +369,16 @@ class AcpRuntimeError(Exception):
 
 class AcpRuntimeDead(AcpRuntimeError):
     """Raised when the underlying process has died."""
+
+
+class AcpRequestTimeout(AcpRuntimeError):
+    """Raised when a request's response does not arrive within its budget.
+
+    Distinguished from a plain ``AcpRuntimeError`` so a caller that knows what
+    the request was waiting on can attach that context before it reaches the
+    user. Subclasses the base so existing ``except AcpRuntimeError`` handlers
+    keep catching it.
+    """
 
 
 class AcpRuntimeProtocol(Protocol):
@@ -382,6 +422,9 @@ class AcpRuntimeProtocol(Protocol):
         ...
 
     async def send_error(self, request_id: str | int, code: int, message: str) -> None:
+        ...
+
+    def mark_turn_active(self, session_id: str, active: bool) -> None:
         ...
 
     def unregister_session(self, session_id: str) -> None:
@@ -478,6 +521,22 @@ class AcpSessionHandle:
         # a yield in prompt().
         self._parked_total: float = 0.0
         self._parked_since: float | None = None
+        # Consumers that implement the low-fidelity child downgrade (dashboard
+        # card / interactive approver) opt IN; for everyone else the handle
+        # itself fail-closes low-fidelity child permission requests below, so
+        # a consumer that predates the fidelity contract can never auto-approve
+        # a child on agent-authored context. Full-fidelity child events flow to
+        # every consumer unchanged (mode parity everywhere).
+        self.child_fidelity_aware: bool = False
+        # User-visible notices for permission requests this handle answered
+        # itself (fail-close gate below, pre-turn drain): flushed as
+        # EVENT_SUBAGENT_ACTIVITY at the next dispatch so the rejection shows
+        # on the child's crew card instead of vanishing into the log.
+        self._pending_reject_notices: list[tuple[str, str]] = []
+        # In-flight SEL audit tasks for handle-owned permission rejections
+        # (fail-close gate, pre-turn drain) — retained so they cannot be
+        # garbage-collected mid-flight. Mirrors AcpRuntime._audit_tasks.
+        self._audit_tasks: set[asyncio.Task[None]] = set()
         # Set when a permission event is yielded, cleared when it is answered.
         # Distinguishes "waiting for a human" (legitimate, bounded elsewhere)
         # from "the consumer stopped pulling for some other reason".
@@ -595,6 +654,120 @@ class AcpSessionHandle:
         ``agent.chat_turn_timeout_secs`` so the transport wait follows a raised
         turn ceiling instead of cutting the turn at the 2h default underneath it.
         """
+
+        async def _build() -> tuple[str, dict[str, Any]]:
+            # Offloaded: the builder stats and reads image files (up to
+            # MAX_IMAGE_BYTES each) and base64-encodes them. Inline, that
+            # blocking I/O runs on the gateway loop and pauses every other
+            # session's streaming for the duration.
+            prompt_blocks = await asyncio.to_thread(
+                build_prompt_blocks,
+                message,
+                allow_image=self._runtime.supports_image_prompt,
+            )
+            return METHOD_PROMPT, {
+                "sessionId": self._session_id,
+                # An image reaches the model ONLY as an image block. Sending a
+                # local image path as a single text block would ship a
+                # filesystem path as prose (Slack, dashboard) and the model
+                # would never see the picture. Gated on the agent's advertised
+                # capability; when it is absent the path stays in the text as a
+                # tool-openable reference rather than being dropped.
+                "prompt": prompt_blocks,
+            }
+
+        # Explicit aclose in a finally: abandoning THIS wrapper (gen.aclose()
+        # at any yield) must finalize the inner turn generator NOW — its
+        # finally is what unmarks the turn and re-sets _turn_done. Left to the
+        # event loop's async-generator GC hook, the handle would read as
+        # turn-active until some later collection pass.
+        turn = self._run_turn(_build, timeout)
+        try:
+            async for event in turn:
+                yield event
+        finally:
+            await turn.aclose()
+
+    async def stream_command(
+        self, command: str, timeout: float | None = None
+    ) -> AsyncIterator[AcpEvent]:
+        """Execute a slash command natively and yield AcpEvents until it completes.
+
+        Sends ``_kiro.dev/commands/execute`` with the TuiCommand OBJECT form
+        (``{command, args}``) — kiro-cli 2.14.0 exits without a response on the
+        STRING form (see :meth:`compact`), so the object form is load-bearing —
+        and drains ``session/update`` events with the same turn discipline as
+        :meth:`prompt`. The command's own output arrives in the RESPONSE result
+        (message/data), not as update chunks, so the dispatch loop
+        surfaces it as a text chunk (``extract_command_result=True``). Mirrors
+        AcpClient.stream_command for the shared runtime.
+
+        Two carve-outs keep the PROMPT transport (delegate to :meth:`prompt`):
+
+        - ``_PROMPT_TRANSPORT_COMMANDS`` (/compact, /help) — kiro-cli 2.14.0
+          returns no response for these over commands/execute, and the
+          compaction flow (session.py, Slack !compact) depends on watching
+          ``compaction/status`` on the prompt stream.
+        - a non-kiro backend (KAS) — ``_kiro.dev/commands/execute`` is
+          kiro-cli-specific; KAS sessions keep degrading softly through
+          session/prompt instead of erroring on an unimplemented method.
+
+        The native turn is bounded at ``_COMMAND_TURN_TIMEOUT_SECS`` (matching
+        send_command's RPC wait) because neither turn watchdog arms on a
+        command turn; an explicit ``timeout`` still wins.
+        """
+        cmd_name, cmd_args = parse_slash_command(command)
+        # Positive capability gate: only the kiro harness implements
+        # _kiro.dev/commands/execute, so native execution requires
+        # acp_backend == ACP_BACKEND_KIRO — every other harness (KAS today,
+        # any harness added later) fails CLOSED onto the prompt transport
+        # instead of inheriting a kiro-only RPC (harness parity H5/H6).
+        native = (
+            self._runtime.acp_backend == ACP_BACKEND_KIRO
+            and cmd_name not in _PROMPT_TRANSPORT_COMMANDS
+        )
+        if not native:
+            async for event in self.prompt(command, timeout=timeout):
+                yield event
+            return
+
+        async def _build() -> tuple[str, dict[str, Any]]:
+            return METHOD_COMMANDS_EXECUTE, {
+                "sessionId": self._session_id,
+                "command": {"command": cmd_name, "args": cmd_args},
+            }
+
+        # Same deterministic finalization as prompt(): see the comment there.
+        turn = self._run_turn(
+            _build,
+            timeout if timeout is not None else _COMMAND_TURN_TIMEOUT_SECS,
+            extract_command_result=True,
+        )
+        try:
+            async for event in turn:
+                yield event
+        finally:
+            await turn.aclose()
+
+    async def _run_turn(
+        self,
+        build_request: Callable[[], Awaitable[tuple[str, dict[str, Any]]]],
+        timeout: float | None,
+        *,
+        extract_command_result: bool = False,
+    ) -> AsyncGenerator[AcpEvent, None]:
+        """Shared turn lifecycle for :meth:`prompt` and :meth:`stream_command`.
+
+        Owns the concurrent-turn guard, the per-turn state resets, the pre-turn
+        stale-frame drain, the request send, event dispatch, and turn-done
+        bookkeeping. ``build_request`` returns the JSON-RPC ``(method, params)``
+        to send; it runs BEFORE the turn is marked active (see the comment at
+        the send site below).
+
+        ``timeout=None`` (every dashboard turn) resolves from
+        ``agent.chat_turn_timeout_secs`` so the transport wait follows a raised
+        turn ceiling instead of cutting the turn at the 2h default underneath it.
+        """
         timeout = await _effective_prompt_timeout_async(timeout)
         # Guard against concurrent prompts on the same handle: a second call
         # would clear _turn_done and race on the shared _queue, corrupting
@@ -648,11 +821,87 @@ class AcpSessionHandle:
         # the queue grows without bound. The abandoned turn's prompt response is
         # already skipped via is_response_for; its notifications are not, so drop
         # them here before the new turn begins.
+        #
+        # EXCEPTION — permission REQUESTS are answered, never dropped: a
+        # server→client request discarded here strands the backend's response
+        # oneshot and wedges the requesting (sub)agent's whole tool batch until
+        # process teardown — the 2026-08-15 2h crew stall. A request stranded
+        # from an abandoned turn (or routed here for a backend child between
+        # turns) gets the fail-closed reject; the live turn's requests are
+        # handled by the dispatch loop as before.
         while True:
             try:
-                self._queue.get_nowait()
+                stale = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+            if (
+                stale is not None
+                and stale.id is not None
+                and stale.method is not None
+                and stale.is_method(METHOD_REQUEST_PERMISSION)
+            ):
+                # Answer with the request's OWN advertised reject option: the
+                # per-turn _permission_options map was just cleared, so a bare
+                # reject_tool would always take its `cancelled` fallback —
+                # which claude-agent-acp renders as "Tool use aborted" (reads
+                # as a failure) instead of a clean policy denial. Repopulate
+                # the map from the stranded frame's own options first.
+                _stale_params = stale.params if isinstance(stale.params, dict) else {}
+                _reject_id = reject_option_id(_stale_params)
+                if _reject_id is not None:
+                    self._permission_options[stale.id] = {"reject": _reject_id}
+                _stale_sid = str(_stale_params.get("sessionId") or "")
+                _stale_tc = _stale_params.get("toolCall")
+                _stale_title = (
+                    _stale_tc.get("title") if isinstance(_stale_tc, dict) else ""
+                ) or "<unknown tool>"
+                try:
+                    await self.reject_tool(stale.id)
+                except asyncio.CancelledError:
+                    # The prompt was cancelled mid-drain: put the request back
+                    # for the NEXT drain instead of dropping it un-answered
+                    # (a dropped server→client request strands the backend's
+                    # oneshot — the exact hang this drain exists to prevent).
+                    self._queue.put_nowait(stale)
+                    # _turn_done was already cleared for THIS turn, and the
+                    # BaseException guard that would restore it wraps only
+                    # the send_request below — re-raising from here without
+                    # setting it would leave the handle permanently
+                    # turn-active and every later prompt() rejected.
+                    self._turn_done.set()
+                    raise
+                except Exception:
+                    # A reject that failed to SEND left the child waiting on
+                    # a stranded oneshot with no proof any answer reached the
+                    # backend. The pipe cannot be trusted — escalate to the
+                    # runtime's dead-marking so the child's wait dies with
+                    # the process instead of hanging invisibly.
+                    logger.exception("failed to answer stranded permission request")
+                    _md = getattr(self._runtime, "_mark_dead", None)
+                    if _md is not None:
+                        _md("pre-turn drain reject failed")
+                    continue
+                logger.warning(
+                    "rejected permission request id=%s stranded in the "
+                    "pre-turn drain (abandoned turn or between-turns child "
+                    "frame) — answering so the backend cannot hang",
+                    stale.id,
+                )
+                # Crew-card notice ONLY for a child-origin strand: the card
+                # keys on sub_session_id, so the parent's own session id (an
+                # abandoned parent-turn request) can never match a card —
+                # emitting it would name the wrong actor. The parent case is
+                # covered by the WARNING + SEL record.
+                if _stale_sid and _stale_sid != self._session_id:
+                    self._pending_reject_notices.append((_stale_sid, str(_stale_title)))
+                self._audit_handle_reject(
+                    stale.id,
+                    str(_stale_title),
+                    "stranded_request_pre_turn_drain",
+                    sub_session_id=(
+                        _stale_sid if _stale_sid != self._session_id else ""
+                    ),
+                )
 
         self.last_prompt_stats = self.last_prompt_stats.carry_over()
 
@@ -671,33 +920,53 @@ class AcpSessionHandle:
         # exception hierarchy. Re-raised unchanged, so cancellation still
         # propagates.
         try:
-            req_id = await self._runtime.send_request(
-                METHOD_PROMPT,
-                {
-                    "sessionId": self._session_id,
-                    # An image reaches the model ONLY as an image block. Sending a
-                    # local image path as a single text block would ship a
-                    # filesystem path as prose (Slack, dashboard) and the model
-                    # would never see the picture. Gated on the agent's advertised
-                    # capability; when it is absent the path stays in the text as a
-                    # tool-openable reference rather than being dropped.
-                    # Offloaded: the builder stats and reads image files (up to
-                    # MAX_IMAGE_BYTES each) and base64-encodes them. Inline, that
-                    # blocking I/O runs on the gateway loop and pauses every other
-                    # session's streaming for the duration.
-                    "prompt": await asyncio.to_thread(
-                        build_prompt_blocks,
-                        message,
-                        allow_image=self._runtime.supports_image_prompt,
-                    ),
-                },
-            )
+            # Build the request FIRST (for prompts, the slow, cancellable
+            # image-encoding part — see prompt()'s _build), then mark the turn
+            # active immediately before the write: a child permission frame
+            # read by the runtime between the write and the mark would
+            # otherwise be auto-answered as "between turns" even though this
+            # owner's turn had begun. Marking pre-build instead would claim an
+            # active turn during a long image-encoding stint in which nothing
+            # consumes the queue. The BaseException guard unmarks on any
+            # failure so a dead write cannot leave the session permanently
+            # routed-to.
+            _method, _params = await build_request()
+            _mark = getattr(self._runtime, "mark_turn_active", None)
+            if _mark is not None:
+                _mark(self._session_id, True)
+            req_id = await self._runtime.send_request(_method, _params)
         except BaseException:
             self._turn_done.set()
+            _mark = getattr(self._runtime, "mark_turn_active", None)
+            if _mark is not None:
+                _mark(self._session_id, False)
             raise
 
         try:
-            async for event in self._dispatch_events(req_id, timeout):
+            # Surface any drain-time rejections (see the pre-turn drain above)
+            # as crew-card activity before the turn's own events — the user
+            # sees WHY a child's tool failed instead of an unexplained error.
+            # INSIDE the try/finally: these are yields, i.e. abandonment
+            # points. A consumer that closes the stream at a notice yield
+            # would otherwise skip mark_turn_active(False)/_turn_done and
+            # wedge the handle as permanently turn-active.
+            # Snapshot-and-clear BEFORE yielding: the rejects were already
+            # sent, so a consumer that abandons the stream mid-notice must
+            # not see the same notices replayed at the next turn's start.
+            _notices = list(self._pending_reject_notices)
+            self._pending_reject_notices.clear()
+            for _n_sid, _n_title in _notices:
+                yield AcpEvent(
+                    kind=EVENT_SUBAGENT_ACTIVITY,
+                    sub_session_id=_n_sid,
+                    text=(
+                        "⛔ permission auto-rejected (stranded between turns): "
+                        f"{redact_text(str(_n_title)[:4096])[:120]}"
+                    ),
+                )
+            async for event in self._dispatch_events(
+                req_id, timeout, extract_command_result=extract_command_result
+            ):
                 # Park accounting. The consumer holds this event from here until
                 # it comes back for the next one, and that interval is CONSUMER
                 # time, not backend silence: the dispatch loop is suspended at
@@ -719,6 +988,8 @@ class AcpSessionHandle:
                         self._parked_total += time.monotonic() - self._parked_since
                         self._parked_since = None
         finally:
+            if _mark is not None:
+                _mark(self._session_id, False)
             if not self._turn_done.is_set():
                 self._turn_done.set()
 
@@ -870,6 +1141,63 @@ class AcpSessionHandle:
                 {"outcome": {"outcome": OUTCOME_CANCELLED}},
             )
 
+    def _audit_handle_reject(
+        self,
+        request_id: str | int | None,
+        title: str,
+        error: str,
+        sub_session_id: str = "",
+    ) -> None:
+        """SEL-audit a permission request this handle rejected ITSELF.
+
+        The fail-close fidelity gate and the pre-turn drain answer requests
+        that never reach a consumer, so no consumer-side audit fires — every
+        permission decision must still leave a SEL record (repo convention;
+        the runtime's unregistered-session auto-reject does the same).
+        Off-loop (``asyncio.to_thread``) and AFTER the reject was sent: sel()
+        may do blocking filesystem work on first use, and an audit failure
+        must not undo or delay the already-made decision. Title is
+        backend/LLM-authored: bounded then redacted before it is stored.
+        """
+        safe_title = redact_text(str(title)[:4096])[:120] if title else "<unknown>"
+        rid = request_id if isinstance(request_id, (str, int)) else ""
+        # Hang-resilience series: handle-owned denials (fail-close fidelity
+        # gate, pre-turn drain). CHILD-origin only — the pre-turn drain also
+        # answers abandoned PARENT-turn requests (sub_session_id empty), and
+        # counting those would corrupt the child-denial series.
+        if sub_session_id:
+            emit_counter(
+                CHILD_PERMISSION_DENIED,
+                {"surface": "session_handle", "reason": error},
+            )
+
+        def _audit() -> None:
+            try:
+                from kiro_crew.sel import sel
+
+                sel().log_tool_invocation(
+                    # Child rejections carry the CHILD's id in the key —
+                    # attributing them only to the parent would erase the
+                    # traceability the audit exists to provide.
+                    session_key=(
+                        f"acp:{self._session_id}:{sub_session_id}"
+                        if sub_session_id
+                        else f"acp:{self._session_id}"
+                    ),
+                    agent="kirocrew",
+                    source="acp_session_handle",
+                    tool_name=safe_title,
+                    outcome="denied",
+                    request_id=rid,
+                    error=error,
+                )
+            except Exception:
+                logger.exception("SEL audit for handle-rejected permission failed")
+
+        audit_task = asyncio.ensure_future(asyncio.to_thread(_audit))
+        self._audit_tasks.add(audit_task)
+        audit_task.add_done_callback(self._audit_tasks.discard)
+
     # ── Session Configuration ──
 
     async def set_mode(self, agent_name: str) -> None:
@@ -943,7 +1271,30 @@ class AcpSessionHandle:
             "_session/steer",
             {"sessionId": self._session_id, "message": wrapped},
         )
+        # Stamped HERE, at the innermost write, because this is the one point
+        # every steer funnels through: the dashboard steers the inner client
+        # directly while the IM transports steer the provider wrapper, and both
+        # end up on this line. A reader of the stamp therefore needs no
+        # per-transport wiring. See ``last_steer_monotonic``.
+        self._last_steer_monotonic = time.monotonic()
         return True
+
+    # Monotonic stamp of the last steer handed to the backend, 0.0 when this
+    # session has never been steered. Read by the dashboard's keepalive route to
+    # decide whether a sleeping `wait` should return early: a steer can only be
+    # injected at a model-inference boundary, and an in-flight tool call is the
+    # absence of one, so a sleep that outlasts the steer would hold the user's
+    # correction in the backend's queue until it elapses.
+    #
+    # Deliberately monotonic, not wall clock: it is only ever compared against
+    # another monotonic stamp taken in the same process (the sleep's start), and
+    # mixing the two clocks is how a suspend-resume silently reorders them.
+    _last_steer_monotonic: float = 0.0
+
+    @property
+    def last_steer_monotonic(self) -> float:
+        """Monotonic time of the last steer written to the backend (0.0 if none)."""
+        return self._last_steer_monotonic
 
     @property
     def supports_steer(self) -> bool:
@@ -1350,7 +1701,9 @@ class AcpSessionHandle:
         a finished session's state stays resident in the multiplexed process
         forever, so RSS climbs with cumulative sessions (the background-runtime
         unbounded-growth bug). ``terminate_session`` is best-effort + bounded and
-        ALWAYS unregisters the queue, so teardown neither hangs nor raises.
+        ALWAYS unregisters the queue, so teardown neither hangs nor fails on a
+        dead or slow runtime -- but see the `finally` below for the one
+        exception it cannot swallow.
 
         Each session on a shared runtime (a ``_bg`` op or a session-sharing
         subagent) is a distinct ``session/new`` with its own persisted
@@ -1369,9 +1722,19 @@ class AcpSessionHandle:
         still runs unconditionally: it is the RSS reclaim on the multiplexed
         process; only the unlink is deferred.
         """
-        await self._runtime.terminate_session(self._session_id)
-        if not getattr(self, "keep_transcript", False):
-            self._cleanup_transcript()
+        # The unlink runs in a `finally`, for the same reason
+        # `terminate_session` unregisters the queue in one: that method swallows
+        # `Exception`, but `asyncio.CancelledError` is a `BaseException` and
+        # propagates straight out of the await. Cancellation is exactly when
+        # teardown runs -- gateway shutdown, an abandoned turn -- so the
+        # sequential form skipped the cleanup on the path that produces the most
+        # of these files, and every survivor is permanent: nothing else deletes
+        # an ephemeral session's transcript.
+        try:
+            await self._runtime.terminate_session(self._session_id)
+        finally:
+            if not getattr(self, "keep_transcript", False):
+                self._cleanup_transcript()
 
     def _cleanup_transcript(self) -> None:
         """Best-effort delete of this session's kiro-cli transcript files.
@@ -1459,11 +1822,20 @@ class AcpSessionHandle:
                 self._queue.put_nowait(_m)
 
     async def _dispatch_events(
-        self, req_id: int, timeout: float
+        self, req_id: int, timeout: float, *, extract_command_result: bool = False
     ) -> AsyncIterator[AcpEvent]:
-        """Core event dispatch loop. Yields AcpEvent objects from the session queue."""
+        """Core event dispatch loop. Yields AcpEvent objects from the session queue.
+
+        ``extract_command_result`` (commands/execute turns): the command's
+        output arrives in the RESPONSE result rather than as session/update
+        chunks — surface it as a text chunk before the terminal event.
+        """
         deadline = time.monotonic() + timeout
         last_data_ts = time.monotonic()
+        # Whether a native agent-switch notification already reported the
+        # switch this turn; guards the result-extracted fallback below from
+        # double-emitting EVENT_AGENT_SWITCHED (mirrors AcpClient).
+        saw_agent_switch = False
         # Consumer time already accounted for at the moment `last_data_ts` was
         # taken. The idle clocks below measure BACKEND silence, so any park that
         # happens after this point must be subtracted from them.
@@ -1585,9 +1957,11 @@ class AcpSessionHandle:
                         # a tool, e.g. kiro-cli use_subagent) narrows to the
                         # model-silent budget, because its longest legitimate
                         # silent gap is minutes, not hours. Keyed STRICTLY on
-                        # the oracle's established_flat evidence tag: plain
-                        # flat-subtree or shell-child evidence (a quiet build /
-                        # quiet MCP tool) keeps the full window.
+                        # the oracle's evidence TAGS — established_flat, or
+                        # shell_child_absent for a shell command with no process
+                        # to its name. Untagged evidence (a quiet build's
+                        # unmatched-but-live tree, a quiet MCP tool) keeps the
+                        # full window.
                         # F3 — hard cap: watchdog_tool_stall_hard_cap_secs is
                         # the absolute ceiling for UNKNOWN forbearance. Apply
                         # min(suspect_window, hard_cap) so the configured cap
@@ -1600,6 +1974,22 @@ class AcpSessionHandle:
                         _narrowed = evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
                         if _narrowed:
                             _suspect = min(wd.model_silent_probe_secs, _suspect)
+                        elif evidence.startswith(EVIDENCE_SHELL_CHILD_ABSENT):
+                            # The oracle can see the runtime's tree and nothing
+                            # in it is young enough to be this dispatch's child:
+                            # the shell command is not running. Build-scale
+                            # forbearance exists for a QUIET build, not for an
+                            # absent one — a sub-second command whose result
+                            # frame was lost is never observed alive, so without
+                            # this it collects the full suspect window while the
+                            # matched-then-gone fork of the same state acts on
+                            # CHILD_EXIT_GRACE_SECS. Narrowed to the ordinary
+                            # silence window rather than to that grace: absence
+                            # is inferred from start times, so the verdict stays
+                            # UNKNOWN and the action stays the non-lethal
+                            # session cancel at a few minutes.
+                            _narrowed = True
+                            _suspect = min(wd.stale_window_secs, _suspect)
                         _suspect = min(_suspect, wd.tool_stall_hard_cap_secs)
                         _acting = (
                             verdict in (VERDICT_DEAD, VERDICT_STUCK_INPUT)
@@ -1754,6 +2144,29 @@ class AcpSessionHandle:
                         # Single-shot: the flag is consumed here so a later genuine
                         # cancel can never be misattributed to a stale probe.
                         self._stale_probe = False
+                    if extract_command_result and isinstance(result, dict):
+                        # commands/execute returns its output in the RESPONSE
+                        # result (message/data), not via session/update
+                        # chunks — surface it as a text chunk. The helper
+                        # two-pass redacts (URLs + credentials) before
+                        # returning: command output is backend-echoed text
+                        # that reaches the dashboard.
+                        text = format_command_result(result)
+                        if text:
+                            yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=text)
+                        if not saw_agent_switch:
+                            data = result.get("data")
+                            if isinstance(data, dict) and data.get("agent"):
+                                agent_info = data["agent"]
+                                name = (
+                                    agent_info.get("name", "")
+                                    if isinstance(agent_info, dict)
+                                    else ""
+                                )
+                                if name:
+                                    yield AcpEvent(
+                                        kind=EVENT_AGENT_SWITCHED, text=name
+                                    )
                     self._last_stop_reason = reason
                     self._tool_dispatched = False
                     self._turn_done.set()
@@ -1787,13 +2200,50 @@ class AcpSessionHandle:
                 action = self._classify(msg)
 
                 if action == "permission":
+                    _perm_event = self._build_permission_event(msg)
+                    if _perm_event.child_low_fidelity and not self.child_fidelity_aware:
+                        # This consumer never opted into the child-fidelity
+                        # contract: it would run its ordinary hook/trust
+                        # auto-approve on agent-authored context. Answer
+                        # fail-closed here instead of yielding — the request
+                        # is REJECTED (never dropped), the child gets a tool
+                        # error, nothing can hang, and no title-only approve
+                        # can occur on any consumer surface.
+                        logger.warning(
+                            "rejecting low-fidelity child permission request "
+                            "id=%s for fidelity-unaware consumer (child=%s)",
+                            _perm_event.request_id,
+                            _perm_event.sub_session_id,
+                        )
+                        await self.reject_tool(_perm_event.request_id)
+                        self._audit_handle_reject(
+                            _perm_event.request_id,
+                            _perm_event.title or "",
+                            "child_low_fidelity_unaware_consumer",
+                            sub_session_id=_perm_event.sub_session_id or "",
+                        )
+                        yield AcpEvent(
+                            kind=EVENT_SUBAGENT_ACTIVITY,
+                            sub_session_id=_perm_event.sub_session_id,
+                            # Backend-controlled title: bound before redaction
+                            # and cap the display, consistent with the drain
+                            # notice and the [:4096] pre-redaction bounds.
+                            text=(
+                                "⛔ permission auto-rejected (missing security "
+                                "context): "
+                                f"{redact_text(str(_perm_event.title or '<unknown tool>')[:4096])[:120]}"
+                            ),
+                        )
+                        continue
                     # Mark BEFORE the yield: the consumer parks on this event, and
                     # an observer reading the park mid-flight must be able to tell
                     # "waiting for a human" from "the consumer stopped pulling".
                     self._awaiting_permission = True
-                    yield self._build_permission_event(msg)
+                    yield _perm_event
                 elif action == "server_request_unknown":
-                    await self._runtime.send_error(msg.id, -32601, "Method not found")
+                    await self._runtime.send_error(
+                        msg.id, JSONRPC_METHOD_NOT_FOUND, "Method not found"
+                    )
                 elif action == "update":
                     for ev in self._handle_update(msg):
                         yield ev
@@ -1846,13 +2296,24 @@ class AcpSessionHandle:
                 elif action == "clear":
                     yield AcpEvent(kind=EVENT_CLEAR_STATUS)
                 elif action == "agent_switched":
+                    saw_agent_switch = True
                     params = msg.params or {}
                     yield AcpEvent(kind=EVENT_AGENT_SWITCHED, text=params.get("agentName", ""))
                 elif action == "subagent_list":
                     params = msg.params or {}
                     subs = params.get("subagents")
                     if isinstance(subs, list):
-                        yield AcpEvent(kind=EVENT_SUBAGENT_LIST, subagents=subs)
+                        # The roster notification carries no sessionId, so the
+                        # runtime fans it out to every co-tenant. Carry that
+                        # provenance through: a subagent consumer needs to tell
+                        # it apart from the SAME event kind produced by the
+                        # routed KAS lifecycle path below, which does belong to
+                        # this session.
+                        yield AcpEvent(
+                            kind=EVENT_SUBAGENT_LIST,
+                            subagents=subs,
+                            runtime_global=msg.fanout_no_owner,
+                        )
                 elif action == "subagent_activity":
                     params = msg.params or {}
                     ssid = str(params.get("sessionId") or "")
@@ -1986,12 +2447,13 @@ class AcpSessionHandle:
         bounded so a hung /proc read can't wedge the watchdog itself. Any
         failure degrades to UNKNOWN, never to a kill.
 
-        A timed-out await does not stop its executor thread. The submitted future
-        is tracked and intervening ticks answer UNKNOWN without submitting again,
-        bounding this handle to one outstanding walk per liveness generation
-        instead of one per tick — otherwise a permanently wedged /proc read grows
-        a new blocked worker every ``check_after_secs`` and starves the shared
-        pool that teardown's ``_get_child_pids`` also draws from.
+        A timed-out await does not stop its executor thread. The one-outstanding-
+        walk bound (otherwise a permanently wedged /proc read grows a new blocked
+        worker every ``check_after_secs`` and starves the shared pool that
+        teardown's ``_get_child_pids`` also draws from), the refused-submission-
+        reads-UNKNOWN contract, and exception retrieval all live in the shared
+        :func:`consult_offloaded` guard; only which oracle check runs, and
+        against which pid and tool state, is decided here.
         """
         pid = getattr(self._runtime, "pid", None)
         call: Callable[..., tuple[str, str]]
@@ -2008,34 +2470,13 @@ class AcpSessionHandle:
             call = self._oracle.check_tool
             args = (pid, tool)
 
-        prior = self._consult_future
-        if prior is not None:
-            if not prior.done():
-                return VERDICT_UNKNOWN, "prior consult still in flight"
-            # wait_for cancels shield's outer future, and shield detaches its
-            # inner-done callback in exactly that case. The submission-time
-            # callback below covers that normal path; this consume additionally
-            # covers an already-completed future that never went through it.
-            _consume_future_exception(prior)
-
-        try:
-            # Submission stays inside the guard: the caller is a watchdog tick, so
-            # a refused executor job (shut down during teardown, thread creation
-            # refused under load) must read as UNKNOWN rather than abort the turn.
-            loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(subprocess_executor(), call, *args)
-            # Attach at SUBMISSION, not only where a later tick or a boundary
-            # observes it: a turn that ends on this verdict returns with the walk
-            # still running and may never be consulted again, and CancelledError
-            # is a BaseException so an `except Exception` arm would miss a turn
-            # cancelled mid-walk. Retrieval is not destructive, so the await
-            # below still sees the result.
-            future.add_done_callback(_consume_future_exception)
-            self._consult_future = future
-            return await asyncio.wait_for(asyncio.shield(future), timeout=10.0)
-        except Exception:
-            logger.debug("oracle consultation failed/timed out", exc_info=True)
-            return VERDICT_UNKNOWN, "oracle offload error"
+        return await consult_offloaded(
+            self,
+            call,
+            args,
+            executor_factory=subprocess_executor,
+            log_label="oracle consultation",
+        )
 
     def _log_working_deferral(self, idle: float, evidence: str, turn_timeout: float) -> None:
         """Evidence trail for a WORKING deferral, rate-limited to one line per
@@ -2076,8 +2517,9 @@ class AcpSessionHandle:
         (tool-stall recovery via _end_stalled_tool). Attrs are all closed
         enums (metrics/schema.py cardinality rule): the free-form evidence is
         bucketed by :func:`_watchdog_evidence_class`; ``window`` is one of:
-        "standard" (default), "narrowed" (tool-branch established_flat reduces
-        the build-scale suspect window to the model-silent budget), or "extended"
+        "standard" (default), "narrowed" (a tool-branch tag reduces the
+        build-scale suspect window — established_flat to the model-silent budget,
+        shell_child_absent to the ordinary silence window), or "extended"
         (model-wait established_flat extends the 300s stale window to the
         model-silent probe window for a non-streamed server-side think).
         ``agent_override`` is the per-agent-override BOOLEAN from the settings
@@ -2165,57 +2607,27 @@ class AcpSessionHandle:
         # A real usage_update is authoritative for context_pct + token counts;
         # kiro's metadata percentage can measure a different window, so applying
         # it here would desync the headline % from the "used / total" token text.
-        if pct is not None and not self.last_prompt_stats.context_tokens_from_usage:
-            try:
-                pct_f = float(pct)
-                # Sanitize a malformed metadata percentage (NaN/±inf/out-of-range,
-                # e.g. 1e308) at the source so context_pct is always a real
-                # [0, 100] value: keeps compaction comparisons sane and the
-                # diagnostic /api/sessions JSON standard (Infinity/NaN are not
-                # valid JSON). NaN is caught by its self-inequality.
-                pct_f = 0.0 if pct_f != pct_f else min(max(pct_f, 0.0), 100.0)
-                self.last_prompt_stats.context_pct = pct_f
-                self.last_prompt_stats.note_pct_reported()
-                self._backfill_context_window(pct_f)
-            except (TypeError, ValueError):
-                pass
+        # sanitize_pct is the shared coercion (the AcpClient path uses it too),
+        # so the two metadata paths cannot drift: it clamps NaN/±inf/out-of-range
+        # and returns None for a missing or unparseable value.
+        pct_f = self.last_prompt_stats.sanitize_pct(pct)
+        if pct_f is not None and not self.last_prompt_stats.context_tokens_from_usage:
+            self.last_prompt_stats.context_pct = pct_f
+            self.last_prompt_stats.note_pct_reported()
+            self._backfill_context_window(pct_f)
         self.last_prompt_stats.credits += credits
 
     def _backfill_context_window(self, pct: float) -> None:
-        """Derive window/used tokens from the model registry when kiro-cli 2.10+
-        metadata gives only a percentage (no usage_update {used, size}).
+        """Derive window/used tokens from a percentage-only reading.
 
-        Mirrors AcpClient._backfill_context_window so the shared-runtime path
-        reports the same context-meter token counts. No-op once a real
-        usage_update has set the window. Keys on ``_resolved_model_id`` (kiro's
-        ``currentModelId`` from the session/new|load response, also synced by
-        set_model) first, then falls back to ``_model`` (the user-picked alias).
-        Resolves through the central ``model_registry.model_window`` authority
-        (kiro-list cache > registry > heuristic); only backfills a KNOWN window,
-        leaving 0 for a genuinely-unknown model so the frontend's own
-        authoritative window drives the meter. kiro's real usage_update.size
-        always wins when present. A surviving ``context_window_tokens`` (e.g.
-        kept across a compaction reset — the model did not change) outranks the
-        registry, since the served size can differ from the static entry.
+        Thin wrapper binding this handle's resolved model id (kiro-agent
+        ``currentModelId``, else the user-picked alias); the shared logic lives
+        on ``AcpPromptStats.backfill_context_window`` (the AcpClient path
+        delegates to the same method, so the two can no longer drift).
         """
-        if self.last_prompt_stats.context_tokens_from_usage:
-            return  # a real usage_update already set authoritative counts
-        win = self.last_prompt_stats.context_window_tokens
-        if not win or win <= 0:
-            model_id = self._resolved_model_id or self._model
-            if not model_id or not model_registry.has_known_window(model_id):
-                return
-            reg_win = model_registry.model_window(model_id)
-            if not reg_win or reg_win <= 0:
-                return
-            win = int(reg_win)
-            self.last_prompt_stats.context_window_tokens = win
-        # A malformed metadata percentage (NaN, ±inf, or a huge finite value
-        # like 1e308) would overflow ``round(win * pct / 100)`` and abort the
-        # turn. Sanitize to a sane [0, 100] before deriving used tokens (NaN
-        # -> 0); this also keeps used <= window.
-        safe_pct = 0.0 if pct != pct else min(max(pct, 0.0), 100.0)
-        self.last_prompt_stats.context_used_tokens = round(win * safe_pct / 100.0)
+        self.last_prompt_stats.backfill_context_window(
+            pct, self._resolved_model_id or self._model
+        )
 
     def _emit_tool_interrupted_sel(self, site: str) -> None:
         """Emit a SEL audit + WARNING when kiro-cli's security filter cancels tools.
@@ -2394,6 +2806,7 @@ class AcpSessionHandle:
         normalization, is_shell from the trusted tool_call cache) identically to
         AcpClient. Records the advertised optionIds so approve/reject echo them.
         """
+        _perm_params = msg.params if isinstance(msg.params, dict) else {}
         event, recorded = build_permission_event(
             msg,
             tool_input_cache=self._tool_call_inputs,
@@ -2401,9 +2814,24 @@ class AcpSessionHandle:
             raw_params_cache=self._tool_call_raw_params,
             mcp_server_name_cache=self._tool_call_mcp_server,
             tool_name_cache=self._tool_call_tool_name,
+            # ORIGIN-BOUND provenance: cache entries are keyed by the
+            # emitting frame's sessionId, so a child cannot replay a consumed
+            # parent toolCallId to inherit trusted params for a different
+            # operation, while same-origin repeat frames still resolve.
+            cache_scope=str(_perm_params.get("sessionId") or self._session_id),
         )
         if recorded is not None and event.request_id != "":
             self._permission_options[event.request_id] = recorded
+        # A frame the runtime routed here for a backend-internal subagent
+        # carries the CHILD's sessionId, not this handle's. Mark the origin so
+        # the policy consumer can tell reduced-fidelity requests apart. Child
+        # tool_call/refinement frames ARE routed into the caches above (same
+        # parser as slot-owned frames), so a well-behaved child carries full
+        # structured context; the low-fidelity downgrade applies only when the
+        # provenance flags say the context never arrived (frame race, drop).
+        frame_sid = str((msg.params or {}).get("sessionId") or "")
+        if frame_sid and frame_sid != self._session_id:
+            event.sub_session_id = frame_sid
         return event
 
     def _handle_kas_update(self, session_update: str, update: dict) -> list[AcpEvent] | None:
@@ -2451,43 +2879,46 @@ class AcpSessionHandle:
         are KAS's mid-turn steer echo (kiro-cli: ``session/update`` steer
         discriminants, handled by the "steer" action).
         """
-        meta = update.get("_meta")
-        kiro = meta.get("kiro") if isinstance(meta, dict) else None
-        if not isinstance(kiro, dict):
+        kiro = kas_wire.kiro_meta(update)
+        if kiro is None:
             return []
-        kind = kiro.get("kind")
-        if kind == "context_usage":
-            self._apply_kas_context_pct(kiro.get("usagePercentage"))
+        kind = kiro.get(kas_wire.FIELD_KIND)
+        if kind == kas_wire.KIND_CONTEXT_USAGE:
+            self._apply_kas_context_pct(kiro.get(kas_wire.FIELD_USAGE_PERCENTAGE))
             return []
-        if kind == "turn_completion":
+        if kind == kas_wire.KIND_TURN_COMPLETION:
             self._apply_kas_turn_completion(kiro)
             return []
-        if kind in ("summarization_started", "summarization_completed", "summarization_failed"):
-            if kind == "summarization_completed":
+        if kind in kas_wire.SUMMARIZATION_KINDS:
+            if kind == kas_wire.KIND_SUMMARIZATION_COMPLETED:
                 # Pre-compaction counts no longer describe the session — drop
                 # them so the meter resets and fresh telemetry re-derives real
                 # numbers (parity with the kiro-cli compaction handler).
                 self.last_prompt_stats.reset_after_compaction()
                 status_type = "completed"
-            elif kind == "summarization_failed":
+            elif kind == kas_wire.KIND_SUMMARIZATION_FAILED:
                 status_type = "failed"
             else:
                 status_type = "started"
             # conversationSummary is backend-echoed, LLM-influenced text that
             # reaches the dashboard — redact exfil URLs/credentials first.
-            summary = redact_text(str(kiro.get("conversationSummary", "") or ""))
+            summary = redact_text(str(kiro.get(kas_wire.FIELD_CONVERSATION_SUMMARY, "") or ""))
             return [AcpEvent(kind=EVENT_COMPACTION_STATUS, text=status_type, title=summary)]
-        if kind in ("steering_queued", "steering_injected", "steering_cleared"):
+        if kind in kas_wire.STEERING_KINDS:
             # KAS mid-turn steer echo. kiro-cli sends these as `session/update`
             # discriminants (handled by the "steer" action); KAS instead puts the
             # kind under `_meta.kiro`, so route it here. `injected` is the
             # settling signal (→ EVENT_STEER_CONSUMED, which _settle_consumed_steers
             # consumes); queued/cleared mirror the kiro path. Never trust
             # backend-echoed steer text — redact before it reaches any surface.
-            if kind == "steering_cleared":
+            if kind == kas_wire.KIND_STEERING_CLEARED:
                 return [AcpEvent(kind=EVENT_STEER_CLEARED)]
-            text = redact_text(str(kiro.get("content") or ""))
-            steer_kind = EVENT_STEER_CONSUMED if kind == "steering_injected" else EVENT_STEER_QUEUED
+            text = redact_text(str(kiro.get(kas_wire.FIELD_CONTENT) or ""))
+            steer_kind = (
+                EVENT_STEER_CONSUMED
+                if kind == kas_wire.KIND_STEERING_INJECTED
+                else EVENT_STEER_QUEUED
+            )
             return [AcpEvent(kind=steer_kind, text=text)]
         return []
 
@@ -2499,25 +2930,24 @@ class AcpSessionHandle:
         a child nested tool or an ordinary frame that should fall through to the
         shared parser (so caches populate and tool events render).
         """
-        meta = update.get("_meta")
-        kiro = meta.get("kiro") if isinstance(meta, dict) else None
-        if not isinstance(kiro, dict):
+        kiro = kas_wire.kiro_meta(update)
+        if kiro is None:
             return None
 
-        agent_subtask_id = kiro.get("agentSubtaskId")
-        pipeline = kiro.get("pipeline")
+        agent_subtask_id = kiro.get(kas_wire.FIELD_AGENT_SUBTASK_ID)
+        pipeline = kiro.get(kas_wire.FIELD_PIPELINE)
 
         if not agent_subtask_id and not pipeline:
             return None
 
         # Pipeline frame: one entry per stage.
         if isinstance(pipeline, dict):
-            stages = pipeline.get("stages")
+            stages = pipeline.get(kas_wire.FIELD_STAGES)
             if isinstance(stages, list):
                 for stage in stages:
                     if not isinstance(stage, dict):
                         continue
-                    s_id = stage.get("agentSubtaskId")
+                    s_id = stage.get(kas_wire.FIELD_AGENT_SUBTASK_ID)
                     if not isinstance(s_id, str) or not s_id:
                         continue
                     s_status = str(stage.get("status") or "in_progress")
@@ -2535,7 +2965,7 @@ class AcpSessionHandle:
             )]
 
         # Individual agent-subtask frame (kind == "agent-subtask") → PARENT.
-        is_parent = kiro.get("kind") == "agent-subtask"
+        is_parent = kiro.get(kas_wire.FIELD_KIND) == kas_wire.KIND_AGENT_SUBTASK
 
         if is_parent:
             subtask_id = str(agent_subtask_id)
@@ -2566,15 +2996,17 @@ class AcpSessionHandle:
         Returns a list when the chunk belongs to a child sub-agent, else None
         (fall through to normal chunk handling).
         """
-        meta = update.get("_meta")
-        kiro = meta.get("kiro") if isinstance(meta, dict) else None
-        if not isinstance(kiro, dict):
+        kiro = kas_wire.kiro_meta(update)
+        if kiro is None:
             return None
-        subtask_id = kiro.get("agentSubtaskId")
+        subtask_id = kiro.get(kas_wire.FIELD_AGENT_SUBTASK_ID)
         if not isinstance(subtask_id, str) or not subtask_id:
             return None
         # Must NOT have kind:"agent-subtask" or pipeline — those are parent frames
-        if kiro.get("kind") == "agent-subtask" or kiro.get("pipeline"):
+        if (
+            kiro.get(kas_wire.FIELD_KIND) == kas_wire.KIND_AGENT_SUBTASK
+            or kiro.get(kas_wire.FIELD_PIPELINE)
+        ):
             return None
         text, _thinking = parse_text_chunk(update)
         if not text or _thinking:
@@ -2595,11 +3027,10 @@ class AcpSessionHandle:
         activity attribution is emitted BEFORE the tool events from
         ``parse_session_update``.
         """
-        meta = update.get("_meta")
-        kiro = meta.get("kiro") if isinstance(meta, dict) else None
-        if not isinstance(kiro, dict):
+        kiro = kas_wire.kiro_meta(update)
+        if kiro is None:
             return []
-        subtask_id = kiro.get("agentSubtaskId")
+        subtask_id = kiro.get(kas_wire.FIELD_AGENT_SUBTASK_ID)
         if not isinstance(subtask_id, str) or not subtask_id:
             return []
         tool_call_id = str(update.get("toolCallId") or "")
@@ -2616,21 +3047,15 @@ class AcpSessionHandle:
     def _apply_kas_context_pct(self, pct: object) -> None:
         """Apply a KAS ``context_usage`` percentage to the context meter.
 
-        Mirrors ``_track_metadata``'s pct path: a real ``usage_update`` is
-        authoritative (``context_tokens_from_usage``) and must not be clobbered,
-        and the value is sanitized to a real [0, 100] before use.
+        A real ``usage_update`` is authoritative (``context_tokens_from_usage``)
+        and must not be clobbered. ``sanitize_pct`` (shared with the kiro-cli
+        metadata path) clamps NaN/±inf/out-of-range and returns None when the
+        value is absent or unparseable, so malformed telemetry degrades to
+        "no reading" rather than aborting the active turn.
         """
-        if pct is None or self.last_prompt_stats.context_tokens_from_usage:
+        pct_f = self.last_prompt_stats.sanitize_pct(pct)
+        if pct_f is None or self.last_prompt_stats.context_tokens_from_usage:
             return
-        try:
-            pct_f = float(pct)  # type: ignore[arg-type]
-        except (TypeError, ValueError, OverflowError):
-            # OverflowError: a JSON integer beyond float range (int->float
-            # conversion) — malformed telemetry must degrade to "absent", never
-            # abort the active turn's dispatch.
-            return
-        # NaN is caught by self-inequality; ±inf/out-of-range are clamped.
-        pct_f = 0.0 if pct_f != pct_f else min(max(pct_f, 0.0), 100.0)
         self.last_prompt_stats.context_pct = pct_f
         self.last_prompt_stats.note_pct_reported()
         self._backfill_context_window(pct_f)
@@ -2638,27 +3063,17 @@ class AcpSessionHandle:
     def _apply_kas_turn_completion(self, kiro: dict) -> None:
         """Set per-turn credits from a KAS ``turn_completion`` frame.
 
-        ``promptTurnSummaries`` entries are ``{usage, unit, unitPlural}``; only
-        ``unit == "credit"`` contributes, mirroring the kiro-cli ``meteringUsage``
-        credit sum (value validation shared via ``_token_count``). The acp
-        provider bills in credits.
-
-        The frame carries the whole turn's summary, so the total is ASSIGNED, not
-        accumulated: a duplicate or resume-replayed ``turn_completion`` reports
-        the same total and must not inflate the displayed cost. A malformed frame
-        (no summaries list) leaves the prior value untouched rather than zeroing.
+        Delegates the ``promptTurnSummaries`` credit sum (only ``unit ==
+        "credit"`` entries count; the acp provider bills in credits) to
+        ``kas_wire.turn_credits``. The frame carries the whole turn's summary, so
+        the total is ASSIGNED, not accumulated: a duplicate or resume-replayed
+        ``turn_completion`` reports the same total and must not inflate the
+        displayed cost. A malformed frame (``turn_credits`` returns ``None``)
+        leaves the prior value untouched rather than zeroing.
         """
-        summaries = kiro.get("promptTurnSummaries")
-        if not isinstance(summaries, list):
-            return
-        total = 0.0
-        for entry in summaries:
-            if not isinstance(entry, dict) or entry.get("unit") != "credit":
-                continue
-            value = _token_count(entry.get("usage"))
-            if value is not None:
-                total += float(value)
-        self.last_prompt_stats.credits = total
+        total = kas_wire.turn_credits(kiro)
+        if total is not None:
+            self.last_prompt_stats.credits = total
 
     def _handle_update(self, msg: JsonRpcMessage) -> list[AcpEvent]:
         """Process a session/update notification and return events."""
@@ -2666,6 +3081,51 @@ class AcpSessionHandle:
         update = params.get("update") or {}
         if not isinstance(update, dict):
             return []
+
+        # A frame the runtime routed here for a backend-internal subagent
+        # carries the CHILD's sessionId. Its tool_call/refinement updates are
+        # parsed with the SAME shared parser and the SAME per-toolCallId
+        # caches as this handle's own tool calls — that is what gives a later
+        # child permission request real command bytes (tool_input, is_shell,
+        # raw params), so the policy gates evaluate it with main-agent
+        # fidelity instead of the LLM-authored title. The parsed events are
+        # re-tagged as subagent activity (crew monitor), NOT emitted as this
+        # session's own transcript events — a child's text chunks and tool
+        # cards must not render as parent output.
+        frame_sid = str(params.get("sessionId") or "")
+        if frame_sid and frame_sid != self._session_id:
+            child_events = parse_session_update(
+                update,
+                tool_input_cache=self._tool_call_inputs,
+                shell_cache=self._tool_call_is_shell,
+                raw_params_cache=self._tool_call_raw_params,
+                mcp_server_name_cache=self._tool_call_mcp_server,
+                tool_name_cache=self._tool_call_tool_name,
+                cache_scope=frame_sid,
+            )
+            out: list[AcpEvent] = []
+            for ev in child_events:
+                if ev.kind == EVENT_TOOL_CALL and ev.tool_call_id:
+                    out.append(
+                        AcpEvent(
+                            kind=EVENT_SUBAGENT_ACTIVITY,
+                            sub_session_id=frame_sid,
+                            tool_call_id=ev.tool_call_id,
+                            title=ev.title,
+                        )
+                    )
+                elif ev.kind == EVENT_TEXT_CHUNK and ev.text:
+                    out.append(
+                        AcpEvent(
+                            kind=EVENT_SUBAGENT_ACTIVITY,
+                            sub_session_id=frame_sid,
+                            text=ev.text,
+                        )
+                    )
+                # Thinking chunks, tool results, and refinements update the
+                # caches above but emit nothing: the crew monitor only shows
+                # coarse activity, and the caches are the security payload.
+            return out
 
         session_update = update.get("sessionUpdate", "")
 
@@ -2736,6 +3196,7 @@ class AcpSessionHandle:
                         raw_params_cache=self._tool_call_raw_params,
                         mcp_server_name_cache=self._tool_call_mcp_server,
                         tool_name_cache=self._tool_call_tool_name,
+                        cache_scope=self._session_id,
                     )
                     return _child_prefix
             if session_update == "agent_message_chunk":
@@ -2756,6 +3217,7 @@ class AcpSessionHandle:
             raw_params_cache=self._tool_call_raw_params,
             mcp_server_name_cache=self._tool_call_mcp_server,
             tool_name_cache=self._tool_call_tool_name,
+            cache_scope=self._session_id,
         )
         for ev in events:
             if ev.kind == EVENT_TEXT_CHUNK:
@@ -2765,7 +3227,12 @@ class AcpSessionHandle:
                 self._stale_eligible = False
                 self._tool_dispatched = True
                 # Attribution snapshot for the liveness oracle: title + the
-                # already-redacted input + dispatch time + the trusted shell
+                # already-redacted input + dispatch time on BOTH clocks (monotonic
+                # for elapsed spans, boot for dating a child process against this
+                # dispatch) + the parking this turn has banked so far, which
+                # bounds how far this stamp can lag the runtime's actual spawn
+                # (the park is banked when the consumer returns, i.e. before this
+                # frame is processed, so it is complete here) + the trusted shell
                 # flag. A new dispatch retires the oracle so its tracked child
                 # and counter samples never bleed across tools — including from a
                 # walk still running against the previous tool's command.
@@ -2773,6 +3240,8 @@ class AcpSessionHandle:
                     title=ev.title,
                     command=ev.tool_input,
                     dispatch_ts=time.monotonic(),
+                    dispatch_boot_ts=boottime_now(),
+                    dispatch_parked_secs=self._parked_total,
                     is_shell=ev.is_shell,
                     tool_name=ev.tool_name,
                 )

@@ -482,6 +482,7 @@ async def run_remote_kirocrew(
     remote_bin: str = "",
     marker_port: int | None = None,
     timeout_secs: float = 60.0,
+    connect_timeout_secs: float = 10.0,
 ) -> tuple[int, str]:
     """Run ``kirocrew <subcommand>`` on *ssh_host* over SSH.
 
@@ -495,11 +496,21 @@ async def run_remote_kirocrew(
     (same fix as token mint), instead of the blind PATH candidate search. This
     is what makes the dashboard "restart remote" action work on a host whose
     ``~/.local/bin/kirocrew`` points at an uninstalled worktree.
+
+    *connect_timeout_secs* — this is the same one-shot ssh-exec shape as
+    :func:`mint_remote_token`, so it pays the same proxy handshake cost on
+    CONNECT (OpenSSH >= 8.6 counts banner/KEX against ``ConnectTimeout``).
+    Callers should pass the resolved ``instances.mint_timeout_secs`` budget
+    rather than leaving the 10s fail-fast default, or a restart on a
+    slow-proxy host fails on the connect even after the user tuned the
+    tunable for exactly this. Independent of *timeout_secs* (the overall
+    wait_for budget): the outer wait_for is still the ultimate bound
+    regardless of what ``ConnectTimeout`` allows internally.
     """
     remote_command = build_remote_command(
         remote_bin, subcommand, marker_port=_validate_port(marker_port)
     )
-    argv = _build_ssh_argv(ssh_host, remote_command)
+    argv = _build_ssh_argv(ssh_host, remote_command, connect_timeout_secs=connect_timeout_secs)
     logger.info("Running 'kirocrew %s' on %s", subcommand, ssh_host)
     try:
         proc = await asyncio.create_subprocess_exec(

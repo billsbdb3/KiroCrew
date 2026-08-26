@@ -6,6 +6,7 @@ import { AlertTriangle, ArrowLeft, Globe, Copy, ExternalLink, RefreshCw, Trash2,
 import type { Artifact } from '../types'
 import { PageHeader, Card, CardTitle, StatCard, Btn, Input, Toggle , Badge} from '../components/ui'
 import SimpleSelect from '../components/SimpleSelect'
+import { useConfirm } from '../components/ConfirmDialog'
 import PublicPublishAckModal from '../components/PublicPublishAckModal'
 import InfoTip from '../components/InfoTip'
 import { safeHttpUrl } from '../lib/safeUrl'
@@ -37,6 +38,7 @@ const linkBtn: React.CSSProperties = { background: 'transparent', color: 'var(--
 
 export default function ArtifactDeployPage() {
   const qc = useQueryClient()
+  const { confirm, confirmDialog } = useConfirm()
   const [reach, setReach] = useState<Reach | null>(null)
   const [policy, setPolicy] = useState('')
   const [boundaryPolicy, setBoundaryPolicy] = useState('')
@@ -163,7 +165,11 @@ export default function ArtifactDeployPage() {
       const prev = await jsend<any>('/recall', { site_id: s.site_id, profile: s.profile || '' })
       if (prev.status !== 200) throw new Error(prev.data?.error || `Recall preview failed (${prev.status})`)
       const r = prev.data.resources || {}
-      const ok = window.confirm(i18nT('pages.artifactDeployPage.recall_confirm', { name: s.site_id, bucket: r.bucket || '?' }))
+      const ok = await confirm({
+        title: i18nT('pages.artifactDeployPage.recall_title'),
+        body: i18nT('pages.artifactDeployPage.recall_confirm', { name: s.site_id, bucket: r.bucket || '?' }),
+        confirmLabel: i18nT('pages.artifactDeployPage.recall_button'),
+      })
       if (!ok) return { status: 0, data: { cancelled: true } }
       return jsend<any>('/recall', {
         site_id: s.site_id, confirm: true, profile: s.profile || '',
@@ -187,7 +193,11 @@ export default function ArtifactDeployPage() {
       const prev = await jsend<any>('/destroy', { site_id: s.site_id, profile: s.profile || '' })
       if (prev.status !== 200) throw new Error(prev.data?.error || `Destroy preview failed (${prev.status})`)
       const r = prev.data.resources || {}
-      const ok = window.confirm(i18nT('pages.artifactDeployPage.destroy_confirm', { name: s.site_id, bucket: r.bucket || '?', distribution: r.distribution_id || '?' }))
+      const ok = await confirm({
+        title: i18nT('pages.artifactDeployPage.destroy_title'),
+        body: i18nT('pages.artifactDeployPage.destroy_confirm', { name: s.site_id, bucket: r.bucket || '?', distribution: r.distribution_id || '?' }),
+        confirmLabel: i18nT('pages.artifactDeployPage.destroy_button'),
+      })
       if (!ok) return { status: 0, data: { cancelled: true } }
       return jsend<any>('/destroy', {
         site_id: s.site_id, confirm: true, profile: s.profile || '',
@@ -228,7 +238,7 @@ export default function ArtifactDeployPage() {
     <>
       {/* Deploy is a sub-surface of Artifacts: always give the way
           back to the gallery so the console never feels like a dead end. */}
-      <div className="px-6 pt-2">
+      <div className="px-4 md:px-6 pt-2">
         <button
           type="button"
           onClick={() => navigate('/artifacts')}
@@ -240,7 +250,7 @@ export default function ArtifactDeployPage() {
         </button>
       </div>
       <PageHeader title={i18nT('pages.artifactDeployPage.artifact_deploy')} subtitle={i18nT('pages.artifactDeployPage.one_console_for_deploying_artifacts_to_your_own')} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0" style={{ color: 'var(--text)' }}>
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0" style={{ color: 'var(--text)' }}>
 
       {/* Cloud deployment withheld: the PROVISIONING half of this console is
           hidden below, but the deployments table and its recall/destroy actions
@@ -403,7 +413,13 @@ export default function ArtifactDeployPage() {
                     <span style={{ display: 'flex', gap: 6 }}>
                       <Btn onClick={() => verify.mutate(p.name)}><ShieldCheck size={11} /> {i18nT('pages.artifactDeployPage.verify')}</Btn>
                       <Btn aria-label={i18nT('pages.artifactDeployPage.remove_from_registry', { name: p.name })}
-                        onClick={() => window.confirm(i18nT('pages.artifactDeployPage.remove_profile_confirm', { name: p.name })) && removeProfile.mutate(p.name)}>
+                        onClick={async () => {
+                          if (await confirm({
+                            title: i18nT('pages.artifactDeployPage.remove_profile_title'),
+                            body: i18nT('pages.artifactDeployPage.remove_profile_confirm', { name: p.name }),
+                            confirmLabel: i18nT('pages.artifactDeployPage.remove_profile_button'),
+                          })) removeProfile.mutate(p.name)
+                        }}>
                         <Trash2 size={11} /> {i18nT('pages.artifactDeployPage.remove')}
                       </Btn>
                     </span>
@@ -633,6 +649,7 @@ export default function ArtifactDeployPage() {
         )}
       </Card>
       </div>
+      {confirmDialog}
     </>
   )
 }

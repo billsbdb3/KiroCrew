@@ -15,6 +15,7 @@ from pathlib import Path
 from kiro_crew.acp.client import AcpError, AcpTimeoutError
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
+    CONTEXT_WARN_MARGIN_PCT,
     ConfigReadError,
     build_provider_factory,
     config_path,
@@ -162,8 +163,6 @@ async def _interactive(provider: LLMProvider, cfg: KiroCrewConfig) -> None:
 
     print("Type your message (Ctrl+D or 'exit' to quit)\n")
 
-    prompt_count = 0
-
     while True:
         try:
             message = input("you> ").strip()
@@ -178,11 +177,14 @@ async def _interactive(provider: LLMProvider, cfg: KiroCrewConfig) -> None:
             break
 
         await _send_and_print(provider, message)
-        prompt_count += 1
 
         # Check context usage — compact and restart if needed
         pct = provider.context_usage_pct()
         needs_compact = pct >= cfg.session.autocompact_pct
+        # Warn one margin BELOW the compaction point. An absolute warn level
+        # would be dead code here: the compact arm is tested first and claims
+        # the whole range above the configured threshold.
+        warn_at = cfg.session.autocompact_pct - CONTEXT_WARN_MARGIN_PCT
 
         if needs_compact:
             reason = f"context at {pct:.0f}%"
@@ -193,8 +195,7 @@ async def _interactive(provider: LLMProvider, cfg: KiroCrewConfig) -> None:
                 pass
             await provider.shutdown()
             await provider.start()
-            prompt_count = 0
-        elif pct >= 75.0:
+        elif warn_at > 0 and pct >= warn_at:
             print(f"\n⚠️  Context at {pct:.0f}%", file=sys.stderr)
 
         print()

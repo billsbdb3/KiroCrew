@@ -310,7 +310,9 @@ class TestReadPathsLocked:
                     svc.get_job(jid)
                 await asyncio.sleep(0)
 
-        remove_task = asyncio.create_task(svc.remove_jobs(ids[::2]))
+        remove_task = asyncio.create_task(
+            svc.remove_jobs(ids[::2], actor="test", source="test")
+        )
         read_tasks = [asyncio.create_task(reader()) for _ in range(4)]
         await asyncio.gather(remove_task, *read_tasks)
 
@@ -804,7 +806,7 @@ class TestMutatorContract:
             with pytest.raises(CronStoreBusy):
                 svc.update_job(existing.id, name="renamed")
             with pytest.raises(CronStoreBusy):
-                svc.remove_job(existing.id)
+                svc.remove_job(existing.id, actor="test", source="test")
             with pytest.raises(CronStoreBusy):
                 svc.enable_job(existing.id, enabled=False)
             with pytest.raises(CronStoreBusy):
@@ -835,7 +837,7 @@ class TestMutatorContract:
 
             async def ticker() -> None:
                 nonlocal ticks
-                for _ in range(5):
+                while True:
                     await asyncio.sleep(0.02)
                     ticks += 1
 
@@ -846,15 +848,25 @@ class TestMutatorContract:
                 with pytest.raises(CronStoreBusy):
                     await svc.update_job_async(job.id, name="renamed")
                 with pytest.raises(CronStoreBusy):
-                    await svc.remove_job_async(job.id)
+                    await svc.remove_job_async(job.id, actor="test", source="test")
                 with pytest.raises(CronStoreBusy):
                     await svc.enable_job_async(job.id, enabled=False)
+                # Sampled while the lock is still held, BEFORE the ticker is
+                # stopped: reading it afterwards would count ticks that ran once
+                # the mutators had returned, so the assertion would hold even for
+                # a mutator that parked the loop outright.
+                ticks_while_contended = ticks
             finally:
+                tick_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await tick_task
                 platform_compat.release_lock(holder.fileno())
                 holder.close()
-                await tick_task
             # The event loop advanced its other task while mutators waited.
-            assert ticks == 5
+            assert ticks_while_contended >= 1, (
+                "event loop parked while the contended mutators waited "
+                f"(ticks={ticks_while_contended})"
+            )
 
         asyncio.run(scenario())
 
@@ -869,7 +881,7 @@ class TestMutatorContract:
             assert await svc.enable_job_async(job.id, enabled=False) is True
             assert await svc.ack_job_async(job.id, "note") is True
             assert await svc.unack_job_async(job.id) is True
-            assert await svc.remove_job_async(job.id) is True
+            assert await svc.remove_job_async(job.id, actor="test", source="test") is True
             assert svc.get_job(job.id) is None
 
         asyncio.run(scenario())
@@ -932,7 +944,7 @@ class TestMergeResultOffLoop:
 
         async def ticker() -> None:
             nonlocal ticks
-            for _ in range(5):
+            while True:
                 await asyncio.sleep(0.02)
                 ticks += 1
 
@@ -944,13 +956,20 @@ class TestMergeResultOffLoop:
             # _run_job_isolated swallows it (best-effort) and completes without
             # ever parking the loop.
             await svc._run_job_isolated(job)
-            await tick_task
+            # Sampled before the ticker is stopped: counting ticks that ran after
+            # the merge returned would hold even for a merge that parked the loop.
+            ticks_during_merge = ticks
         finally:
+            tick_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await tick_task
             platform_compat.release_lock(holder.fileno())
             holder.close()
 
         assert merged_off_loop["ok"], "merge must run off the event loop (to_thread)"
-        assert ticks == 5, "the event loop must keep ticking while the merge waits"
+        assert ticks_during_merge >= 1, (
+            f"the event loop must keep ticking while the merge waits (ticks={ticks_during_merge})"
+        )
 
     @pytest.mark.asyncio
     async def test_merge_result_persists_uncontended(self, tmp_path: Path) -> None:
@@ -1228,7 +1247,7 @@ class TestTerminalStateMergeLocked:
 
         async def ticker() -> None:
             nonlocal ticks
-            for _ in range(5):
+            while True:
                 await asyncio.sleep(0.02)
                 ticks += 1
 
@@ -1239,13 +1258,20 @@ class TestTerminalStateMergeLocked:
             # The merge raises CronStoreBusy inside to_thread (store contended);
             # _force_reap swallows it (best-effort) and never parks the loop.
             await svc._force_reap(job.id, 5.0, 1)
-            await tick_task
+            # Sampled before the ticker is stopped: counting ticks that ran after
+            # the reap returned would hold even for a reap that parked the loop.
+            ticks_during_merge = ticks
         finally:
+            tick_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await tick_task
             platform_compat.release_lock(holder.fileno())
             holder.close()
 
         assert merged_off_loop["ok"], "terminal merge must run off the event loop"
-        assert ticks == 5, "the event loop must keep ticking while the merge waits"
+        assert ticks_during_merge >= 1, (
+            f"the event loop must keep ticking while the merge waits (ticks={ticks_during_merge})"
+        )
 
 
 def _bounded_lock(svc: CronService):  # type: ignore[no-untyped-def]

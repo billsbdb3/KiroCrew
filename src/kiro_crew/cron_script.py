@@ -38,7 +38,9 @@ from typing import TYPE_CHECKING, Any
 from kiro_crew import platform_compat
 from kiro_crew.config.loader import config_dir, read_local_secret
 from kiro_crew.config.paths import kiro_agents_dir
+from kiro_crew.github_runner import prevalidated_gh_env
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.port_resolution import resolve_serving_port
 from kiro_crew.sandbox import (
     _AGENT_DENIED_ENV_KEYS,
     SandboxUnavailableError,
@@ -198,6 +200,36 @@ def _kill_proc_group(proc: subprocess.Popen) -> None:
         pass
 
 
+def _drain_after_kill(proc: subprocess.Popen, job_id: str | None) -> None:
+    """Reap a SIGKILLed child's pipes without leaking fds or hijacking the result.
+
+    ``communicate(timeout=5)`` can ITSELF raise ``TimeoutExpired``: the child
+    outlived the group kill (uninterruptible I/O, or no pgid resolved so only
+    ``proc.kill()`` was tried), or another process inherited the write end of
+    the pipe and holds it open, so EOF never arrives. Waiting longer cannot help
+    once SIGKILL has been sent, and the caller has already decided the outcome —
+    so swallow that one exception rather than letting it displace the caller's
+    ``raise`` / ``return``. Closing the pipes has to happen either way:
+    ``Popen._communicate`` closes them as a side effect of reaching EOF, which
+    is exactly the path not taken here, and nothing else ever closes them.
+    """
+    try:
+        proc.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Post-kill drain timed out (5s) for cron %s (pid %s); the child "
+            "outlived SIGKILL or another process holds the pipe — closing pipes",
+            job_id, proc.pid,
+        )
+    finally:
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+
 if TYPE_CHECKING:
     from kiro_crew.cron import CronJob
 
@@ -247,7 +279,14 @@ class ScriptContext:
     _secret: str = ""
 
     def __post_init__(self) -> None:
-        self._port = int(os.environ.get("KIROCREW_PORT", "5476"))
+        # The parent injects the port it minted the credential for. Preferring it
+        # keeps credential and dial target from one resolution; KIROCREW_PORT is the
+        # fallback for a directly-constructed context and is 5476 on a --port auto
+        # gateway, which is a SIBLING rather than this instance.
+        self._port = int(
+            os.environ.pop("_KIROCREW_DIAL_PORT", "")
+            or os.environ.get("KIROCREW_PORT", "5476")
+        )
         # Secret injected via temp file (not inherited env) to prevent privilege escalation.
         # Pop env var and unlink file immediately so fn(ctx) cannot access the secret directly.
         secret_file = os.environ.pop("_KIROCREW_SECRET_FILE", "")
@@ -548,17 +587,46 @@ def resolve_script_path(script_path: str) -> tuple[str, str]:
     return str(file_path), func_name
 
 
-def _resolve_internal_secret() -> str:
+def _resolve_internal_secret(port: int) -> str:
     """Internal secret for ScriptContext HTTP calls (e.g. notify -> /api/send-message).
 
-    The gateway generates its secret at startup and writes it to
-    ``config_dir()/.local_secret``; the ``KIROCREW_INTERNAL_SECRET`` env var is
-    normally unset, so fall back to the file via the shared
-    ``config.loader.read_local_secret`` helper (single home for that read).
-    Without this the sandbox sends an empty ``X-Internal-Secret`` and every
-    code-cron notify gets HTTP 403.
+    The gateway generates its secret at startup and publishes it per listener as
+    ``run/gateway-<port>.secret`` (with ``config_dir()/.local_secret`` as the
+    home-wide fallback); the ``KIROCREW_INTERNAL_SECRET`` env var is normally unset,
+    so fall back to the file via the shared ``config.loader.read_local_secret``
+    helper (single home for that read). Without this the sandbox sends an empty
+    ``X-Internal-Secret`` and every code-cron notify gets HTTP 403.
+
+    Takes the ALREADY-RESOLVED dial port rather than resolving its own. The caller
+    resolves the port ONCE and passes the same value here and into
+    ``_KIROCREW_DIAL_PORT``. Resolving twice -- once for the credential, once for the
+    child -- is a TOCTOU: a ``--port auto`` gateway that binds between the two calls
+    would mint the credential for one port and tell the child to dial another, and
+    the mismatched credential 403s the callback. One resolution makes that
+    unrepresentable, which is what the ``_KIROCREW_DIAL_PORT`` mechanism promised.
     """
-    return os.environ.get("KIROCREW_INTERNAL_SECRET", "") or read_local_secret()
+    env_secret = os.environ.get("KIROCREW_INTERNAL_SECRET", "")
+    if env_secret:
+        return env_secret
+    return read_local_secret(port)
+
+
+def _resolve_dial_port() -> int:
+    """The ONE port this cron dials, used for both the credential and the child.
+
+    The parent mints the credential and the child sends it, so a second independent
+    resolution in the child is exactly how the two diverge: ``ScriptContext`` reads
+    ``KIROCREW_PORT``, which is 5476 on a ``--port auto`` gateway, while the parent
+    would have minted for the real ephemeral port -- credential for one gateway,
+    request to another. One resolution, injected as ``_KIROCREW_DIAL_PORT``, makes
+    that mismatch unrepresentable.
+
+    Delegates to :func:`resolve_serving_port`, the shared gateway-side resolver that
+    prefers ``KIROCREW_BOUND_PORT`` over an inherited ``KIROCREW_PORT`` -- the cron
+    scheduler runs inside the gateway, so the bound port is ground truth and a
+    sibling-naming ``KIROCREW_PORT`` must not win.
+    """
+    return resolve_serving_port()
 
 
 def run_script_sandboxed(
@@ -607,6 +675,11 @@ def run_script_sandboxed(
 
     fd, launcher_path = tempfile.mkstemp(suffix=".py", prefix="kirocrew_cron_")
     sandbox_cleanup: str | None = None
+    # Resolve the dial port ONCE: the credential written below and the
+    # _KIROCREW_DIAL_PORT the child dials must come from the same resolution, or a
+    # --port auto bind between two resolutions would pair a credential with the
+    # wrong port and 403 the callback.
+    dial_port = _resolve_dial_port()
     # Write secret to temp file for ScriptContext (scrubbed from env)
     secret_fd, secret_path = tempfile.mkstemp(prefix="kirocrew_secret_")
     try:
@@ -624,7 +697,7 @@ def run_script_sandboxed(
             # unlinks the secret + launcher (otherwise the fd leaks and temp
             # files persist).
             platform_compat.restrict_to_owner(secret_path)
-            os.write(secret_fd, _resolve_internal_secret().encode())
+            os.write(secret_fd, _resolve_internal_secret(dial_port).encode())
         finally:
             os.close(secret_fd)
         try:
@@ -639,6 +712,15 @@ def run_script_sandboxed(
         # are never inherited; the internal secret is passed via the 0600 file.
         clean_env = _clean_cron_env()
         clean_env["_KIROCREW_SECRET_FILE"] = secret_path
+        # The child must dial the gateway the credential above was minted for:
+        # same dial_port, resolved once above, not a second resolution here.
+        clean_env["_KIROCREW_DIAL_PORT"] = str(dial_port)
+        # Pre-resolve gh OUTSIDE the sandbox and pin its identity for the
+        # child: the sandbox's single-uid user namespace maps every root-owned
+        # path component to the overflow uid, so the child's own ownership
+        # walk refuses ANY gh on the host. Empty when the host has no usable
+        # gh -- scripts that never call gh are unaffected either way.
+        clean_env.update(prevalidated_gh_env())
 
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
         proc = popen_limited(
@@ -653,7 +735,7 @@ def run_script_sandboxed(
                 # Popen.communicate does not kill the child on timeout
                 # (unlike subprocess.run) — clean up before re-raising.
                 _kill_proc_group(proc)
-                proc.communicate(timeout=5)
+                _drain_after_kill(proc, job_id)
                 raise
         finally:
             cancelled = _unregister_proc(job_id, proc)
@@ -661,8 +743,25 @@ def run_script_sandboxed(
             return {"status": "cancelled", "error": "Cancelled by user"}
 
         if proc.returncode != 0 and not stdout.strip():
-            error_text = stderr[:500] or f"exit {proc.returncode}"
-            error_text = redact(error_text)
+            # Report the TERMINAL stderr context, not the head. A process that
+            # dies hard leaves its diagnosis LAST -- the traceback is the final
+            # thing written -- while whatever a startup path logged first (a
+            # data-home migration warning, a deprecation notice, an import
+            # banner) sits in front of it. Bounding from the head therefore
+            # reports the noise and truncates the cause, and the operator reads
+            # a cron failure whose message describes something that did not kill
+            # the job.
+            #
+            # ``rstrip`` first so a trailing newline does not spend part of the
+            # budget, and so an all-whitespace stderr still falls through to the
+            # exit-code fallback rather than reporting blank text.
+            #
+            # Redact the WHOLE stream before bounding: slicing first would cut
+            # a credential that straddles the 500-char boundary in half, and
+            # ``redact`` cannot recognise the surviving fragment, so it would
+            # reach logs and the persisted ``last_error`` unmasked.
+            tail = redact(stderr.rstrip())
+            error_text = tail[-500:] if tail else f"exit {proc.returncode}"
             return {"status": "error", "error": error_text}
 
         try:
@@ -670,7 +769,10 @@ def run_script_sandboxed(
         except (json.JSONDecodeError, IndexError):
             return {
                 "status": "error",
-                "error": f"Bad output: {redact(stdout[:200])}",
+                # Redact the complete stdout BEFORE truncating: slicing first
+                # could cut a credential at the boundary, leaving its unredacted
+                # head in the diagnostic.
+                "error": f"Bad output: {redact(stdout)[:200]}",
             }
     except subprocess.TimeoutExpired:
         return {"status": "error", "error": f"Script timed out after {timeout}s"}
@@ -848,7 +950,7 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
                 output, stderr_out = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
                 _kill_proc_group(proc)
-                proc.communicate(timeout=5)
+                _drain_after_kill(proc, job_id)
                 return {"status": "error", "output": f"❌ Command timed out after {timeout}s", "exit_code": -1}
         finally:
             if job_id:
@@ -860,7 +962,13 @@ def run_command_sandboxed(command: str, timeout: int = 300, job_id: str | None =
         if proc.returncode != 0:
             output = f"⚠️ Exit code {proc.returncode}\n\n{output}"
             if stderr_out:
-                output += f"\n\nstderr:\n{stderr_out[:1000]}"
+                # A command that dies hard leaves its diagnosis last: report the
+                # stderr tail, not the head, so a chatty startup warning can't
+                # displace the terminal error. Redact the complete stderr BEFORE
+                # truncating: slicing first could cut off a credential's
+                # detectable prefix (e.g. the scheme of a token-bearing URL),
+                # letting the raw secret tail through redaction.
+                output += f"\n\nstderr:\n{redact(stderr_out.rstrip())[-1000:]}"
         return {
             "status": "ok" if proc.returncode == 0 else "error",
             "output": output,

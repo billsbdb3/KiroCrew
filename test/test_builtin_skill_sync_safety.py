@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import requires_symlinks
 from kiro_crew import skills as skills_mod
 from kiro_crew.skills import (
     _PROVENANCE_MARKER,
@@ -160,6 +161,7 @@ class TestNameCollisionPreservation:
         second = _backup_skill_md(base / ".deploy.user-backup.2")
         assert "USER second" in second.read_text(encoding="utf-8")
 
+    @requires_symlinks
     def test_dangling_symlink_at_backup_name_is_not_overwritten(
         self, builtin_root: Path, base: Path
     ) -> None:
@@ -380,6 +382,7 @@ class TestFingerprint:
         _record_builtin_provenance(a)
         assert _skill_tree_fingerprint(a) == before
 
+    @requires_symlinks
     def test_symlink_target_participates(self, tmp_path: Path) -> None:
         # A symlink is hashed by its target TEXT, never followed: retargeting
         # it diverges the tree, and outside file content can't leak into the
@@ -391,6 +394,7 @@ class TestFingerprint:
         os.symlink("target-two", a / "link")
         assert _skill_tree_fingerprint(a) != one
 
+    @requires_symlinks
     def test_symlink_and_regular_file_with_same_bytes_differ(self, tmp_path: Path) -> None:
         a = _make_skill(tmp_path, "a", "same")
         b = _make_skill(tmp_path, "b", "same")
@@ -429,10 +433,14 @@ class TestFingerprint:
         (a / "hidden.txt").write_text("secret", encoding="utf-8")
         real_open = os.open
 
-        def _deny(path: object, flags: int, *args: object) -> int:
+        # ``**kwargs`` because this replaces the os module attribute, so it is live for
+        # the whole test INCLUDING teardown, where pytest's own tmp_path cleanup calls
+        # os.open with dir_fd=. A stub narrower than the API it stands in for turns that
+        # cleanup into a TypeError reported as an error at teardown.
+        def _deny(path: object, flags: int, *args: object, **kwargs: object) -> int:
             if "hidden.txt" in str(path):
                 raise PermissionError("denied")
-            return real_open(path, flags, *args)  # type: ignore[arg-type]
+            return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
 
         monkeypatch.setattr(skills_mod.os, "open", _deny)
         assert _skill_tree_fingerprint(a) is None
@@ -441,6 +449,7 @@ class TestFingerprint:
 class TestMarkerHardening:
     """The provenance marker is data the sync wrote, never a path to follow."""
 
+    @requires_symlinks
     def test_marker_symlink_is_not_followed_on_write(
         self, builtin_root: Path, base: Path, tmp_path: Path
     ) -> None:
@@ -458,6 +467,7 @@ class TestMarkerHardening:
 
         assert victim.read_text(encoding="utf-8") == "do not touch"
 
+    @requires_symlinks
     def test_marker_symlink_reads_as_no_provenance(self, tmp_path: Path) -> None:
         # A symlink at the marker path is not a marker: the directory counts
         # as user-authored ("no provenance") instead of trusting content read
@@ -494,6 +504,7 @@ class TestVerificationBounds:
         os.link(outside, a / "innocuous.txt")
         assert _skill_tree_fingerprint(a) is None
 
+    @requires_symlinks
     def test_link_root_is_unprovable(self, tmp_path: Path) -> None:
         real = _make_skill(tmp_path, "real", "content")
         link = tmp_path / "linked"
@@ -552,6 +563,7 @@ class TestVerificationBounds:
         )
         assert preserved
 
+    @requires_symlinks
     def test_linked_dest_is_quarantined_without_following(
         self, builtin_root: Path, base: Path, tmp_path: Path
     ) -> None:

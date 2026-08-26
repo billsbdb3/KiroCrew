@@ -17,7 +17,7 @@ export const SETTINGS_KEYWORDS: Record<string, string[]> = {
   'display.interface': ['chat mode', 'cli mode', 'bubbles', 'terminal'],
 
   // Chat
-  'chat.fallback-model': ['model', 'llm', 'opus', 'sonnet', 'haiku', 'gpt', 'default model', 'fallback model', 'switch model', 'which model'],
+  'chat.default-model': ['model', 'llm', 'opus', 'sonnet', 'haiku', 'gpt', 'default model', 'fallback model', 'switch model', 'which model'],
   'chat.default-reasoning-effort': ['reasoning', 'thinking', 'effort', 'thinking depth', 'xhigh', 'reasoning effort'],
   'chat.auto-compact-threshold': ['context window', 'compaction', 'memory', 'conversation length'],
   'chat.show-timestamps': ['time', 'clock', 'message time'],
@@ -34,12 +34,27 @@ export const SETTINGS_KEYWORDS: Record<string, string[]> = {
 
   // Notifications
   'notifications.play-sound-on-new-notifications': ['alert', 'audio', 'mute', 'silent'],
+  'notifications.sources': ['mute', 'priority', 'channel', 'per-app', 'silence'],
+  'notifications.volume': ['loudness', 'sound level', 'quieter', 'louder'],
+
+  // About (manual entries — settingsManual.ts)
+  // The gateway row's rendered label is a ternary: self-updatable installs show
+  // "Auto-update on restart" while the entry is indexed under the notify
+  // wording — these keywords keep the row findable under BOTH phrasings.
+  'about.update-notifications': ['auto-update', 'auto update on restart', 'automatic updates', 'update check'],
+  'about.update-channel': ['stable', 'insider', 'nightly', 'release channel', 'beta'],
 
   // Browser
 
   // Computer use
   'computer-use.enable-computer-use': ['accessibility', 'desktop', 'click', 'keyboard', 'screenshot', 'a11y', 'automation', 'gui'],
   'computer-use.attach-screenshots': ['screen capture', 'screenshot', 'pixels', 'window image'],
+
+  // Security (manual entries — settingsManual.ts)
+  'security.how-long-auto-approve-stays-on': ['yolo', 'auto-approve', 'auto approve', 'skip permissions', 'dangerously skip permissions', 'permissions', 'ttl', 'duration', 'expiry', 'until shutdown'],
+  'security.trust-this-machine-s-tailnet-name': ['lan', 'network', 'remote', 'expose', 'tailscale', 'origin'],
+  'security.denied-commands': ['deny', 'denylist', 'blocklist', 'blocked commands', 'command rules'],
+  'security.trust-every-third-party-app': ['apps', 'third party', 'auto approve apps', 'trust'],
 
   // General navigation
   'chat.split-view-session-grid': ['split pane', 'multi session', 'grid view'],

@@ -6,13 +6,21 @@ import { AlertTriangle, Bookmark, Cloud, ExternalLink, Globe, ImageOff, Rocket, 
 import { openPopout } from '../utils/artifactPopout'
 import { VirtuosoMasonry } from '@virtuoso.dev/masonry'
 import type { ItemContent } from '@virtuoso.dev/masonry'
-import { DndContext, PointerSensor, useSensor, useSensors, DragOverlay, MeasuringStrategy, pointerWithin, type DragEndEvent, type DragStartEvent, type CollisionDetection, type Modifier } from '@dnd-kit/core'
+// At one column the gallery is a list, and it is windowed by this app's own
+// virtualizer rather than a library: see `LibraryList` for the measured reason.
+import { useVirtualChat } from '../hooks/virtualizer/useVirtualChat'
+import { useCollapseOnScroll, COLLAPSE_MS, CHROME_ATTR } from '../hooks/useCollapseOnScroll'
+import { widgetHeightKey, getWidgetHeight, setWidgetHeight, estimateWidgetHeight } from '../utils/widgetHeights'
+import { getImageDims, rememberImageDims } from '../utils/imageDims'
+import { DndContext, MouseSensor, TouchSensor, useSensor, useSensors, DragOverlay, MeasuringStrategy, pointerWithin, type DragEndEvent, type DragStartEvent, type CollisionDetection, type Modifier } from '@dnd-kit/core'
 import SegmentedControl from '../components/SegmentedControl'
 import { api } from '../api/client'
 import { Card, CardTitle, PageHeader, Btn, Badge, SearchInput, EmptyState, Input, IconButton } from '../components/ui'
 import SimpleSelect from '../components/SimpleSelect'
 import RemoteArtifactCard from '../components/RemoteArtifactCard'
 import { useImeGuard } from '../hooks/useImeGuard'
+import { useIsMobile } from '../hooks/useIsMobile'
+import { useScrollEdges } from '../hooks/useScrollEdges'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '../components/ui/dropdown-menu'
 import { timeAgo as _timeAgo } from '../utils/timeAgo'
 import MarkdownRenderer from '../components/MarkdownRenderer'
@@ -35,6 +43,8 @@ import type { Artifact, ArtifactFolder, PublishProviderDescriptor, RemoteArtifac
 
 import { i18nT } from '../i18n/t'
 import { FOLDER_COLOR_PALETTE } from '../components/folderColorCatalog'
+import { useSandboxDoc } from '../hooks/useSandboxDoc'
+import { useNearViewport } from '../hooks/useNearViewport'
 /** Read the current computed theme CSS vars (capped to the known set, each
  * value sanitized) so a sandboxed preview iframe matches the dashboard theme.
  * Mirrors the helper in ArtifactDetailPage. */
@@ -173,9 +183,22 @@ type LibCtx = {
 }
 
 /** Responsive column count from the container width (~300px target column). */
+/** The page column's own horizontal padding at narrow widths (`px-4`, one side).
+ *  Only used to seed the column estimate below; the real width is measured. */
+const PAGE_GUTTER = 16
+
 function useColumnCount(minColWidth = 300): readonly [React.RefObject<HTMLDivElement>, number] {
   const ref = useRef<HTMLDivElement>(null)
-  const [cols, setCols] = useState(2)
+  // Seeded from the viewport instead of a constant because the page reads this
+  // count to decide WHO OWNS THE SCROLL AXIS: a wrong first value hands the axis
+  // over and takes it back a frame later, which reads as a jump. This is only an
+  // estimate (it assumes the narrow gutter); the ResizeObserver corrects it
+  // against the real element on mount either way.
+  const [cols, setCols] = useState(() =>
+    typeof window === 'undefined'
+      ? 2
+      : Math.max(1, Math.floor((window.innerWidth - PAGE_GUTTER * 2) / minColWidth)),
+  )
   useEffect(() => {
     const el = ref.current
     if (!el || typeof ResizeObserver === 'undefined') return
@@ -187,6 +210,11 @@ function useColumnCount(minColWidth = 300): readonly [React.RefObject<HTMLDivEle
   }, [minColWidth])
   return [ref, cols] as const
 }
+
+/** Key space for cached thumbnail heights. These are measured at BASE_W and
+ *  clamped to VIEWPORT_H, so they are not comparable with the heights a
+ *  full-width `WidgetFrame` measures and must not share its entries. */
+const THUMB_HEIGHT_SPACE = 'thumb900'
 
 /** Live preview of a widget/html artifact, rendered as a scaled-down
  * thumbnail: the iframe lays out at a fixed desktop width (BASE_W) so the
@@ -207,8 +235,21 @@ function WidgetThumb({ content, slug }: { content: string; slug: string }) {
     () => (content ? buildSrcdoc({ html: content, themeVars, mode: theme, includeHeightReporter: true }) : null),
     [content, themeVars, theme],
   )
-  const [blobUrl, setBlobUrl] = useState<string | null>(null)
-  const [contentH, setContentH] = useState(VIEWPORT_H) // iframe height at BASE_W (≤ VIEWPORT_H)
+  // Reserve the height this content had last time, or the median of thumbnails
+  // already measured, before falling back to the viewport ceiling.
+  //
+  // Seeding from VIEWPORT_H instead makes every thumbnail start at the MAXIMUM
+  // and correct downward when the iframe reports — so the error is one-way, and
+  // inside a virtualized list the corrections accumulate into a scroller whose
+  // total height keeps shrinking as you scroll (measured: 4.1k px of height
+  // change and 1.2k px of drift over eight swipes). `WidgetFrame` solved the
+  // same problem the same way; the key space is separate because these
+  // thumbnails lay out at a fixed BASE_W while a frame lays out at its
+  // container's width, so the two sets of heights are not comparable.
+  const heightKey = useMemo(() => widgetHeightKey(content, THUMB_HEIGHT_SPACE), [content])
+  const [contentH, setContentH] = useState(
+    () => getWidgetHeight(heightKey) ?? Math.min(VIEWPORT_H, estimateWidgetHeight(THUMB_HEIGHT_SPACE, VIEWPORT_H)),
+  ) // iframe height at BASE_W (≤ VIEWPORT_H)
   const [colW, setColW] = useState(320) // measured column/preview width
   const wrapRef = useRef<HTMLDivElement>(null)
   const iframeRef = useRef<HTMLIFrameElement>(null)
@@ -224,29 +265,63 @@ function WidgetThumb({ content, slug }: { content: string; slug: string }) {
     return () => ro.disconnect()
   }, [])
 
+  // A gateway-served document, not a `blob:` URL — the same reason the artifact
+  // and widget frames moved: some WebKit-based in-app browsers refuse a blob
+  // load outright and can take the whole page down with it.
+  const near = useNearViewport(wrapRef)
+  // Mint only once the thumb is near the viewport. A gallery renders every card
+  // it has, and minting for all of them at once pushes a pile of documents the
+  // gateway has to hold in flight simultaneously — with image-bearing artifacts
+  // that is megabytes, and the stash then has to refuse mints it could otherwise
+  // have served. Deferring keeps the pressure proportional to what is on screen.
+  const { url: blobUrl, failed } = useSandboxDoc(near ? srcdoc : null)
+  const [thumbLoaded, setThumbLoaded] = useState(false)
   useEffect(() => {
-    if (!srcdoc) return
-    const blob = new Blob([srcdoc], { type: 'text/html;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    setBlobUrl(url)
-    return () => URL.revokeObjectURL(url)
-  }, [srcdoc])
+    setThumbLoaded(false)
+  }, [blobUrl])
+  // The load listener is bound on the ref rather than via an `onLoad` prop: the
+  // a11y lint rule counts any handler prop on a non-interactive element as an
+  // interaction, and the repo's eslint ratchet has no room for a new warning.
+  useEffect(() => {
+    const el = iframeRef.current
+    if (!el || !blobUrl) return
+    const onLoad = () => setThumbLoaded(true)
+    el.addEventListener('load', onLoad)
+    return () => el.removeEventListener('load', onLoad)
+  }, [blobUrl])
 
   useEffect(() => {
     const handler = (e: MessageEvent) => {
       if (!iframeRef.current || e.source !== iframeRef.current.contentWindow) return
       if (e.data?.type === 'mc-widget-height' && typeof e.data.height === 'number') {
-        setContentH((prev) => {
-          // Clamp to the viewport ceiling so viewport-sized content (100vh) can
-          // never grow the iframe — and thus can never grow itself. Only shrinks.
-          const next = Math.min(VIEWPORT_H, Math.max(80, Math.round(e.data.height)))
-          return next === prev ? prev : next
-        })
+        // Reject non-finite reports outright: `typeof NaN === 'number'`, and
+        // NaN flows straight through min/max/round into BOTH the persisted
+        // cache and contentH (rendering height:NaN). A misbehaving widget
+        // must not be able to corrupt the geometry every later mount reserves
+        // from.
+        if (!Number.isFinite(e.data.height)) return
+        // Clamp to the viewport ceiling so viewport-sized content (100vh) can
+        // never grow the iframe — and thus can never grow itself.
+        const next = Math.min(VIEWPORT_H, Math.max(80, Math.round(e.data.height)))
+        // Remember it before the state update: this is what lets the NEXT mount
+        // of the same content reserve the right box and not correct at all.
+        setWidgetHeight(heightKey, next)
+        setContentH((prev) => (next === prev ? prev : next))
       }
     }
     window.addEventListener('message', handler)
     return () => window.removeEventListener('message', handler)
-  }, [])
+  }, [heightKey])
+
+  // Re-reserve when the CONTENT changes: the card mounts before its lazy
+  // fetch resolves (`hasPreview` gates on kind, not content), so the useState
+  // initializer above ran against the EMPTY content's key. Without this
+  // resync the persisted height for the real content is ignored and every
+  // mount pays one avoidable correction when the iframe reports — the same
+  // height-churn class the virtualized gallery works to eliminate.
+  useEffect(() => {
+    setContentH(getWidgetHeight(heightKey) ?? Math.min(VIEWPORT_H, estimateWidgetHeight(THUMB_HEIGHT_SPACE, VIEWPORT_H)))
+  }, [heightKey])
 
   const scale = colW / BASE_W
   // contentH is already clamped to VIEWPORT_H in the reporter, so the iframe
@@ -258,7 +333,11 @@ function WidgetThumb({ content, slug }: { content: string; slug: string }) {
     <div
       ref={wrapRef}
       className="relative w-full overflow-hidden bg-card"
-      style={{ height: blobUrl ? scaledH : 140 }}
+      // The SAME box before and after the iframe exists. Reserving a different
+      // placeholder height (and then swapping) is a second height change per
+      // card on top of the report, and in a virtualized list every one of those
+      // re-lays out everything below it.
+      style={{ height: scaledH }}
     >
       {blobUrl ? (
         <iframe
@@ -273,8 +352,23 @@ function WidgetThumb({ content, slug }: { content: string; slug: string }) {
             height: renderH,
             transform: `scale(${scale})`,
             transformOrigin: 'top left',
+            // Hidden until the document reports load: until then the engine may
+            // paint its own WHITE canvas over this element's background, which
+            // across a grid of cards reads as the page flashing.
+            colorScheme: theme,
+            opacity: thumbLoaded ? 1 : 0,
           }}
         />
+      ) : failed ? (
+        /* A static muted thumb, NOT the pulse: `animate-pulse` asserts progress,
+           and after a failed mint nothing is in flight. Repeated across a grid an
+           endless pulse reads as a hung page rather than a failed card. The card
+           itself is the retry affordance — opening the artifact mints again. */
+        <div className="h-full bg-bg-elevated flex items-center justify-center p-2">
+          <span className="text-[11px] text-muted text-center leading-tight">
+            {i18nT('components.artifactBody.could_not_render')}
+          </span>
+        </div>
       ) : (
         <div className="h-full bg-bg-elevated animate-pulse" />
       )}
@@ -327,6 +421,16 @@ function ImageThumb({ a }: { a: Artifact }) {
   // file, refused mime). A bare <img> would leave the browser's broken-image
   // glyph sitting in an otherwise healthy card with nothing to read.
   const [failed, setFailed] = useState(false)
+  // Natural dimensions, best source first: the save-time header sniff in the
+  // artifact metadata, else the client-side cache learned from a prior load
+  // (legacy artifacts saved before the sniff existed). Either way the browser
+  // derives an aspect ratio from the ATTRIBUTES and reserves the final
+  // contain-fit box before any bytes arrive — without it the card mounts
+  // ~16px tall and grows ~280px when the lazy load lands, shoving everything
+  // below it mid-scroll on every pass (the virtualizer's row-height cache
+  // sizes placeholders, not a remounted card's own empty <img> box).
+  const meta = a.image
+  const known = meta?.width && meta?.height ? { w: meta.width, h: meta.height } : getImageDims(a.slug)
   if (failed) {
     return (
       <div className="flex flex-col items-center justify-center gap-1 max-h-[300px] h-[120px] overflow-hidden bg-bg-elevated p-2 text-center">
@@ -343,8 +447,18 @@ function ImageThumb({ a }: { a: Artifact }) {
         src={`/api/artifacts/${a.slug}/asset`}
         alt={a.image?.alt || a.name}
         loading="lazy"
+        width={known?.w}
+        height={known?.h}
         className="max-w-full max-h-[280px] object-contain"
         draggable={false}
+        // Learn the natural size on a successful load so the NEXT mount of a
+        // legacy image (no sniffed metadata) reserves correctly. Slug-keyed:
+        // a re-upload overwrites on its next load.
+        onLoad={(e) => {
+          if (!meta?.width || !meta?.height) {
+            rememberImageDims(a.slug, e.currentTarget.naturalWidth, e.currentTarget.naturalHeight)
+          }
+        }}
         onError={() => setFailed(true)}
       />
     </div>
@@ -582,12 +696,12 @@ function FolderNameInput({ initial = '', placeholder = 'Folder name', onCommit, 
       placeholder={placeholder}
       aria-label={placeholder}
       onChange={(e) => setValue(e.target.value)}
-      onFocus={(e) => e.target.select()}
       onClick={(e) => e.stopPropagation()}
       onMouseDown={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
-      className="w-full bg-transparent border border-accent rounded px-1.5 py-0.5 text-text-strong outline-none text-sm select-text"
+      className="w-full bg-transparent border border-accent rounded px-1.5 py-0.5 text-text-strong outline-none text-sm select-text focus-ring"
       {...ime.bindEnter<HTMLInputElement>({
+        onFocus: (e) => (e.target as HTMLInputElement).select(),
         onEnter: () => { (document.activeElement as HTMLInputElement)?.blur() },
         onEscape: () => { cancelledRef.current = true; onCancel() },
         onBlur: () => {
@@ -722,7 +836,7 @@ function FolderCard({ folder, folders, previewArtifacts, actions }: {
                   )}
                   <div className="text-[11px] text-muted mt-0.5">
                     {i18nT('pages.artifactsPage.artifact', { count: stats.artifactCount })}
-                    {stats.subfolderCount > 0 ? ` · ${stats.subfolderCount} folder${stats.subfolderCount === 1 ? '' : 's'}` : ''}
+                    {stats.subfolderCount > 0 ? ` · ${i18nT('pages.artifactsPage.folder', { count: stats.subfolderCount })}` : ''}
                   </div>
                 </div>
                 <div className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
@@ -815,8 +929,8 @@ function LocalCardBody({ a, context }: { a: Artifact; context: LibCtx }) {
     : ''
   return (
     // Draggable onto folder cards / breadcrumb segments / table folder rows
-    //. PointerSensor's activation distance keeps plain clicks
-    // opening the card.
+    //. The sensors' activation constraints (see dndSensors) keep a plain click
+    // and a finger swipe reaching the card / the gallery scroller.
     <DndDraggable id={`artifact:${a.slug}`} data={{ type: 'artifact', slug: a.slug, name: a.name, folderId: a.folder_id || '' } satisfies LibraryDrag}>
       {({ setNodeRef, listeners, isDragging }) => (
     <div
@@ -922,9 +1036,176 @@ const GridCard: ItemContent<GridEntry, LibCtx> = ({ data: entry, context }) => {
   return <LocalCardBody a={entry.art} context={context} />
 }
 
+/**
+ * Collapses its children to zero height when `collapsed`, freeing the space for
+ * whatever follows in the flex column.
+ *
+ * Animates an explicitly MEASURED height rather than interpolating
+ * `grid-template-rows` between `1fr` and `0fr`: that interpolation is not
+ * implemented uniformly across engines, and the scroll defect this serves was
+ * reported from WebKit — the same trap as shipping `overflow-clip-margin`, which
+ * WebKit does not implement, to fix a WebKit-only clipping bug.
+ *
+ * The height stays `auto` until the first measurement lands, so nothing is
+ * clipped on the first paint, and a ResizeObserver keeps the number honest when
+ * the toolbar rewraps (a rotation, a longer tag name, a locale change).
+ */
+function CollapsibleChrome({ collapsed, children }: { collapsed: boolean; children: React.ReactNode }) {
+  const inner = useRef<HTMLDivElement | null>(null)
+  const shell = useRef<HTMLDivElement | null>(null)
+  const [natural, setNatural] = useState<number | null>(null)
+
+  useEffect(() => {
+    const el = inner.current
+    if (!el) return
+    const measure = () => setNatural(el.offsetHeight)
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  // `inert` is not a typed React 18 prop, and it is what keeps a zero-height
+  // toolbar out of the tab order and off the accessibility tree instead of
+  // leaving invisible-but-focusable controls behind. Engines without it simply
+  // ignore the attribute.
+  useEffect(() => {
+    shell.current?.toggleAttribute('inert', collapsed)
+  }, [collapsed])
+
+  return (
+    <div
+      ref={shell}
+      {...{ [CHROME_ATTR]: '' }}
+      className="overflow-hidden transition-[height,opacity] ease-out motion-reduce:transition-none"
+      // Duration comes from the hook's constant, not a Tailwind `duration-*`
+      // class: the settle window that stops the collapse from re-triggering is
+      // derived from the same number, and a hardcoded class here would let the
+      // two drift apart silently.
+      style={{
+        height: collapsed ? 0 : (natural ?? undefined),
+        opacity: collapsed ? 0 : 1,
+        transitionDuration: `${COLLAPSE_MS}ms`,
+      }}
+    >
+      {/* `flow-root` is load-bearing, not cosmetic. Without it this wrapper is
+        * not a block-formatting context, so the last child's bottom margin
+        * (the toolbar's `mb-3`) collapses THROUGH it and is not counted in
+        * `offsetHeight` — the measured height then comes out 12px short, the
+        * shell clips exactly that margin, and the gap between the chrome and
+        * the section below it disappears. */}
+      <div ref={inner} className="flow-root">{children}</div>
+    </div>
+  )
+}
+
+/** Card count at which the gallery switches from a content-sized CSS-columns
+ *  masonry to the virtualized one.
+ *
+ *  Module scope because TWO places decide on it: the gallery picks its render
+ *  mode, and the page decides which element owns vertical scrolling. Virtualized
+ *  mode brings its own scroller, so if these two ever read different numbers the
+ *  page ends up with two same-axis scrollers again — the exact defect the
+ *  single-scroller plumbing below exists to remove. */
+export const VIRTUALIZE_AT = 30
+
+/** Height-cache partition for the gallery. NOT a chat session id — it is
+ *  exempted in `utils/storageGc` (`RESERVED_NAMESPACES`) so the startup pass
+ *  does not read it as a dead session and wipe it. */
+const ARTIFACT_HEIGHT_NS = 'artifacts-gallery'
+
+/** Reserve for a card whose height has never been measured. The cache's own
+ *  measured heights replace this per card; it only sets the very first paint. */
+const GALLERY_ESTIMATED_CARD_H = 260
+
+/** One column of artifact cards, windowed by this app's own virtualizer.
+ *
+ *  `react-virtuoso` was measured keeping the main thread ~25% busy THROUGH a
+ *  swipe (53 layouts over six swipes) because it maintains a ResizeObserver per
+ *  mounted item and recomputes continuously. `useVirtualChat` is built the other
+ *  way on that hot path: a PASSIVE scroll listener, at most ONE rAF-coalesced
+ *  window recompute per frame, computed as arithmetic over CACHED heights rather
+ *  than by measuring, and ResizeObserver-driven work held back until the scroll
+ *  settles (`SCROLL_SETTLE_MS`) so it cannot fire mid-fling. It also accepts an
+ *  external scroller, which is the capability this page needs — the page column
+ *  has to keep the axis.
+ *
+ *  `followOutput: false` because a gallery is not a transcript: appends must not
+ *  pull the viewport to the bottom. */
+function LibraryList({
+  entries,
+  context,
+  scrollerRef,
+}: {
+  entries: GridEntry[]
+  context: LibCtx
+  scrollerRef: React.RefObject<HTMLDivElement | null>
+}) {
+  const virt = useVirtualChat<GridEntry>({
+    items: entries,
+    getKey: (e) => e.key,
+    sessionId: ARTIFACT_HEIGHT_NS,
+    estimatedHeight: GALLERY_ESTIMATED_CARD_H,
+    // Deliberately tight. Every mounted card is a live sandboxed document, so the
+    // window size IS the cost here: measured at the default (5 each way) the page
+    // held 12-19 iframes and the scroll phase ran 31% busy over 63 layouts,
+    // against 3-5 iframes and 25% over 53 at a tight window. A gallery has no
+    // streaming tail to keep warm, so it has no reason to hold a wide span.
+    overscan: 1,
+    followOutput: false,
+    // A gallery opens at the HEAD, not the chat default tail. Beyond the
+    // landing position this kills a mount-time flicker loop: opening at the
+    // tail puts every unmeasured card ABOVE the viewport, so each real
+    // measurement forces a scrollTop compensation write; at the head the
+    // corrections all land in the bottom spacer, out of sight.
+    initialPlacement: 'top',
+    // Mixed HTML/GIF/image cards vary widely around the estimate, and the
+    // debounced first-measure sync starves under a scroll-driven mounting
+    // streak — each handoff to the before-spacer then bounces the viewport by
+    // (real − estimate). See the option doc.
+    eagerFirstMeasure: true,
+    externalScrollerRef: scrollerRef,
+  })
+  return (
+    <div data-testid="artifacts-gallery-list">
+      {/* Sentinels drive window expansion at the ends. */}
+      <div ref={virt.topSentinelRef} aria-hidden style={{ height: 1 }} />
+      {/* Spacers stand in for everything outside the mounted window so the
+        * scrollbar stays honest while only the window is real DOM.
+        * overflow-anchor:none so the browser anchors on real content rather than
+        * on a spacer that resizes as the window moves. */}
+      <div aria-hidden style={{ height: virt.offsetBefore, overflowAnchor: 'none' }} />
+      {virt.virtualItems.map((vi) =>
+        vi.mounted ? (
+          // The measure ref is what feeds the height cache; without it a card's
+          // real height is never learned and every reserve stays an estimate.
+          // `flow-root` is load-bearing: the card inside carries the list gap
+          // as its own mb-3, and without a BFC that margin COLLAPSES THROUGH
+          // this wrapper — offsetHeight then under-reports every row by 12px,
+          // the offset tree accumulates the error (~96px per viewport of short
+          // cards), and engines without native scroll anchoring (iOS Safari)
+          // render the drift as a visible bounce at content-determined, fixed
+          // positions. Chrome's anchoring silently absorbs it, which is why a
+          // Chromium probe shows nothing.
+          <div key={vi.key} ref={virt.measureRef(vi.index)} className="flow-root">
+            <MasonryCard data={vi.data} context={context} index={vi.index} />
+          </div>
+        ) : (
+          <div key={vi.key} aria-hidden style={{ height: vi.height, overflowAnchor: 'none' }} />
+        ),
+      )}
+      <div aria-hidden style={{ height: virt.offsetAfter, overflowAnchor: 'none' }} />
+      <div ref={virt.bottomSentinelRef} aria-hidden style={{ height: 1 }} />
+    </div>
+  )
+}
+
 /** The "Your Artifacts" grid of local artifacts. */
 function LibraryMasonry({
   entries,
+  cols,
+  widthRef,
+  scrollerRef,
   onOpen,
   onDelete,
   deletingSlug,
@@ -932,35 +1213,66 @@ function LibraryMasonry({
   pinningSlug,
 }: {
   entries: GridEntry[]
+  /** Measured ONCE, at the page level. The page reads the same number to decide
+   *  who owns the scroll axis, so measuring it a second time here could disagree
+   *  at a boundary width and leave the page with two same-axis scrollers — the
+   *  trap `VIRTUALIZE_AT` is hoisted to module scope to avoid. */
+  cols: number
+  /** Attached to the width-defining wrapper below so the page's measurement is
+   *  taken from the element that actually lays the columns out. */
+  widthRef: React.RefObject<HTMLDivElement>
+  /** The page's scrolling column. A ref, not the resolved element: the
+   *  virtualizer takes `externalScrollerRef` and reads it when it needs it, so
+   *  nothing has to re-render just because the element appeared. */
+  scrollerRef: React.RefObject<HTMLDivElement | null>
   onOpen: (slug: string) => void
   onDelete: (a: Artifact) => void
   deletingSlug: string | null
   onTogglePin: (a: Artifact) => void
   pinningSlug: string | null
 }) {
-  const [ref, cols] = useColumnCount(300)
   const context = useMemo<LibCtx>(
     () => ({ onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug }),
     [onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug],
   )
   // Below this count, render a content-sized CSS-columns masonry so the
   // gallery takes only the height its cards need — no reserved blank space.
-  // At or above it, fall back to the virtualized masonry (fixed height +
-  // internal scroll) so a large library of iframe-preview cards stays
-  // performant.
-  const VIRTUALIZE_AT = 30
+  // At or above it the gallery virtualizes so a large library of iframe-preview
+  // cards stays performant.
+  const virtualized = entries.length >= VIRTUALIZE_AT
+  // ONE column is not a waterfall, it is a list — and a list can be windowed
+  // against an EXTERNAL scroller (`LibraryList`). `VirtuosoMasonry` cannot: its
+  // whole prop surface is columnCount/data/context/ItemContent/initialItemCount/
+  // useWindowScroll, so a virtualized masonry can only ever own a scroller of its
+  // own. Handing the axis to the page instead is what keeps every section above
+  // and below the gallery reachable by scrolling, and it is free here because at
+  // one column the two layouts render the same thing.
+  const asList = virtualized && cols === 1
+  // The masonry owns the axis only when it is actually a masonry. This must stay
+  // in lockstep with the page's own `galleryOwnsScroll`.
+  const masonryOwnsScroll = virtualized && cols > 1
   return (
     // -mr-3 offsets each card's own mr-3 so the trailing column's gutter
     // doesn't add page width; cards carry mr-3 (gutter) + mb-3 (row gap).
-    <div ref={ref} className="-mr-3">
-      {entries.length >= VIRTUALIZE_AT ? (
+    //
+    // Only the masonry needs to fill the page's content column (`flex-1
+    // min-h-0`, which is what lets a flex child shrink to its parent instead of
+    // its content). A list scrolling inside the page column is content-sized.
+    <div ref={widthRef} className={masonryOwnsScroll ? '-mr-3 flex-1 min-h-0' : '-mr-3'}>
+      {asList ? (
+        <LibraryList entries={entries} context={context} scrollerRef={scrollerRef} />
+      ) : masonryOwnsScroll ? (
         <VirtuosoMasonry
           key={cols}
           columnCount={cols}
           data={entries}
           context={context}
           ItemContent={GridCard}
-          style={{ height: 'min(72vh, 1000px)' }}
+          // 100% of the flex-sized parent, NOT a viewport fraction: a `72vh`
+          // box does not know how much room the toolbar and folder rows above
+          // it already took, so it overflowed the page column and forced a
+          // second scroller into existence.
+          style={{ height: '100%' }}
         />
       ) : (
         <div style={{ columnCount: cols, columnGap: 0 }}>
@@ -990,7 +1302,7 @@ function MasonryGridItem({ data, context, index }: { data: GridEntry; context: L
 /** Column headers shared by the flat table and the folder tree table. Data
  * columns sort on click (asc → desc → default); the star and Actions columns
  * are control columns and stay plain. */
-function LibraryTableHead({ sort, onSort }: { sort: SortState; onSort: (key: SortKey) => void }) {
+function LibraryTableHead({ sort, onSort, edgeRight = false }: { sort: SortState; onSort: (key: SortKey) => void; edgeRight?: boolean }) {
   const th = 'text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium'
   const sortable = (key: SortKey, label: string, extra: string) => {
     const active = sort?.key === key
@@ -1023,7 +1335,25 @@ function LibraryTableHead({ sort, onSort }: { sort: SortState; onSort: (key: Sor
         {sortable('version', i18nT('pages.artifactsPage.ver'), 'w-[60px]')}
         {sortable('tags', i18nT('pages.artifactsPage.tags'), 'min-w-[160px]')}
         {sortable('updated', i18nT('pages.artifactsPage.updated'), 'w-[110px]')}
-        <th className={`${th} w-[120px]`}>{i18nT('pages.artifactsPage.actions')}</th>
+        {/* Actions is the last of nine columns, and the declared widths total
+            past a phone (and a rail-narrowed desktop pane), so at rest it
+            starts beyond the scroll edge and every open/delete costs a
+            horizontal scroll. Pinned `sticky right-0` on an OPAQUE `bg-card`
+            (the default cell background is transparent and the scrolling
+            columns would show through the pin). The seam is TWO parts, both
+            gated on the measured overflow flag so a table that fits renders
+            neither: a 1px child div (NOT `border-l` — under Preflight's
+            `border-collapse: collapse` a cell border belongs to the collapsed
+            table grid and paints at the cell's layout slot, so it stays behind
+            while the sticky cell travels) and a `right-full` gradient hung just
+            left of the pin (says "columns continue"). Same treatment as the
+            hooks and schedule tables, adapted for auto layout where a
+            wrapper-anchored cue cannot know the pinned column's left edge. */}
+        <th className={`${th} w-[120px] sticky right-0 bg-card`}>
+          {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
+          {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />}
+          {i18nT('pages.artifactsPage.actions')}
+        </th>
       </tr>
     </thead>
   )
@@ -1031,7 +1361,7 @@ function LibraryTableHead({ sort, onSort }: { sort: SortState; onSort: (key: Sor
 
 /** One artifact row, shared by the flat table and the folder tree. Draggable
  * onto folder rows / the Unfiled lane (indent nests it under its folder). */
-function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug = null, indent = 0, dropFolderId, dropHighlight = false }: {
+function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSlug = null, indent = 0, dropFolderId, dropHighlight = false, edgeRight = false }: {
   a: Artifact
   onOpen: (slug: string) => void
   onDelete: (a: Artifact) => void
@@ -1041,6 +1371,9 @@ function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSl
   /** Slug whose pin toggle is in flight (disables its star to avoid double-fire). */
   pinningSlug?: string | null
   indent?: number
+  /** True while the table's scroller hides columns past its right edge — gates
+   * the pinned Actions cell's seam + fade so a table that fits shows neither. */
+  edgeRight?: boolean
   /** When set, the row also accepts drops, filing the dragged item into this
    * folder (''=unfile) — so dropping anywhere over an expanded folder's
    * region (or the Unfiled section) works, not just on the header row. */
@@ -1055,7 +1388,7 @@ function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSl
           ref={(el) => { setNodeRef(el); setDropRef?.(el) }}
           {...listeners}
           style={{ opacity: isDragging ? 0.4 : 1 }}
-          className={`transition-colors cursor-pointer ${dropHighlight ? 'bg-accent/10' : 'hover:bg-bg-hover'}`}
+          className={`group/artrow transition-colors cursor-pointer ${dropHighlight ? 'bg-accent/10' : 'hover:bg-bg-hover'}`}
           onClick={(e) => {
             if (e.metaKey || e.ctrlKey) {
               openPopout(a.slug, a.name)
@@ -1106,7 +1439,20 @@ function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pinningSl
             </div>
           </td>
           <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted">{_timeAgo(isoToTs(a.updated_at))}</td>
-          <td className="px-2.5 py-2 border-b border-border">
+          {/* Pinned like the header cell, on an OPAQUE `bg-card`. The row's
+              states live on the <tr>, which the opaque base would hide, so the
+              overlay re-applies them beneath the controls (`-z-10` inside the
+              stacking context the sticky cell creates): the `.table-striped`
+              zebra keys off the row's REAL DOM position (`nth-child(even)`),
+              which — unlike the hooks/schedule tables' clean `.map` index — is
+              not knowable here (folder rows, artifact rows, and lane rows
+              interleave), so the overlay mirrors it with the ancestor arbitrary
+              variant instead of an index; the drag-file highlight and the hover
+              tint layer on top, matching the <tr>. */}
+          <td className="sticky right-0 bg-card px-2.5 py-2 border-b border-border">
+            <div aria-hidden className={`absolute inset-0 -z-10 transition-colors [.table-striped_tbody_tr:nth-child(even)_&]:bg-[var(--card-hl)] ${dropHighlight ? 'bg-accent/10' : 'group-hover/artrow:bg-bg-hover'}`} />
+            {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
+            {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />}
             <div className="flex items-center gap-1">
               <button
                 type="button"
@@ -1162,10 +1508,10 @@ function SessionDocStar({ d, busy, onMaterialize }: { d: SessionDoc; busy: boole
 /** A single unsaved session-document row (from "your chats"). Leading star
  * materializes it into a real, starred artifact. Shares the same columns as
  * ArtifactRow so both live in one unified table. */
-function SessionDocRow({ d, busy, onMaterialize }: { d: SessionDoc; busy: boolean; onMaterialize: (path: string, sessionKey?: string) => void }) {
+function SessionDocRow({ d, busy, onMaterialize, edgeRight = false }: { d: SessionDoc; busy: boolean; onMaterialize: (path: string, sessionKey?: string) => void; edgeRight?: boolean }) {
   const ftype = docFileType(d.path)
   return (
-    <tr className="transition-colors hover:bg-bg-hover">
+    <tr className="group/docrow transition-colors hover:bg-bg-hover">
       <td className="px-2.5 py-2 border-b border-border text-center">
         <SessionDocStar d={d} busy={busy} onMaterialize={onMaterialize} />
       </td>
@@ -1182,7 +1528,15 @@ function SessionDocRow({ d, busy, onMaterialize }: { d: SessionDoc; busy: boolea
       <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted">—</td>
       <td className="px-2.5 py-2 border-b border-border"></td>
       <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted whitespace-nowrap">{_timeAgo(isoToTs(d.updated_at))}</td>
-      <td className="px-2.5 py-2 border-b border-border"></td>
+      {/* This row has no Actions controls, but it shares the pinned column, so
+          its trailing cell must pin too — otherwise the scrolling columns show
+          through where the pin sits. Same opaque base + overlay (zebra by real
+          DOM position + hover) + gated seam as ArtifactRow. */}
+      <td className="sticky right-0 bg-card px-2.5 py-2 border-b border-border">
+        <div aria-hidden className="absolute inset-0 -z-10 transition-colors [.table-striped_tbody_tr:nth-child(even)_&]:bg-[var(--card-hl)] group-hover/docrow:bg-bg-hover" />
+        {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
+        {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />}
+      </td>
     </tr>
   )
 }
@@ -1255,7 +1609,18 @@ function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }:
         </button>
       </CardTitle>
       {!collapsed && (
-      <div ref={listRef} tabIndex={-1} className="flex flex-col gap-0.5 outline-none">
+      <>
+      {/* Expanded, this list is the full session-doc set (hundreds of rows). It
+        * lives inside the page column, which hands its scroll axis to the
+        * gallery once that virtualizes — so an unbounded list here is CLIPPED
+        * with no way to reach the rest of it. Cap it and let it scroll itself.
+        * Collapsed to five rows it needs no cap, so the common case still has a
+        * single scroller on the page. */}
+      <div
+        ref={listRef}
+        tabIndex={-1}
+        className={`flex flex-col gap-0.5 outline-none ${expanded ? 'max-h-[40vh] overflow-y-auto' : ''}`}
+      >
         {visible.map((d) => (
           <div key={d.path} className="flex items-center gap-2.5 px-2 py-1.5 rounded-lg">
             <SessionDocStar d={d} busy={materializingPath === d.path} onMaterialize={handleMaterialize} />
@@ -1266,18 +1631,23 @@ function SessionDocsGallery({ docs, pending, onMaterialize, materializingPath }:
             <span className="text-[12px] text-muted whitespace-nowrap shrink-0">{_timeAgo(isoToTs(d.updated_at))}</span>
           </div>
         ))}
-        {overflow && (
-          <Btn
-            onClick={() => setExpanded((v) => !v)}
-            className="justify-center w-full px-2 py-1.5 rounded-lg text-[11.5px] font-medium border-none"
-            aria-expanded={expanded}
-          >
-            {expanded
-              ? <><ChevronUp size={13} className="shrink-0" /> {i18nT('pages.artifactsPage.show_less')}</>
-              : <><ChevronDown size={13} className="shrink-0" /> {i18nT('pages.artifactsPage.show_all_count', { count: docs.length })}</>}
-          </Btn>
-        )}
       </div>
+      {/* OUTSIDE the scrollable list on purpose: inside it, "Show less" sat
+        * after the last of hundreds of rows, so the control that undoes the
+        * expansion was itself only reachable by scrolling past everything the
+        * expansion added. */}
+      {overflow && (
+        <Btn
+          onClick={() => setExpanded((v) => !v)}
+          className="justify-center w-full px-2 py-1.5 mt-1 rounded-lg text-[11.5px] font-medium border-none"
+          aria-expanded={expanded}
+        >
+          {expanded
+            ? <><ChevronUp size={13} className="shrink-0" /> {i18nT('pages.artifactsPage.show_less')}</>
+            : <><ChevronDown size={13} className="shrink-0" /> {i18nT('pages.artifactsPage.show_all_count', { count: docs.length })}</>}
+        </Btn>
+      )}
+      </>
       )}
     </Card>
   )
@@ -1310,16 +1680,21 @@ function LibraryTable({
   onMaterialize?: (path: string, sessionKey?: string) => void
   materializingPath?: string | null
 }) {
+  // The pinned Actions column's seam is painted only while the scroller hides
+  // columns. Auto layout means the ROWS set scrollWidth (a filter emptying
+  // rows, a locale switch re-labelling headers, a webfont load), none of which
+  // resize the scroller's own box — so the table is the observed content node.
+  const [attachScroller, edges, , attachTable] = useScrollEdges<HTMLDivElement>()
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full border-collapse table-striped">
-        <LibraryTableHead sort={sort} onSort={onSort} />
+    <div ref={attachScroller} className="overflow-x-auto">
+      <table ref={attachTable} className="w-full border-collapse table-striped">
+        <LibraryTableHead sort={sort} onSort={onSort} edgeRight={edges.right} />
         <tbody>
           {items.map((a) => (
-            <ArtifactRow key={a.slug} a={a} onOpen={onOpen} onDelete={onDelete} deletingSlug={deletingSlug} onTogglePin={onTogglePin} pinningSlug={pinningSlug} />
+            <ArtifactRow key={a.slug} a={a} onOpen={onOpen} onDelete={onDelete} deletingSlug={deletingSlug} onTogglePin={onTogglePin} pinningSlug={pinningSlug} edgeRight={edges.right} />
           ))}
           {onMaterialize && sessionDocs.map((d) => (
-            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} />
+            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} edgeRight={edges.right} />
           ))}
         </tbody>
       </table>
@@ -1373,7 +1748,7 @@ function FolderRow({ folder, folders, depth, expanded, onToggle, actions, dropHi
                     <span className="text-sm text-text-strong font-medium truncate">{folder.name}</span>
                   )}
                   <span className="text-[11px] text-muted">
-                    {stats.artifactCount}{stats.subfolderCount > 0 ? ` · ${stats.subfolderCount} folder${stats.subfolderCount === 1 ? '' : 's'}` : ''}
+                    {stats.artifactCount}{stats.subfolderCount > 0 ? ` · ${i18nT('pages.artifactsPage.folder', { count: stats.subfolderCount })}` : ''}
                   </span>
                   <span className="ml-auto opacity-0 group-hover:opacity-100 transition-opacity">
                     <FolderMenu folder={folder} folders={folders} actions={actions} />
@@ -1412,6 +1787,9 @@ function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand
   onMaterialize?: (path: string, sessionKey?: string) => void
   materializingPath?: string | null
 }) {
+  // See LibraryTable: the pinned Actions seam is gated on measured overflow,
+  // and auto layout makes the table (not the scroller's box) the content node.
+  const [attachScroller, edges, , attachTable] = useScrollEdges<HTMLDivElement>()
   const folderIds = new Set(folders.map(f => f.id))
   const byFolder = new Map<string, Artifact[]>()
   for (const a of items) {
@@ -1453,6 +1831,7 @@ function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand
               indent={depth + 1}
               dropFolderId={f.id}
               dropHighlight={overFolderId === f.id}
+              edgeRight={edges.right}
             />,
           )
         }
@@ -1464,9 +1843,9 @@ function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand
   const unfiled = byFolder.get('') || []
   const unfiledHot = overFolderId === ''
   return (
-    <div className="overflow-x-auto">
-      <table className="w-full border-collapse table-striped">
-        <LibraryTableHead sort={sort} onSort={onSort} />
+    <div ref={attachScroller} className="overflow-x-auto">
+      <table ref={attachTable} className="w-full border-collapse table-striped">
+        <LibraryTableHead sort={sort} onSort={onSort} edgeRight={edges.right} />
         <tbody>
           {rows}
           {folders.length > 0 && (
@@ -1500,10 +1879,11 @@ function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggleExpand
               pinningSlug={pinningSlug}
               dropFolderId={folders.length > 0 ? '' : undefined}
               dropHighlight={unfiledHot}
+              edgeRight={edges.right}
             />
           ))}
           {onMaterialize && sessionDocs.map((d) => (
-            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} />
+            <SessionDocRow key={d.path} d={d} busy={materializingPath === d.path} onMaterialize={onMaterialize} edgeRight={edges.right} />
           ))}
         </tbody>
       </table>
@@ -1518,6 +1898,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   // a click.
   const cloudDeployEnabled = useCloudDeploymentEnabled()
   const [filter, setFilter] = useState('')
+  const isMobile = useIsMobile()
   const [tagFilter, setTagFilter] = useState('')
   const [kindFilter, setKindFilter] = useState<string>('')
   // Default to "All" artifacts, but remember the last visit's choice: if the
@@ -1801,9 +2182,28 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
   // ── Library drag-and-drop ─────────────────────────────────────────────────
   // One DndContext covers both views. Artifact → folder-drop moves it; folder
   // → folder-drop nests it into the target, cycle-guarded. (Folders sort
-  // alphabetically, so there is no manual sibling reorder.) The activation
-  // distance keeps clicks working.
-  const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }))
+  // alphabetically, so there is no manual sibling reorder.)
+  //
+  // Split mouse/touch sensors so a finger can both SCROLL and drag (mirrors the
+  // Apps nav rail in App.tsx):
+  //  - MouseSensor: 6px distance, so a plain click still opens the card and only
+  //    a deliberate mouse drag starts a move.
+  //  - TouchSensor: 250ms press-and-hold (5px tolerance), so a finger swipe that
+  //    travels past the tolerance CANCELS the sensor and the gallery pans
+  //    natively; only a deliberate hold picks the card up.
+  //
+  // A single PointerSensor cannot do this. Past its activation distance
+  // `AbstractPointerSensor.handleMove` calls `preventDefault()` on every
+  // subsequent move event — and dnd-kit installs a non-passive window
+  // `touchmove` listener precisely so those calls take effect ("This is
+  // required for iOS Safari", TouchSensor.setup). Chromium ignores
+  // preventDefault on `pointermove` for panning, so the swallowed swipe only
+  // shows up on WebKit: a gesture starting on a CARD dies while the same
+  // gesture starting in the GAP between cards (no listener, no sensor) scrolls.
+  const dndSensors = useSensors(
+    useSensor(MouseSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 5 } }),
+  )
   const [activeDrag, setActiveDrag] = useState<LibraryDrag | null>(null)
   // The folder the drag is currently over (''=unfile target, null=none) —
   // drives group highlighting: hovering anywhere over an expanded folder's
@@ -2026,12 +2426,125 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
           ? asMessage(materializeMut.error)
           : null
 
+  // Hooks must run before the `isLoading` early return below, so the scroll
+  // wiring lives here rather than beside the JSX it feeds.
+  //
+  // The virtualized gallery brings its OWN vertical scroller. Two same-axis
+  // scrollers on one page is a defect: whichever one the finger lands in decides
+  // whether anything moves, and the page-level one has only ~113px of travel
+  // once the gallery is on screen, so a swipe that lands there stops dead after
+  // a few pixels and reads as "this card does not scroll". Measured at 390px with
+  // 42 artifacts: page column 706px tall over 819px of content, gallery scroller
+  // 608px tall over 12485px. So exactly one element owns the axis; below the
+  // threshold the gallery is content-sized and the page column scrolls, as before.
+  // Measured here, not inside the gallery, because two independent measurements
+  // of the same width could disagree at a boundary and leave the page holding an
+  // axis the gallery also thinks it owns. `galleryWidthRef` is attached to the
+  // gallery's own column-defining wrapper so the number still describes the
+  // element that lays the columns out.
+  const [galleryWidthRef, cols] = useColumnCount(300)
+  // Scroll ownership. A virtualized MASONRY can only own a scroller of its own,
+  // so the page column has to stop scrolling and hand the axis over — otherwise
+  // both scroll on the same axis and the page column has only ~113px of travel
+  // once the gallery is on screen, so a swipe that lands there stops dead after
+  // a few pixels and reads as "this card does not scroll". Measured at 390px with
+  // 42 artifacts: page column 706px tall over 819px of content, gallery scroller
+  // 608px tall over 12485px.
+  //
+  // At ONE column there is no masonry to preserve, so the gallery renders as a
+  // list windowed against this column (`LibraryList`) and the page column KEEPS
+  // the axis. That is the narrow case, and it is the one where handing the axis over
+  // hurt: it is what forced the pre-gallery region to be capped into a scroller
+  // of its own and the chrome to hide on scroll, and it is what left sections
+  // rendered after the gallery unreachable.
+  const galleryOwnsScroll = view === 'grid' && gridEntries.length >= VIRTUALIZE_AT && cols > 1
+  // Hide-on-scroll for the page's own chrome. At 390x844 the title, subtitle,
+  // heading row and filter rows pin 317px — 38% of the viewport — above a 527px
+  // gallery. This is only reachable when the masonry owns the axis (so, several
+  // columns on a short viewport); at one column the chrome scrolls away with the
+  // page instead, which tracks the finger 1:1 and needs no animation, no
+  // threshold and no settle window.
+  //
+  // Narrow only: at desktop heights the chrome is a small fraction of the column
+  // and moving it on scroll would be motion nobody asked for.
+  const chromeHostRef = useRef<HTMLDivElement | null>(null)
+  const chromeCollapsed = useCollapseOnScroll(chromeHostRef, isMobile && galleryOwnsScroll)
+
   if (isLoading) return <div className="p-6 text-muted">{i18nT('pages.artifactsPage.loading')}</div>
 
+  // Both controls below are rendered ONCE and placed differently per width, not
+  // duplicated per branch: the view switcher owns a framer `layoutId`, and two
+  // live elements sharing one id fight over the same animated indicator.
+  const viewSwitcher = (
+    <SegmentedControl
+      segments={[
+        { key: 'grid', label: i18nT('pages.artifactsPage.gallery'), icon: <LayoutDashboard size={13} />, tooltip: i18nT('pages.artifactsPage.masonry_preview_gallery') },
+        { key: 'table', label: i18nT('pages.artifactsPage.table'), icon: <TableIcon size={13} />, tooltip: i18nT('pages.artifactsPage.compact_table') },
+      ]}
+      value={view}
+      onChange={(v) => { setView(v); safeSetItem('mc-artifacts-view', v) }}
+      layoutId="artifact-view"
+      // This control sits in a content-hugging group, so its own
+      // measurement always reads "plenty of room". Even on its own line
+      // the two labelled segments do not fit beside the create actions
+      // at 320px, and they are the widest thing in the row.
+      compact={isMobile}
+    />
+  )
+  const starredToggle = (
+    <div className="inline-flex items-center rounded-lg border border-border bg-bg-elevated p-0.5" role="group" aria-label={i18nT('pages.artifactsPage.filter_starred')}>
+      <button
+        type="button"
+        onClick={() => { setPinnedOnly(true); safeSetItem('mc-artifacts-pinned-only', '1') }}
+        aria-pressed={pinnedOnly}
+        className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none inline-flex items-center gap-1 ${pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
+      >
+        <Star size={12} className={pinnedOnly ? 'fill-current' : ''} /> {i18nT('pages.artifactsPage.starred')}
+      </button>
+      <button
+        type="button"
+        onClick={() => { setPinnedOnly(false); safeSetItem('mc-artifacts-pinned-only', '0') }}
+        aria-pressed={!pinnedOnly}
+        className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none ${!pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
+      >
+        {i18nT('pages.artifactsPage.all')}
+      </button>
+    </div>
+  )
+
+  // Scroll ownership and the hide-on-scroll wiring are decided above, before the
+  // `isLoading` early return, because hooks cannot run after it.
   return (
     <>
-      <PageHeader title={i18nT('pages.artifactsPage.artifacts')} subtitle={i18nT('pages.artifactsPage.widgets_files_and_snippets_live_tracked_with_ver')} />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      {/* The scroll host carries NO padding of its own: `PageHeader` brings the
+        * page gutter with it, and doubling that would put the title 32px in
+        * while the cards it labels stay at 16px. The gutter lives on the inner
+        * content wrapper instead.
+        *
+        * The header sits INSIDE this element so that, when the page owns the
+        * axis, it scrolls away with the content by physics — 1:1 with the
+        * finger, no animation and no threshold. When the masonry owns the axis
+        * this element does not scroll, and the header collapses instead. */}
+      <div
+        ref={chromeHostRef}
+        data-testid="artifacts-scroll-host"
+        className={`flex-1 min-h-0 flex flex-col ${
+          galleryOwnsScroll ? 'overflow-hidden' : 'overflow-y-auto'
+        }`}
+      >
+        {/* shrink-0 so flex cannot absorb the header the way it absorbed the
+          * folder region: inside an `overflow-hidden` column a squeezed child
+          * has nothing able to scroll it back into view. */}
+        <div className="shrink-0">
+          <CollapsibleChrome collapsed={chromeCollapsed}>
+            <PageHeader title={i18nT('pages.artifactsPage.artifacts')} subtitle={i18nT('pages.artifactsPage.widgets_files_and_snippets_live_tracked_with_ver')} />
+          </CollapsibleChrome>
+        </div>
+      <div
+        className={`px-4 md:px-6 ${
+          galleryOwnsScroll ? 'flex flex-col flex-1 min-h-0' : 'pb-8'
+        }`}
+      >
         {(errMessage || mutErr || addError) && (
           <div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise">
             <span className="text-danger text-lg shrink-0"><AlertTriangle className="lucide-inline" /></span>
@@ -2043,7 +2556,17 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
           </div>
         )}
 
-        <div className="flex items-center justify-between gap-3 mb-3">
+        {/* Collapses with the page title on the way down. The heading row and
+          * the filters are the other 180px of the 317px of pinned chrome; the
+          * breadcrumb and folder cards below stay put because they are content,
+          * not chrome. */}
+        <CollapsibleChrome collapsed={chromeCollapsed}>
+        {/* `flex-wrap` moves the ACTION GROUP to its own line when the title
+          * cannot share one with it — it does not let the button row itself
+          * wrap, which is what would cost the row its ranking. Without it the
+          * title is the flex item that gives, and at 320px it is squeezed to a
+          * few pixels while the view switcher still hangs off the right edge. */}
+        <div className="flex items-center justify-between gap-3 mb-3 flex-wrap">
           <h3 className="text-sm font-semibold text-text-strong">{i18nT('pages.artifactsPage.your_artifacts')}</h3>
           <div className="flex items-center gap-2">
             {/* Split button: creating a blank document is the common verb and
@@ -2061,9 +2584,22 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Btn
-                    aria-label={i18nT('pages.artifactsPage.more_ways_to_add_an_artifact')}
+                    // On a phone this menu also holds the folder action, so an
+                    // add-only name would under-promise its contents — and the
+                    // name is all a screen reader gets from a chevron.
+                    aria-label={isMobile
+                      ? i18nT('pages.artifactsPage.more_actions')
+                      : i18nT('pages.artifactsPage.more_ways_to_add_an_artifact')}
                     disabled={addArtifactMut.isPending}
-                    className="rounded-l-none border-l-0 px-1"
+                    // The caret holds only a 13px icon, so its content box is
+                    // ~7px shorter than the labelled half next to it (whose
+                    // text line-height sets the split button's height). The
+                    // parent centres it, which shows as a gap above AND below
+                    // the caret — `self-stretch` makes it take the row's height
+                    // instead, keeping the seam a single continuous edge without
+                    // pinning a literal height that the label's font would
+                    // outgrow.
+                    className="rounded-l-none border-l-0 px-1 self-stretch"
                   >
                     {addArtifactMut.isPending ? <Loader2 size={13} className="animate-spin" /> : <ChevronDown size={13} />}
                   </Btn>
@@ -2072,6 +2608,33 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                   <DropdownMenuItem onSelect={handleAddArtifact}>
                     <FileText size={13} className="text-muted shrink-0" /> {i18nT('pages.artifactsPage.import_from_a_file')}
                   </DropdownMenuItem>
+                  {/* On a phone this menu is also where the folder action lives:
+                    * three peer controls do not fit a 320px line in the wide
+                    * locales (fr/it/bn run ~40% longer than en), and clipping
+                    * one off the edge is the only worse outcome than moving it
+                    * one tap away. Creating is the row's verb, so creating is
+                    * what keeps the visible slot. */}
+                  {isMobile && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onSelect={handleNewFolder}>
+                        <FolderPlus size={13} className="text-muted shrink-0" /> {i18nT('pages.artifactsPage.new_folder')}
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                  {/* Deploy LEAVES the page rather than filtering it, so on a
+                    * phone it is the one control in the toolbar that can move
+                    * behind a tap without costing anything: keeping it visible
+                    * is what forced the filter row to wrap and left a lone
+                    * right-floated button on a line of its own. */}
+                  {isMobile && cloudDeployEnabled && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem onSelect={() => navigate('/deploy')}>
+                        <Globe size={13} className="text-muted shrink-0" /> {i18nT('pages.artifactsPage.artifact_deploy')}
+                      </DropdownMenuItem>
+                    </>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             </div>
@@ -2083,21 +2646,28 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               className="hidden"
               onChange={handleAddArtifactFile}
             />
-            <Btn onClick={handleNewFolder} className="flex items-center gap-1.5" title={i18nT('pages.artifactsPage.create_a_folder_to_organize_your_artifacts')}>
-              <FolderPlus size={13} /> {i18nT('pages.artifactsPage.new_folder')}
-            </Btn>
-            <SegmentedControl
-              segments={[
-                { key: 'grid', label: i18nT('pages.artifactsPage.gallery'), icon: <LayoutDashboard size={13} />, tooltip: i18nT('pages.artifactsPage.masonry_preview_gallery') },
-                { key: 'table', label: i18nT('pages.artifactsPage.table'), icon: <TableIcon size={13} />, tooltip: i18nT('pages.artifactsPage.compact_table') },
-              ]}
-              value={view}
-              onChange={(v) => { setView(v); safeSetItem('mc-artifacts-view', v) }}
-              layoutId="artifact-view"
-            />
+            {!isMobile && (
+              <Btn onClick={handleNewFolder} className="flex items-center gap-1.5" title={i18nT('pages.artifactsPage.create_a_folder_to_organize_your_artifacts')}>
+                <FolderPlus size={13} /> {i18nT('pages.artifactsPage.new_folder')}
+              </Btn>
+            )}
+            {/* On a phone the view switcher moves down to pair with the Starred
+              * toggle: both answer "what am I looking at", and putting them on
+              * one justified row gives the toolbar's last line a left AND a
+              * right edge instead of a single stranded control. */}
+            {!isMobile && viewSwitcher}
           </div>
         </div>
-        <div className="flex flex-wrap gap-2 items-center mb-3">
+        {/* Narrow-first toolbar: one control per row, every row spanning the
+          * full content width, so the four rows share one left edge and one
+          * right edge. A single `flex-wrap` row is what produced the scatter —
+          * it broke wherever the widths happened to land (search + kind on one
+          * line, a right-floated Deploy alone on the next, a left-aligned
+          * toggle on a third), giving every line a different x. From `md` up
+          * `md:contents` dissolves the mobile grouping wrappers so the same
+          * children are direct flex items again and the desktop row is
+          * byte-for-byte the layout it was. */}
+        <div className="flex flex-col gap-2 mb-3 md:flex-row md:flex-wrap md:items-center">
             <SearchInput
               placeholder={i18nT('pages.artifactsPage.filter_by_name_slug_description')}
               value={filter}
@@ -2108,49 +2678,48 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
                 sentinel, so it stays a selectable option as long as '' is present
                 in `options` — which is why it leads each array and takes its
                 visible label from the matching `optionLabels` slot. */}
-            <SimpleSelect
-              options={[...KIND_OPTIONS]}
-              optionLabels={KIND_OPTIONS.map((k) => (k ? `kind: ${k}` : i18nT('pages.artifactsPage.all_kinds')))}
-              value={kindFilter}
-              aria-label={i18nT('pages.artifactsPage.filter_by_kind')}
-              onChange={setKindFilter}
-            />
-            {/* The popup is exactly this trigger's width, so a trigger sized to
-                its own placeholder would clip the user-defined tag names it
-                lists. Floor the TRIGGER, not the panel — that keeps the two in
-                lockstep while leaving the rows readable. */}
-            <SimpleSelect
-              style={{ minWidth: 180 }}
-              options={['', ...allTags]}
-              optionLabels={[i18nT('pages.artifactsPage.all_tags'), ...allTags.map((t) => `${i18nT('pages.artifactsPage.tag')} ${t}`)]}
-              value={tagFilter}
-              aria-label={i18nT('pages.artifactsPage.filter_by_tag')}
-              onChange={setTagFilter}
-            />
-            {cloudDeployEnabled && (
+            <div className="flex gap-2 md:contents">
+              <div className="flex-1 min-w-0 md:flex-initial">
+                <SimpleSelect
+                  options={[...KIND_OPTIONS]}
+                  optionLabels={KIND_OPTIONS.map((k) => (k ? `kind: ${k}` : i18nT('pages.artifactsPage.all_kinds')))}
+                  value={kindFilter}
+                  aria-label={i18nT('pages.artifactsPage.filter_by_kind')}
+                  onChange={setKindFilter}
+                />
+              </div>
+              {/* The popup is exactly this trigger's width, so a trigger sized to
+                  its own placeholder would clip the user-defined tag names it
+                  lists. Floor the TRIGGER, not the panel — that keeps the two in
+                  lockstep while leaving the rows readable. The floor is desktop
+                  only: sharing the row half-and-half already gives the trigger
+                  ~179px at 390px, and a hard 180px floor on a phone would push
+                  the pair past the viewport instead. */}
+              <div className="flex-1 min-w-0 md:flex-initial md:min-w-[180px]">
+                <SimpleSelect
+                  options={['', ...allTags]}
+                  optionLabels={[i18nT('pages.artifactsPage.all_tags'), ...allTags.map((t) => `${i18nT('pages.artifactsPage.tag')} ${t}`)]}
+                  value={tagFilter}
+                  aria-label={i18nT('pages.artifactsPage.filter_by_tag')}
+                  onChange={setTagFilter}
+                />
+              </div>
+            </div>
+            {cloudDeployEnabled && !isMobile && (
               <Btn onClick={() => navigate('/deploy')} className="flex items-center gap-1.5 ml-auto" title={i18nT('pages.artifactsPage.artifact_deploy_aws_profiles_and_published_sites')}>
                 <Globe size={13} /> {i18nT('pages.artifactsPage.artifact_deploy')}
               </Btn>
             )}
-            <div className="inline-flex items-center rounded-lg border border-border bg-bg-elevated p-0.5" role="group" aria-label={i18nT('pages.artifactsPage.filter_starred')}>
-              <button
-                type="button"
-                onClick={() => { setPinnedOnly(true); safeSetItem('mc-artifacts-pinned-only', '1') }}
-                aria-pressed={pinnedOnly}
-                className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none inline-flex items-center gap-1 ${pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
-              >
-                <Star size={12} className={pinnedOnly ? 'fill-current' : ''} /> {i18nT('pages.artifactsPage.starred')}
-              </button>
-              <button
-                type="button"
-                onClick={() => { setPinnedOnly(false); safeSetItem('mc-artifacts-pinned-only', '0') }}
-                aria-pressed={!pinnedOnly}
-                className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-colors cursor-pointer border-none ${!pinnedOnly ? 'bg-accent text-accent-fg' : 'bg-transparent text-muted hover:text-text'}`}
-              >
-                {i18nT('pages.artifactsPage.all')}
-              </button>
-            </div>
+            {isMobile
+              ? (
+                <div className="flex items-center justify-between gap-2">
+                  {starredToggle}
+                  {viewSwitcher}
+                </div>
+              )
+              : starredToggle}
           </div>
+        </CollapsibleChrome>
 
           {/* One DndContext spans breadcrumb + folder cards + gallery/table so
               artifacts and folders can be dragged between all of them. */}
@@ -2163,6 +2732,27 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             onDragEnd={handleDragEnd}
             onDragCancel={handleDragCancel}
           >
+            {/* Everything between the chrome and the gallery is capped and
+              * scrolls itself once the gallery owns the page's scroll axis.
+              *
+              * Without the cap this content is a plain flex sibling of a
+              * `flex-1 min-h-0` gallery inside an `overflow-hidden` column, so a
+              * tall stack of folder cards is absorbed by flex-shrink and there is
+              * NOTHING that can scroll it into view. Measured at 390x844 with a
+              * 700px stand-in above the gallery: it rendered at 562px (squeezed
+              * 138px), the gallery collapsed to 0px — the artifact list vanishes
+              * outright — and no ancestor scroller could reach either
+              * (`docScrollable: 0`).
+              *
+              * `shrink-0` is what stops the squeeze; `max-h-[45%]` is what leaves
+              * the gallery a floor to live in. Below the virtualization threshold
+              * the page column still scrolls, so no cap is wanted there. Marked
+              * as chrome so scrolling this region does not also hide the toolbar
+              * above it. */}
+            <div
+              {...(galleryOwnsScroll ? { [CHROME_ATTR]: '' } : {})}
+              className={galleryOwnsScroll ? 'shrink-0 max-h-[45%] overflow-y-auto' : ''}
+            >
             {view === 'grid' && !filtersActive && scopeFolderId && (
               <FolderBreadcrumbBar folders={folders} currentFolderId={scopeFolderId} onNavigate={openFolder} />
             )}
@@ -2224,13 +2814,16 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
               * views fold the docs into their own rows instead. Skipped while
               * folder-scoped (docs are unfiled) and in the Starred view. */}
             {view === 'grid' && !pinnedOnly && !tagFilter && (filtersActive || !scopeFolderId) && (
-              <SessionDocsGallery
-                docs={sessionDocs}
-                pending={sessionDocsQ.isPending}
-                onMaterialize={handleMaterialize}
-                materializingPath={materializingPath}
-              />
+              <CollapsibleChrome collapsed={chromeCollapsed}>
+                <SessionDocsGallery
+                  docs={sessionDocs}
+                  pending={sessionDocsQ.isPending}
+                  onMaterialize={handleMaterialize}
+                  materializingPath={materializingPath}
+                />
+              </CollapsibleChrome>
             )}
+            </div>
 
             {gridEntries.length === 0 && (view === 'grid' || filtersActive) ? (
               (artifacts.length === 0 && folders.length === 0) ? (
@@ -2253,6 +2846,9 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             ) : view === 'grid' ? (
               <LibraryMasonry
                 entries={gridEntries}
+                cols={cols}
+                widthRef={galleryWidthRef}
+                scrollerRef={chromeHostRef}
                 onOpen={handleOpen}
                 onDelete={handleDelete}
                 deletingSlug={deleteMut.isPending ? (deleteMut.variables as string) : null}
@@ -2332,6 +2928,7 @@ export default function ArtifactsPage() {  const navigate = useNavigate()
             onCloned={(slug) => { qc.invalidateQueries({ queryKey: ['artifacts'] }); qc.invalidateQueries({ queryKey: ['remote-artifacts', p.name] }); navigate(`/artifacts/${slug}`) }}
           />
         ))}
+        </div>
       </div>
     </>
   )

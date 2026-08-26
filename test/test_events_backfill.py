@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from conftest import make_dir_link
 from kiro_crew.events.backfill import run_backfill
 from kiro_crew.events.kinds import (
     AutonudgeArmed,
@@ -365,7 +366,7 @@ def test_apply_refuses_symlinked_events_directory(tmp_path: Path) -> None:
     home.mkdir()
     victim = tmp_path / "victim-dir"
     victim.mkdir()
-    (home / "events").symlink_to(victim)
+    make_dir_link(home / "events", victim)
     report = run_backfill(home, apply=True)
     assert report["applied"] is False
     assert "symlink" in (report["apply_refused"] or "")
@@ -375,13 +376,15 @@ def test_apply_refuses_symlinked_events_directory(tmp_path: Path) -> None:
 def test_apply_refuses_symlinked_gateway_lock(tmp_path: Path) -> None:
     home = tmp_path / "home"
     home.mkdir()
-    target = tmp_path / "victim.txt"
-    target.write_text("precious", encoding="utf-8")
-    (home / "gateway.lock").symlink_to(target)
+    target = tmp_path / "victim-dir"
+    target.mkdir()
+    victim = target / "victim.txt"
+    victim.write_text("precious", encoding="utf-8")
+    make_dir_link(home / "gateway.lock", target)
     report = run_backfill(home, apply=True)
     assert report["applied"] is False
     assert "symlink" in (report["apply_refused"] or "")
-    assert target.read_text(encoding="utf-8") == "precious"  # never truncated
+    assert victim.read_text(encoding="utf-8") == "precious"  # never truncated
 
 
 def test_symlinked_store_files_are_refused(tmp_path: Path) -> None:
@@ -392,13 +395,15 @@ def test_symlinked_store_files_are_refused(tmp_path: Path) -> None:
     home = tmp_path / "home"
     sessions = home / "sessions"
     sessions.mkdir(parents=True)
-    secret = tmp_path / "secret.jsonl"
+    secret_dir = tmp_path / "secret-dir"
+    secret_dir.mkdir()
+    secret = secret_dir / "secret.jsonl"
     secret.write_text(
         json.dumps({"role": "user", "content": "hunter2", "ts": "2026-08-01T10:00:00+00:00"})
         + "\n",
         encoding="utf-8",
     )
-    (sessions / "dashboard_chat-1.jsonl").symlink_to(secret)
+    make_dir_link(sessions / "dashboard_chat-1.jsonl", secret_dir)
     report = run_backfill(home, apply=False)
     assert report["kinds"].get("session/message") is None
     assert report["failures"].get("transcripts", 0) >= 1

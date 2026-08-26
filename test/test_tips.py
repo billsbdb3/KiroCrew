@@ -27,7 +27,9 @@ from kiro_crew.tips import (
     _select_tip,
     _validate_tip_fields,
 )
-from kiro_crew.tips_text import truncate_summary
+from kiro_crew.tips_text import SUMMARY_MAX_CHARS, truncate_summary
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestCatalogParsing:
@@ -719,7 +721,7 @@ class TestCatalogAllowlist:
         """Catch allowlist drift: every listed doc must exist in the docs dir."""
         from kiro_crew.tips_allowlist import TIP_DOC_ALLOWLIST
 
-        docs_dir = Path("src/kiro_crew/docs")
+        docs_dir = _REPO_ROOT / "src/kiro_crew/docs"
         if not docs_dir.is_dir():  # running from an installed package
             import kiro_crew
 
@@ -753,6 +755,51 @@ class TestStateFilePermissions:
             st_file.chmod(0o644)
             _save_state(TipsState())
             assert (st_file.stat().st_mode & 0o777) == 0o600
+
+    def test_lockdown_precedes_content(self, tmp_path: Path, monkeypatch) -> None:
+        """The memory-derived payload must never exist in a file that has not
+        been locked down yet.
+
+        On Windows the POSIX mode bits are a no-op, so the owner-only DACL from
+        ``restrict_to_owner`` is the only protection; applying it after the
+        rename left the state readable under the inherited ACL for the write
+        window (issue #5285). Asserted by measuring the file's SIZE at lockdown
+        time — zero means no payload byte existed yet. A post-write stat passes
+        on the buggy ordering too, so it would not be a regression test.
+        """
+        from kiro_crew import platform_compat
+
+        sizes: list[int] = []
+        real_restrict = platform_compat.restrict_to_owner
+
+        def _measuring_restrict(target):
+            sizes.append(Path(target).stat().st_size)
+            return real_restrict(target)
+
+        monkeypatch.setattr(platform_compat, "restrict_to_owner", _measuring_restrict)
+        with patch.dict(os.environ, {"KIROCREW_HOME": str(tmp_path)}):
+            _save_state(TipsState(tips=[{"id": "x", "why": "references user projects"}]))
+
+        assert sizes, "premise: the lockdown ran at all"
+        assert sizes[0] == 0, (
+            f"the file already held payload bytes when it was locked down: {sizes[0]} bytes"
+        )
+
+    def test_a_failed_lockdown_still_persists_the_state(self, tmp_path: Path, monkeypatch) -> None:
+        """``restrict_on_error="warn"`` keeps this site's established policy: a
+        lockdown failure must not break tips persistence, but it must be
+        visible (the helper logs it)."""
+        from kiro_crew import platform_compat
+
+        def _refuse(_target):
+            raise OSError("read-only ACL store")
+
+        monkeypatch.setattr(platform_compat, "restrict_to_owner", _refuse)
+        with patch.dict(os.environ, {"KIROCREW_HOME": str(tmp_path)}):
+            _save_state(TipsState(dismissed_docs=["a.md"]))
+            st_file = tmp_path / "tips_state.json"
+            assert st_file.is_file(), "warn policy must keep the write"
+            assert json.loads(st_file.read_text())["dismissed_docs"] == ["a.md"]
 
 
 class TestTipFieldAllowlist:
@@ -1424,6 +1471,29 @@ class TestTruncateSummary:
     def test_bang_and_question_boundaries(self) -> None:
         assert truncate_summary("Stop! Then more words follow here.", limit=10) == "Stop!"
         assert truncate_summary("Why? Then more words follow here.", limit=10) == "Why?"
+
+    def test_empty_string_returns_empty(self) -> None:
+        assert truncate_summary("") == ""
+
+    def test_default_limit_matches_summary_max_chars(self) -> None:
+        text = "word " * 80  # 400 chars, over the 300-char default cap
+        assert truncate_summary(text) == truncate_summary(text, SUMMARY_MAX_CHARS)
+        assert len(truncate_summary(text)) <= SUMMARY_MAX_CHARS
+
+    def test_result_never_exceeds_limit(self) -> None:
+        # Tightest guarantee across every branch, including sub-word limits where
+        # only the ellipsis (or a hard-cut prefix) fits — the existing cases only
+        # bound a single limit each.
+        samples = [
+            "",
+            "short",
+            "a sentence. another sentence. and more words trailing off here",
+            "nospacessingleverylongtokenwithoutanybreaks" * 3,
+            "word " * 200,
+        ]
+        for text in samples:
+            for limit in (1, 2, 5, 20, 100, 300):
+                assert len(truncate_summary(text, limit)) <= limit
 
 
 class TestCuratedTips:

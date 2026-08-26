@@ -2,15 +2,16 @@
 // by BOTH the issue Investigate action (lib/investigate.ts) and the pull-request
 // Review action (lib/review.ts). Only the seed PROMPT and the slot TITLE differ
 // between the two; every other step — resolve the per-repo chat folder, create a
-// slot filed into it, seed + auto-run the first turn, link the local record so a
-// repeat click RESUMES instead of duplicating, navigate to /chat — is identical,
-// so it lives here once.
+// slot filed into it and already titled, seed + auto-run the first turn, link the
+// local record so a repeat click RESUMES instead of duplicating, navigate to
+// /chat — is identical, so it lives here once.
 //
-// This is deliberately SELF-CONTAINED — it touches no KiroCrew-core files. A
-// first-party app runs inside the dashboard bundle, so it can dispatch the same
-// Redux thunks (`createSlot`, `switchSlot`) and call the same `api` chat
-// primitives the dashboard's own "New Chat" uses (verified precedents:
-// file-explorer / auto-research import the store + api client directly).
+// This deliberately FORKS NOTHING — a first-party app runs inside the dashboard
+// bundle, so it dispatches the same Redux thunks (`createSlot`, `switchSlot`) and
+// calls the same `api` chat primitives the dashboard's own "New Chat" uses
+// (verified precedents: file-explorer / auto-research import the store + api
+// client directly). Where a primitive is missing something this flow needs, the
+// fix belongs in that primitive rather than in a private copy here.
 //
 // The per-item record is the SAME store on both sides
 // (via /api/apps/issue-radar/investigation), NAMESPACED by item kind. On GitHub
@@ -26,6 +27,7 @@ import { useNavigate } from 'react-router-dom'
 import { useAppDispatch } from '../../../store'
 import { createSlot, switchSlot, deleteSlot } from '../../../store/chatSlice'
 import { api } from '../../../api/client'
+import { readSendReceipt } from '../../../utils/sendDelivery'
 import { issueRadarApi, type InvestigationRecord, type ItemKind, RepoRef } from '../api'
 
 /** One folder per connected repo groups all its sessions. */
@@ -118,9 +120,9 @@ export function useAgentSession(): UseAgentSession {
           }
         }
 
-        // ── Fresh session: folder → slot (filed) → seed+run → link.
+        // ── Fresh session: folder → slot (filed + titled) → seed+run → link.
         const folderId = await resolveFolderId(repoRef.repo)
-        const slot = await dispatch(createSlot({ folder_id: folderId })).unwrap()
+        const slot = await dispatch(createSlot({ folder_id: folderId, title })).unwrap()
         // The slot is persisted but not yet linked to an investigation record, so
         // a failure before the seed leaves an EMPTY session behind — and the next
         // attempt, finding no record, would create another one. Rollback covers
@@ -130,8 +132,6 @@ export function useAgentSession(): UseAgentSession {
         // transient metadata write failure. An unlinked-but-working session is
         // strictly better than a destroyed one.
         createdSlotKey = slot.key
-        // Best-effort readable title; the session works regardless.
-        api.renameSlot(slot.key, title).catch(() => {})
         // Seed + auto-run the first turn (background task; persisted + survives
         // the navigation). await ensures the user message is stored before we
         // switch, so it paints immediately on arrival.
@@ -141,11 +141,24 @@ export function useAgentSession(): UseAgentSession {
         const seedInFlight = api.sendChat(prompt, slot.key)
         createdSlotKey = null
         const seeded = await seedInFlight
-        if (seeded && typeof seeded === 'object' && 'ok' in seeded && !(seeded as Response).ok) {
-          // Rejected outright, so nothing is running: the empty slot is safe (and
-          // wrong) to remove.
-          await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
-          throw new Error(`could not seed the session (HTTP ${(seeded as Response).status})`)
+        // A REFUSAL, not merely a non-2xx: `/api/chat` also declines inside a 200
+        // by answering `{ok:false}`, and a status-only check passed that as a
+        // success -- recording and navigating to exactly the empty session this
+        // guard exists to prevent. `readSendReceipt` owns that distinction for
+        // every send site. An UNREADABLE 2xx receipt deliberately does NOT land
+        // here: the request was accepted, so the seed may be running, and
+        // deleting the slot would cancel real work over a mangled reply.
+        if (seeded && typeof seeded === 'object' && 'ok' in seeded) {
+          const { body, outcome } = await readSendReceipt(seeded as Response)
+          if (outcome === 'refused') {
+            // Rejected outright, so nothing is running: the empty slot is safe
+            // (and wrong) to remove.
+            await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
+            const reason = typeof body.error === 'string' && body.error
+              ? body.error
+              : `HTTP ${(seeded as Response).status}`
+            throw new Error(`could not seed the session (${reason})`)
+          }
         }
         const res = await issueRadarApi.saveInvestigation(repoRef, number, {
           slot_key: slot.key,

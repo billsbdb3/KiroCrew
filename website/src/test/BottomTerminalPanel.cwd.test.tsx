@@ -39,7 +39,7 @@ vi.mock('../utils/terminalPopout', () => ({
   returnSelfToMain: vi.fn(),
 }))
 vi.mock('../hooks/usePanelTabs', () => ({
-  usePanelTabs: () => ({ adoptTerminal: vi.fn() }),
+  usePanelTabs: () => ({}),
 }))
 
 beforeEach(() => {

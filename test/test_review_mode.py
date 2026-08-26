@@ -318,6 +318,59 @@ class TestTeamIdInjection:
         assert result is True
         assert c._web.conversations_info.await_args.kwargs["team_id"] == "TWORK"
 
+    # ── ensure_channel_team: the cache's only production feeder ──────
+
+    @pytest.mark.asyncio
+    async def test_ensure_resolves_the_home_workspace_not_the_author(self) -> None:
+        """The value that enters the routing cache is the channel's HOME
+        workspace (conversations_info's ``context_team_id``). An inbound
+        event's ``team`` is the author's workspace — a participant's, on a
+        shared channel — and must never reach this cache; the inbound
+        handler therefore never passes it here."""
+        c = self._client()
+        resp = MagicMock()
+        resp.data = {"channel": {"id": "C1", "context_team_id": "THOME"}}
+        c._web.conversations_info = AsyncMock(return_value=resp)
+        await c.ensure_channel_team("C1")
+        assert c._channel_team == {"C1": "THOME"}
+
+    @pytest.mark.asyncio
+    async def test_ensure_skips_a_channel_already_resolved(self) -> None:
+        c = self._client()
+        c.record_channel_team("C1", "TKNOWN")
+        c._web.conversations_info = AsyncMock()
+        await c.ensure_channel_team("C1")
+        c._web.conversations_info.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_is_retried_once_per_process_not_per_message(self) -> None:
+        """A channel whose home team cannot be resolved must not cost one
+        conversations_info call per inbound message for the rest of the run."""
+        c = self._client()
+        c._web.conversations_info = AsyncMock(side_effect=RuntimeError("missing scope"))
+        await c.ensure_channel_team("C1")
+        await c.ensure_channel_team("C1")
+        await c.ensure_channel_team("C1")
+        assert c._web.conversations_info.await_count == 1
+        assert c._channel_team == {}
+        # And the outbound routing answer for it is a no-op, exactly as for
+        # a channel the cache has never seen.
+        kw: dict = {"channel": "C1"}
+        c._inject_team("C1", kw)
+        assert "team_id" not in kw
+
+    @pytest.mark.asyncio
+    async def test_an_answer_without_context_team_id_counts_as_unresolved(self) -> None:
+        c = self._client()
+        resp = MagicMock()
+        resp.data = {"channel": {"id": "C1"}}
+        c._web.conversations_info = AsyncMock(return_value=resp)
+        await c.ensure_channel_team("C1")
+        assert c._channel_team == {}
+        # Same per-process bound as an erroring lookup.
+        await c.ensure_channel_team("C1")
+        assert c._web.conversations_info.await_count == 1
+
     # ── start_stream workspace_team priority ─────────────────────────
 
     @pytest.mark.asyncio
@@ -356,6 +409,21 @@ class TestTeamIdInjection:
         body = c._web.api_call.await_args.kwargs["json"]
         assert "team_id" not in body
         assert "recipient_team_id" not in body
+
+    @pytest.mark.asyncio
+    async def test_start_stream_derives_recipient_team_from_cache(self) -> None:
+        """Regression: an org-wide install answers startStream with
+        ``missing_recipient_team_id`` when the recipient's workspace is absent,
+        and the renderer transport path never threads an explicit ``team_id`` —
+        so the cached channel team must also satisfy ``recipient_team_id``. For a
+        channel message the recipient's workspace IS the channel's workspace."""
+        c = self._client()
+        c._web.api_call = AsyncMock(return_value={"ts": "1"})
+        c.record_channel_team("C1", "TCHANNEL_A")
+        await c.start_stream("C1", "thread1")
+        body = c._web.api_call.await_args.kwargs["json"]
+        assert body["team_id"] == "TCHANNEL_A"
+        assert body["recipient_team_id"] == "TCHANNEL_A"
 
     # ── Streaming append/stop ────────────────────────────────────────
 

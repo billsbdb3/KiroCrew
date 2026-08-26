@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -164,8 +166,8 @@ class TestCronService:
         svc = CronService(base_dir=tmp_path)
         svc._load()
         job = svc.add_job(name="rm", message="bye", every_secs=300)
-        assert svc.remove_job(job.id)
-        assert not svc.remove_job("nonexistent")
+        assert svc.remove_job(job.id, actor="test", source="test")
+        assert not svc.remove_job("nonexistent", actor="test", source="test")
 
     def test_list_jobs(self, tmp_path: Path) -> None:
         svc = CronService(base_dir=tmp_path)
@@ -484,6 +486,158 @@ class TestEffectiveDelay:
         job.enabled = False
 
         assert svc._effective_delay() == _TIMER_POLL_SECS
+
+
+class TestJobCompletionRearmsTimer:
+    """A job that ran for most of its interval must not have to wait out a
+    stale wake (up to _TIMER_POLL_SECS) before its next tick is dispatched:
+    completion re-arms the timer with the job's real next-due delay."""
+
+    @pytest.mark.asyncio
+    async def test_run_job_isolated_rearms_the_timer(self, tmp_path: Path) -> None:
+        svc = CronService(base_dir=tmp_path)
+        job = CronJob(
+            id="j1", name="watch", message="go",
+            schedule=CronSchedule(kind="every", every_secs=60),
+        )
+        svc._jobs = [job]
+        svc._save()
+        svc._running = True
+
+        with (
+            patch.object(svc, "_execute_with_timeout", return_value=None),
+            patch.object(svc, "_arm_timer") as mock_arm,
+        ):
+            await svc._run_job_isolated(job)
+
+        mock_arm.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_run_job_isolated_does_not_rearm_a_stopped_service(
+        self, tmp_path: Path
+    ) -> None:
+        """A job finishing during/after shutdown must not spin up a fresh
+        timer task behind close_all()'s back."""
+        svc = CronService(base_dir=tmp_path)
+        job = CronJob(
+            id="j1", name="watch", message="go",
+            schedule=CronSchedule(kind="every", every_secs=60),
+        )
+        svc._jobs = [job]
+        svc._save()
+        svc._running = False
+
+        with (
+            patch.object(svc, "_execute_with_timeout", return_value=None),
+            patch.object(svc, "_arm_timer") as mock_arm,
+        ):
+            await svc._run_job_isolated(job)
+
+        mock_arm.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_completed_job_replaces_a_longer_sleeping_timer_task(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression for the reported bug: before this fix, nothing called
+        _arm_timer() on job completion, so a job that became due again
+        sooner than the CURRENTLY armed (long) sleep had to wait out that
+        stale wake -- up to _TIMER_POLL_SECS late. Simulates that exact
+        situation: a timer task already sleeping for a long time is armed
+        when the job finishes; completion must cancel it and arm a fresh,
+        shorter one instead of leaving the stale one in place."""
+        svc = CronService(base_dir=tmp_path)
+        job = CronJob(
+            id="j1", name="watch", message="go",
+            schedule=CronSchedule(kind="every", every_secs=60),
+        )
+        svc._jobs = [job]
+        svc._save()
+        svc._running = True
+        svc._loop = asyncio.get_running_loop()
+
+        async def _sleep_forever() -> None:
+            await asyncio.sleep(9999)
+
+        stale_timer_task = asyncio.create_task(_sleep_forever())
+        svc._timer_task = stale_timer_task
+        await asyncio.sleep(0)  # let it actually start sleeping
+
+        with patch.object(svc, "_execute_with_timeout", return_value=None):
+            await svc._run_job_isolated(job)
+        await asyncio.sleep(0)  # let the cancellation propagate
+
+        assert stale_timer_task.cancelled()
+        assert svc._timer_task is not None
+        assert svc._timer_task is not stale_timer_task
+
+        svc._timer_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await svc._timer_task
+
+
+class TestArmTimerDuringOnTimer:
+    """_arm_timer(), called from a job's own completion handler, must not
+    cancel self._timer_task while _on_timer is still mid-sweep on it (the
+    yield at its own to_thread scan) -- that's a DIFFERENT task calling in
+    than the timer's own, so the pre-existing self-referential guard alone
+    doesn't cover it. See _arm_timer's second guard clause."""
+
+    @pytest.mark.asyncio
+    async def test_arm_timer_does_not_cancel_the_timer_task_mid_sweep(
+        self, tmp_path: Path
+    ) -> None:
+        svc = CronService(base_dir=tmp_path)
+        svc._running = True
+        svc._loop = asyncio.get_running_loop()
+
+        async def _sleep_forever() -> None:
+            await asyncio.sleep(9999)
+
+        fake_timer_task = asyncio.create_task(_sleep_forever())
+        svc._timer_task = fake_timer_task
+        svc._on_timer_running = True
+        try:
+            svc._arm_timer()  # called from THIS task, not svc._timer_task
+            await asyncio.sleep(0)
+            assert not fake_timer_task.cancelled()
+            assert not fake_timer_task.done()
+            assert svc._timer_task is fake_timer_task
+        finally:
+            svc._on_timer_running = False
+            fake_timer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await fake_timer_task
+
+    @pytest.mark.asyncio
+    async def test_arm_timer_still_replaces_the_task_once_the_sweep_is_done(
+        self, tmp_path: Path
+    ) -> None:
+        """The guard is scoped to the sweep window only -- once _on_timer
+        has returned (the common case: the timer task is just sleeping,
+        not mid-dispatch), a completion-triggered re-arm still cancels and
+        replaces it immediately, which is the actual fix for the reported
+        lateness."""
+        svc = CronService(base_dir=tmp_path)
+        svc._running = True
+        svc._loop = asyncio.get_running_loop()
+
+        async def _sleep_forever() -> None:
+            await asyncio.sleep(9999)
+
+        fake_timer_task = asyncio.create_task(_sleep_forever())
+        svc._timer_task = fake_timer_task
+        svc._on_timer_running = False
+        try:
+            svc._arm_timer()
+            await asyncio.sleep(0)
+            assert fake_timer_task.cancelled()
+            assert svc._timer_task is not fake_timer_task
+        finally:
+            if svc._timer_task and not svc._timer_task.done():
+                svc._timer_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await svc._timer_task
 
 
 class TestFormatSchedule:

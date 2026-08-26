@@ -7,6 +7,7 @@ import { sanitizeLlmOutput } from '../../utils/sanitize'
 import type { SubagentActivity } from '../../types'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 const EMPTY_SUBAGENTS: Record<string, SubagentActivity> = {}
 
 /** Max agent rows rendered in the chip — exceptions (stalled/retrying) sort
@@ -32,6 +33,7 @@ interface SpawnListResponse {
 
 /** Active subagent summary above the chat input. */
 const SubagentProgressBar = memo(function SubagentProgressBar({ slot }: { slot: string | null }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Use chatSlice.subagents — populated by subagent_spawn/tool/done WS events
   // (dashboardSlice.subagentRunning only updates on subagent_status which fires at completion)
   const dispatch = useAppDispatch()
@@ -136,7 +138,7 @@ const SubagentProgressBar = memo(function SubagentProgressBar({ slot }: { slot: 
     // consent modal (z=120), and under modal backdrops (z-[46], later in DOM).
     // Without this the chip sits at auto z-index and a fullscreen overlay (e.g.
     // an activate-time transition wipe) covers it for the overlay's lifetime.
-    <div className="px-5 mx-auto w-full relative z-[46]" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+    <div className="px-4 mx-auto w-full relative z-[46]" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
       <div className="mb-1 rounded-md bg-accent/10 border border-accent/20 animate-slide-up overflow-hidden">
         {/* Chrome type, so no `font-mono`: the wave chip is prose and labels,
             and Tailwind's `font-mono` pins `var(--mono)` — a token the Font
@@ -171,8 +173,9 @@ const SubagentProgressBar = memo(function SubagentProgressBar({ slot }: { slot: 
                 className="shrink-0 flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded border border-accent/40 text-accent/80 hover:bg-accent/10 hover:text-accent cursor-pointer transition-all bg-transparent disabled:opacity-50"
                 onClick={retryFailed}
                 disabled={retrying}
-                aria-label={`Retry ${failedIds.length} failed subagent${failedIds.length > 1 ? 's' : ''}`}
               >
+                {/* No aria-label: the accessible name IS the visible text below,
+                    so WCAG 2.5.3 (Label in Name) holds by construction. */}
                 <RotateCcw size={11} className={retrying ? 'animate-spin' : ''} /> {i18nT('pages.chat.subagentProgressBar.retry_failed_count', { count: failedIds.length })}
               </button>
             )}
@@ -182,7 +185,7 @@ const SubagentProgressBar = memo(function SubagentProgressBar({ slot }: { slot: 
                 onClick={stopAll}
                 aria-label={stoppableCount > 1 ? i18nT('pages.chat.subagentProgressBar.stop_all_running_subagents') : i18nT('pages.chat.subagentProgressBar.stop_running_subagent')}
               >
-                <X size={11} /> {i18nT('pages.chat.subagentProgressBar.stop')}{stoppableCount > 1 ? ' all' : ''}
+                <X size={11} /> {stoppableCount > 1 ? i18nT('pages.chat.subagentProgressBar.stop_all') : i18nT('pages.chat.subagentProgressBar.stop')}
               </button>
             )}
           </span>
@@ -193,6 +196,15 @@ const SubagentProgressBar = memo(function SubagentProgressBar({ slot }: { slot: 
             const taskPreview = sanitizeLlmOutput((a.task || '').slice(0, 80)) + ((a.task || '').length > 80 ? '…' : '')
             const agentLabel = taskPreview || sanitizeLlmOutput(a.agent || 'agent')
             const elapsed = Math.round((Date.now() - a.startedAt) / 1000)
+            // The backend sends `idle_secs` once, on the stalled transition, so a
+            // bare render would freeze at that value beside the live `elapsed`
+            // above — the same two-numbers-disagree confusion this row exists to
+            // remove. `stalled` means no activity by definition, so advancing it
+            // locally from the receipt instant is sound. The 1Hz tick above
+            // re-renders it.
+            const idleShown = typeof a.idleSecs === 'number'
+              ? a.idleSecs + (a.stalledAt ? Math.max(0, Math.round((Date.now() - a.stalledAt) / 1000)) : 0)
+              : undefined
             const stoppable = a.status === 'running' || a.status === 'tool'
             return (
               <div key={a.id} data-testid="subagent-row" className="flex items-start gap-1">
@@ -208,7 +220,7 @@ const SubagentProgressBar = memo(function SubagentProgressBar({ slot }: { slot: 
                   <span className="min-w-0 flex-1">
                     <span className="flex items-center gap-1.5">
                       <span className="min-w-0 flex-1 truncate text-text">{agentLabel}</span>
-                      <span className="shrink-0 font-mono tabular-nums text-muted/50">{elapsed}{i18nT('pages.chat.subagentProgressBar.s')}{typeof a.toolCount === 'number' && a.toolCount > 0 ? ` · ${a.toolCount} tool${a.toolCount > 1 ? 's' : ''}` : ''}</span>
+                      <span className="shrink-0 font-mono tabular-nums text-muted/50">{elapsed}{i18nT('pages.chat.subagentProgressBar.s')}{typeof a.toolCount === 'number' && a.toolCount > 0 ? ` · ${i18nT('pages.chat.subagentProgressBar.tool', { count: a.toolCount })}` : ''}</span>
                     </span>
                     {a.retrying ? (
                       <span className="text-info flex items-center gap-1">
@@ -218,10 +230,21 @@ const SubagentProgressBar = memo(function SubagentProgressBar({ slot }: { slot: 
                     ) : a.stalled ? (
                       <span className="text-warn flex items-center gap-1">
                         <AlertTriangle size={11} className="shrink-0" />
-                        {/* The tool name carries the same mono as the non-stalled
-                            `→ lastTool` line below — the two render the SAME value
-                            and diverged once the parent stopped supplying it. */}
-                        <span className="truncate">{i18nT('pages.chat.subagentProgressBar.stalled')}{a.lastTool ? <span className="font-mono">{` at ${sanitizeLlmOutput(a.lastTool)}`}</span> : ''} {i18nT('pages.chat.subagentProgressBar.no_activity')}</span>
+                        {/* Hedged to match the header tooltip: the watchdog sees
+                            an ABSENCE of stream events, which a slow silent tool
+                            also produces — it cannot prove a stall, so it must
+                            not assert one. The idle span (not `elapsed`) is the
+                            figure that justifies the warning, so it is shown
+                            here; `elapsed` already sits on the row above and the
+                            two are different numbers. The tool name carries the
+                            same mono as the non-stalled `→ lastTool` line. */}
+                        <span className="truncate">
+                          {i18nT('pages.chat.subagentProgressBar.possibly_stalled')}
+                          {a.lastTool ? <span className="font-mono">{` at ${sanitizeLlmOutput(a.lastTool)}`}</span> : ''}
+                          {typeof idleShown === 'number'
+                            ? ` — ${i18nT('pages.chat.subagentProgressBar.no_activity_for', { secs: idleShown })}`
+                            : ` ${i18nT('pages.chat.subagentProgressBar.no_activity')}`}
+                        </span>
                       </span>
                     ) : (a.lastTool && <span className="block font-mono text-accent/60 truncate">→ {sanitizeLlmOutput(a.lastTool)}</span>)}
                   </span>

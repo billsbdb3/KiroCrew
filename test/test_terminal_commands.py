@@ -365,6 +365,10 @@ class TestSanitizedPath:
         assert resolved[0] == str(real)
 
     @pytest.mark.skipif(sys.platform == "win32", reason="uid 0 has no meaning on Windows")
+    @pytest.mark.skipif(
+        os.path.exists("/usr/bin") and os.stat("/usr/bin").st_uid != 0,
+        reason="system directories not root-owned on this host",
+    )
     def test_a_system_directory_is_trusted_without_any_config(self):
         # `/usr/bin` must work out of the box or the tier ships dead. Deliberately
         # NOT `/usr/local/bin`: CI runners hand that to the build user, so asserting
@@ -1035,6 +1039,7 @@ class TestProbeWithoutASandbox:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="probes are POSIX-only")
 @_NEEDS_SANDBOX
+@pytest.mark.xdist_group("sandbox_probe")
 class TestRunProbe:
     """The real subprocess path, driven with stock POSIX utilities rather than a
     CLI that may not be installed on the runner."""
@@ -1117,13 +1122,21 @@ class TestRunProbe:
         assert out.strip() == "[]"
 
     @pytest.mark.asyncio
-    async def test_the_environment_is_an_allowlist_not_a_filtered_inherit(self, monkeypatch):
+    async def test_the_environment_is_an_allowlist_not_a_filtered_inherit(self, monkeypatch, tmp_path):
         # A denylist covers the credential names it knows and, by construction,
         # cannot cover the ones it does not — `GH_TOKEN`, `KUBECONFIG`, `NPM_TOKEN`
         # and every future tool's variable would have reached the child. So the
         # environment is built from nothing instead of filtered down.
-        for name in ("GH_TOKEN", "GITHUB_TOKEN", "KUBECONFIG", "NPM_TOKEN", "HOME"):
+        for name in ("GH_TOKEN", "GITHUB_TOKEN", "KUBECONFIG", "NPM_TOKEN"):
             monkeypatch.setenv(name, f"leaked-{name}")
+        # HOME keeps the `leaked-` marker but must be an ABSOLUTE path: on hosts
+        # where the userns sandbox is unavailable the probe child runs unsandboxed
+        # and inherits pytest's CWD (the repo root), and the workspace resolver
+        # mkdirs $HOME/workplace/... — a relative sentinel like "leaked-HOME"
+        # lands that tree inside the checkout and trips the conftest
+        # root-residue guard. Anchoring it under tmp_path keeps the leak
+        # assertion at full strength while any stray resolution stays in tmp.
+        monkeypatch.setenv("HOME", str(tmp_path / "leaked-HOME"))
         out = await tc._run_probe(["/bin/sh", "-c", "env"], None)
         assert out is not None
         assert "leaked-" not in out
@@ -1140,8 +1153,14 @@ class TestRunProbe:
         # not ours and not a leak — it is injected by the kernel/dyld, not
         # inherited from the parent environment.
         os_injected = {"__CF_USER_TEXT_ENCODING"} if sys.platform == "darwin" else set()
+        # systemd injects session markers into processes it manages (systemd-run
+        # --user --scope). These are not inherited from the parent env and are
+        # not credentials — they identify the unit/journal stream.
+        systemd_injected = {"INVOCATION_ID", "JOURNAL_STREAM", "SYSTEMD_EXEC_PID",
+                            "MANAGERPID", "LISTEN_FDS", "LISTEN_FDNAMES"}
         names = {line.split("=", 1)[0] for line in out.splitlines() if "=" in line}
-        assert names <= ours | sandbox_injected | shell_added | os_injected, names
+        assert names <= (ours | sandbox_injected | shell_added | os_injected
+                         | systemd_injected), names
 
     @pytest.mark.asyncio
     async def test_the_child_path_is_the_sanitized_one(self, monkeypatch):

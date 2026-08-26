@@ -3,8 +3,10 @@
 ## Overview
 
 The side conversation module adds an ephemeral Q&A thread to a parent chat
-slot. Users invoke it via the `/side` command or the "Side" tab in the
-Activity panel. The `/side` command is intercepted client-side regardless of
+slot. Users invoke it via the `/side` command or the "Side Chat" tab in the
+Activity panel — the user-facing name is Side Chat, while `side` remains the
+internal spelling for the tab id, state, routes and this module. The `/side`
+command is intercepted client-side regardless of
 the parent turn's state: while a turn is running, the composer's steer path
 checks `isInterceptedSlashCommand` before steering, so the command opens the
 side chat instead of being injected into the running turn as literal text.
@@ -71,8 +73,10 @@ so the two surfaces cannot drift.
 | `steer` (default) | `POST .../side/turn` with `{"steer": true}` injects the text into the RUNNING turn via the isolated session's `steer()` RPC. |
 | `queue` | The text is held on `SideState.queue` and dispatched as the next turn when the current one ends. |
 
-Which mode Enter takes is ONE user preference (`mc-busy-send-mode` in
-localStorage), shared live between the main composer and the side panel.
+Which mode Enter takes is a PER-SLOT preference (`mc-busy-send-mode:<slot>` in
+localStorage), shared live between one session's main composer and its side
+panel; other sessions keep their own mode. A slot that has never chosen a mode
+inherits the legacy unscoped `mc-busy-send-mode` value.
 
 Fall-through, not rejection: a steer is attempted only when the isolated session
 exists, reports `supports_steer`, and `has_active_turn()` is true. Any of those
@@ -268,8 +272,8 @@ Deliberately separate from `broadcast_ws` main-channel events.
 
 ### `ActivityViewer.tsx`
 
-5th tab: `{key: 'side', label: 'Side', icon: MessageSquare}`. Renders
-`<SideChat slot={slot} />` when active.
+5th tab: `{key: 'side', label: i18nT('pages.chat.activityViewer.side'), icon:
+MessageCircleQuestionMark}`. Renders `<SideChat slot={slot} />` when active.
 
 ### `SideChat.tsx`
 
@@ -283,8 +287,10 @@ cancel and edit wait for the server's own frame before changing what the user
 sees.
 
 The composer's DRAFT behaviour is not owned here. It comes from the chat SDK's
-`app-sdk/useComposerDraft`, which this surface was the first consumer of, and
-which owns four invariants this file must not re-derive:
+`app-sdk/useComposerDraft`, which this surface was the first consumer of
+(`app-sdk/ChatEmbed.tsx` the second, wired to its bare `<input>` via the same
+`submitOnEnter`/`isComposing` without attaching `textareaRef` — no auto-grow
+box to size), and which owns four invariants this file must not re-derive:
 
 - A follow-up pick edits the draft, and the picked set is read back OFF the draft
   rather than stored beside it. The draft is what gets submitted, so it is the
@@ -296,7 +302,13 @@ which owns four invariants this file must not re-derive:
 - An Enter that commits an IME candidate is not a submit. This surface's own
   handler predated the shared hook and lacked the guard, so a Chinese/Japanese/
   Korean candidate confirmed with Enter submitted the partial text with nothing
-  left to recover.
+  left to recover. Declining the submit does not release the key: the guard
+  consumes it (`useImeGuard`'s `claimEnter`), because the browser's default for an
+  unclaimed Enter is to put a line break in the draft. Recovery from a composition
+  abandoned without a `compositionend` ships with the tracking rather than with the
+  caller -- `ime.bindComposition()` is the only composition binding the hook
+  exposes, and it carries the blur reset, because a latched guard now declines
+  Enter silently instead of visibly.
 - The submit size limit (`MAX_QUESTION_BYTES`) is measured in UTF-8 bytes, not
   code units. The hook only reports whether the limit is exceeded; this file
   still owns the refusal and its wording.

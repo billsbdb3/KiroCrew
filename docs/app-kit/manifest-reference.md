@@ -20,6 +20,11 @@ The app manifest (`app.json`) declares your app's identity, resources, and requi
 | `minKiroCrewVersion` | string | Minimum Gateway version required |
 | `tags` | string[] | Discovery tags (e.g. `["oncall", "monitoring"]`) |
 | `jobFamilies` | string[] | Job families this app is relevant to |
+| `highlights` | string[] | Concise feature bullets for the detail page |
+| `useCases` | string[] | Short, operator-oriented situations where the app is useful |
+| `configuration` | string[] | Concise setup or configuration steps shown on the detail page |
+| `screenshots` | string[] | Real product screenshots; paths follow the same distribution rules as hero art |
+| `screenshotsDark` | string[] | Optional dark-appearance screenshot variants |
 
 ## Resources
 
@@ -126,6 +131,69 @@ installed against:
 | `ui.pages[].mountFunction` | string | `"mount"` | Exported function name in the ESM bundle |
 | `ui.sidebar.section` | string | `"Apps"` | Sidebar section name |
 | `ui.sidebar.order` | number | `10` | Sort order within section |
+| `ui.overlays[].id` | string | | Overlay id; must match a bundled overlay component (see below) |
+| `ui.overlays[].replaces` | string | | Host overlay slot this app takes over while enabled |
+
+### `ui.overlays` — Replacing a Host Overlay Surface
+
+An overlay is a surface that floats above whatever the user is looking at and is
+opened by a gesture the host owns, so unlike `ui.pages` it has no route and no
+sidebar placement. Declaring one lets an enabled app take over a host surface:
+
+```json
+{
+  "ui": {
+    "overlays": [
+      { "id": "command-bar", "replaces": "quick-search" }
+    ]
+  }
+}
+```
+
+`replaces` names a host slot. `quick-search` is the only slot the dashboard
+currently offers -- it is the Cmd+K / Ctrl+K surface -- and an unknown slot name is
+reported and ignored rather than silently dropping the overlay.
+
+**Host-internal until App Kit adopts it.** Both fields are validated by the backend
+for any manifest, but only an app whose `origin` is `builtin` can actually claim a
+slot: an overlay `id` must name a component compiled into the dashboard bundle, and
+there is no ESM `entryPoint` for overlays the way `ui.pages` has one. An installed app
+declaring `ui.overlays` is refused at install, and a self-registered one is refused
+when slots are resolved -- `builtin` provenance is assigned only by the builtin
+registration Kiro Crew runs at startup and cannot be self-reported. Treat this as the
+mechanism builtin apps use to replace a host surface, not yet as a third-party
+extension point.
+
+A builtin declaring `ui.overlays` must NOT also declare `ui.entry`: builtin
+registration re-derives `origin` on every startup and downgrades an app that ships a
+UI bundle to `local`, which would then be refused its own slot. A test enforces this
+so the combination fails the build rather than silently reverting the surface.
+
+At most one enabled app owns a slot. When two enabled apps declare the same
+`replaces`, the first by app name wins and the collision is reported -- the winner
+does not depend on which app was enabled or installed more recently.
+
+### App Icon
+
+`iconPath` is the App Store's card and row icon, and it is **top-level** — not
+under `ui`. `ui.pages[].icon` and `ui.pages[].iconUrl` above are the sidebar glyph
+for an app that is already *installed*, a different surface; neither one supplies
+a store icon, and an app that declares only those publishes no icon at all.
+
+```json
+{
+  "iconPath": "assets/icon.png"
+}
+```
+
+`kirocrew app init` scaffolds `assets/icon.png` and this field, so a new app
+starts with a working icon rather than a placeholder card. Replace the generated
+placeholder with real artwork before publishing.
+
+For the artwork requirements — path form, dimensions, why the icon must be
+opaque, and how the dark variant relates — see
+[Publishing an app](publishing-guide.md), which owns that spec for every art
+field.
 
 ### Hero Images
 
@@ -138,7 +206,9 @@ and detail cards. The path form depends on how the app is distributed:
   ```json
   {
     "heroImage": "/apps/my-app/ui/hero-light.svg",
-    "heroImageDark": "/apps/my-app/ui/hero-dark.svg"
+    "heroImageDark": "/apps/my-app/ui/hero-dark.svg",
+    "heroImageDetail": "/apps/my-app/ui/hero-detail-light.svg",
+    "heroImageDetailDark": "/apps/my-app/ui/hero-detail-dark.svg"
   }
   ```
 
@@ -149,7 +219,9 @@ and detail cards. The path form depends on how the app is distributed:
   ```json
   {
     "heroImage": "ui/hero-light.svg",
-    "heroImageDark": "ui/hero-dark.svg"
+    "heroImageDark": "ui/hero-dark.svg",
+    "heroImageDetail": "ui/hero-detail-light.svg",
+    "heroImageDetailDark": "ui/hero-detail-dark.svg"
   }
   ```
 
@@ -157,6 +229,11 @@ and detail cards. The path form depends on how the app is distributed:
 |-------|------|-------------|
 | `heroImage` | string | Hero image shown on the App Store card (light theme) |
 | `heroImageDark` | string | Hero image variant used in dark theme |
+| `heroImageDetail` | string | Wide banner preferred by the detail page (light theme) |
+| `heroImageDetailDark` | string | Wide detail banner used in dark theme |
+
+Hero images are illustrative marketing art. `screenshots` are separate and must
+show the real product UI; the detail page renders both when both are declared.
 
 ## Backend
 
@@ -456,6 +533,8 @@ the user to run locally instead of executing it on the server.
 - All required fields must be non-empty strings
 - Each cron entry must specify either `every` or `cron_expr`
 - Each UI page must have `route` and `label`
+- Each UI overlay must have `id` and `replaces`; both must be kebab-case, and `id`
+  must be unique within the manifest
 
 ## Full Example
 
@@ -467,6 +546,9 @@ the user to run locally instead of executing it on the server.
   "description": "Monitor tickets, pipelines, and alarms for your on-call rotation",
   "author": "kirocrew",
   "tags": ["oncall", "monitoring"],
+  "useCases": ["Keep a shared view of firing alerts and active investigations"],
+  "configuration": ["Connect an alert provider in Settings, then start in read-only mode"],
+  "screenshots": ["ui/screenshots/board.png"],
   "agents": ["agents/ticket-analyst.json"],
   "skills": ["skills/oncall-runbook"],
   "crons": [

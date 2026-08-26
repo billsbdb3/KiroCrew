@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+import tempfile
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock
@@ -399,6 +402,13 @@ def test_provider_executable_rejects_relative_override(monkeypatch) -> None:
         source._resolve_provider_executable("gh")
 
 
+_tmp_owner_ok = (
+    sys.platform == "win32"
+    or os.stat(tempfile.gettempdir()).st_uid in (0, os.geteuid())
+)
+
+
+@pytest.mark.skipif(not _tmp_owner_ok, reason="temp dir not owned by root or current user")
 def test_provider_executable_accepts_user_owned_install(monkeypatch, tmp_path) -> None:
     """The default policy accepts the user's own gh — the Homebrew case that
     previously forced a `sudo cp` into a root-owned directory."""
@@ -412,6 +422,7 @@ def test_provider_executable_accepts_user_owned_install(monkeypatch, tmp_path) -
     assert source._resolve_provider_executable("gh") == str(executable.resolve())
 
 
+@pytest.mark.skipif(not _tmp_owner_ok, reason="temp dir not owned by root or current user")
 def test_provider_executable_accepts_symlinked_install(monkeypatch, tmp_path) -> None:
     """Homebrew's layout (bin/gh -> ../Cellar/gh/<v>/bin/gh) resolves through the
     symlink instead of being refused for not being canonical."""
@@ -694,6 +705,39 @@ async def test_run_json_refuses_provider_cli_on_windows(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_json_resolves_the_provider_cli_off_the_event_loop(monkeypatch) -> None:
+    """Resolution stats every candidate and the whole parent chain of each hit,
+    and the sidebar chip refresh reaches it on a timer with no user present. On
+    the loop thread a slow filesystem freezes every task until the loop watchdog
+    kills the gateway, so the walk has to happen on a worker thread."""
+
+    class FakeProcess:
+        returncode = 0
+
+    resolver_threads: list[int] = []
+
+    def recording_resolver(_name: str) -> str:
+        resolver_threads.append(threading.get_ident())
+        return "/usr/bin/gh"
+
+    monkeypatch.setattr(source, "_resolve_provider_executable", recording_resolver)
+    monkeypatch.setattr(
+        source,
+        "sandboxed_spawn_argv",
+        lambda argv, **kwargs: (argv, kwargs["env"], None),
+    )
+    monkeypatch.setattr(
+        source.asyncio, "create_subprocess_exec", AsyncMock(return_value=FakeProcess())
+    )
+    monkeypatch.setattr(source, "_collect_process_output", AsyncMock(return_value=(b"{}", b"")))
+
+    assert await source._run_json("gh", "api", "repos/acme/repo") == {}
+
+    assert len(resolver_threads) == 1
+    assert resolver_threads[0] != threading.get_ident()
+
+
+@pytest.mark.asyncio
 async def test_run_json_sandboxes_with_minimal_provider_environment(monkeypatch) -> None:
     class FakeProcess:
         returncode = 0
@@ -821,11 +865,16 @@ async def test_run_json_awaits_critical_audit_off_loop_before_spawn(
     order: list[str] = []
 
     async def fake_to_thread(func, *args, **kwargs):
+        # Only the audit offload is under test; every other offload on this path
+        # (executable resolution) has to pass through with its real result.
+        if func is not source._audit_provider_cli:
+            return func(*args, **kwargs)
         order.append("audit-started")
         audit_started.set()
         await release_audit.wait()
-        func(*args, **kwargs)
+        result = func(*args, **kwargs)
         order.append("audit-completed")
+        return result
 
     class FakeProcess:
         returncode = 0
@@ -1225,6 +1274,108 @@ async def test_fetch_github_marks_failed_secondary_endpoints_partial(
 
 
 @pytest.mark.asyncio
+async def test_fetch_github_reads_rollup_outside_the_core_field_set(monkeypatch) -> None:
+    """The core `pr view` field set must not bundle `statusCheckRollup` (#5115).
+
+    `gh` resolves a `--json` field set atomically, so a bundled rollup made a
+    fine-grained token without Checks read access fail the WHOLE panel read.
+    """
+    commands: list[tuple[str, int | None]] = []
+
+    async def fake_run(*argv: str, **kwargs: int):
+        command = " ".join(argv)
+        commands.append((command, kwargs.get("max_output_bytes")))
+        if "statusCheckRollup" in command:
+            return {
+                "statusCheckRollup": [
+                    {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                ],
+                "headRefOid": "abc123",
+            }
+        if "pr view" in command:
+            return {"number": 12, "title": "Split", "state": "OPEN", "headRefOid": "abc123"}
+        return {} if "graphql" in command else []
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    data = await source._fetch_github(
+        source.parse_source_url("https://github.com/acme/repo/pull/12")
+    )
+
+    core_reads = [
+        command for command, _limit in commands if "pr view" in command and "title" in command
+    ]
+    assert core_reads
+    assert all("statusCheckRollup" not in command for command in core_reads)
+    rollup_reads = [
+        (command, limit) for command, limit in commands if "statusCheckRollup" in command
+    ]
+    assert len(rollup_reads) == 1
+    assert rollup_reads[0][0].endswith("statusCheckRollup,headRefOid")
+    assert rollup_reads[0][1] == source._CHECKS_OUTPUT_BYTES
+    assert data["checks"][0]["bucket"] == "passed"
+    assert "checks" not in data["partialSections"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_github_core_payload_survives_rollup_failure(monkeypatch) -> None:
+    """A Checks-blind token costs the checks SECTION, never the panel (#5115)."""
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            raise source.SourceProviderError("gh: Resource not accessible by integration")
+        if "pr view" in command:
+            return {
+                "number": 12,
+                "title": "Fine-grained token",
+                "state": "OPEN",
+                "headRefOid": "abc123",
+            }
+        return {} if "graphql" in command else []
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    data = await source._fetch_github(
+        source.parse_source_url("https://github.com/acme/repo/pull/12")
+    )
+
+    assert data["title"] == "Fine-grained token"
+    assert data["state"] == "OPEN"
+    assert data["checks"] == []
+    # The degraded state is distinguishable IN THE PAYLOAD: an empty `checks`
+    # list plus the named partial section, never a silent "no checks".
+    assert "checks" in data["partialSections"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_github_discards_rollup_from_a_different_head(monkeypatch) -> None:
+    """A rollup read that straddled a push must not pin another commit's CI."""
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            return {
+                "statusCheckRollup": [
+                    {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                ],
+                "headRefOid": "pushed-after-core-read",
+            }
+        if "pr view" in command:
+            return {"number": 12, "state": "OPEN", "headRefOid": "abc123"}
+        return {} if "graphql" in command else []
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    data = await source._fetch_github(
+        source.parse_source_url("https://github.com/acme/repo/pull/12")
+    )
+
+    assert data["checks"] == []
+    assert "checks" in data["partialSections"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("failed_endpoint", "expected_section"),
     [
@@ -1512,7 +1663,10 @@ async def test_github_check_status_carries_settled_merge_state(monkeypatch) -> N
     panel is open lands on a poll instead of waiting for a manual refresh."""
 
     async def fake_run(*argv: str, **_kwargs: int):
-        assert "mergeable,mergeStateStatus" in " ".join(argv)
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            return {"statusCheckRollup": [], "headRefOid": "abc123"}
+        assert "mergeable,mergeStateStatus" in command
         return {"state": "OPEN", "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}
 
     monkeypatch.setattr(source, "_run_json", fake_run)
@@ -1537,6 +1691,73 @@ async def test_github_check_status_omits_unsettled_merge_state(
     status = await source._fetch_check_status("https://github.com/acme/repo/pull/12")
 
     assert status == {"state": "open"}
+
+
+@pytest.mark.asyncio
+async def test_github_check_status_keeps_authorized_fields_when_rollup_fails(
+    monkeypatch,
+) -> None:
+    """The chip renders state/merge under a Checks-blind token (#5115).
+
+    Bundling `statusCheckRollup` into the chip read made the WHOLE read fail
+    when the token lacked Checks access; the split keeps the fields the token
+    was authorized for and flags only the CI portion as unavailable.
+    """
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            raise source.SourceProviderError("gh: Resource not accessible by integration")
+        return {"state": "OPEN", "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"}
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    status = await source._fetch_check_status("https://github.com/acme/repo/pull/12")
+
+    assert status is not None
+    assert status.pop(source._CHIP_CI_UNAVAILABLE, None) == "1"
+    assert status == {"state": "open", "mergeable": "conflicting", "mergeStateStatus": "dirty"}
+
+
+@pytest.mark.asyncio
+async def test_github_check_status_marks_stale_rollup_unavailable(monkeypatch) -> None:
+    """A rollup read that straddled a push must not paint another head's CI."""
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            return {
+                "statusCheckRollup": [
+                    {"name": "test", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                ],
+                "headRefOid": "pushed-after-core-read",
+            }
+        return {"state": "OPEN", "headRefOid": "abc123"}
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    status = await source._fetch_check_status("https://github.com/acme/repo/pull/12")
+
+    assert status is not None
+    assert status.pop(source._CHIP_CI_UNAVAILABLE, None) == "1"
+    assert status == {"state": "open"}
+
+
+@pytest.mark.asyncio
+async def test_github_check_status_still_fails_when_core_read_fails(monkeypatch) -> None:
+    """Only the rollup is degradable: a failed CORE read must keep raising, so
+    `_refresh_check_status` keeps its keep-previous-wholesale posture."""
+
+    async def fake_run(*argv: str, **_kwargs: int):
+        command = " ".join(argv)
+        if "statusCheckRollup" in command:
+            return {"statusCheckRollup": [], "headRefOid": "abc123"}
+        raise source.SourceProviderError("core read failed")
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    with pytest.raises(source.SourceProviderError):
+        await source._fetch_check_status("https://github.com/acme/repo/pull/12")
 
 
 @pytest.mark.asyncio
@@ -1990,6 +2211,53 @@ async def test_chip_refresh_without_change_keeps_full_payload(monkeypatch) -> No
     assert url in source._CACHE
     source._CACHE.clear()
     source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_chip_refresh_keeps_known_ci_when_rollup_alone_fails(monkeypatch) -> None:
+    """Mirror of the full-payload keep-known rule for a partial `checks`: a
+    degraded rollup must not erase a glyph the chip cache already knows, and
+    the internal marker must never reach the cache."""
+    url = "https://github.com/acme/repo/pull/12"
+    source._check_cache.clear()
+    source._check_inflight.clear()
+    source._check_cache[url] = (source.time.monotonic(), {"ci": "passed", "state": "open"})
+    monkeypatch.setattr(
+        source,
+        "_fetch_check_status",
+        AsyncMock(return_value={"state": "open", source._CHIP_CI_UNAVAILABLE: "1"}),
+    )
+
+    try:
+        await source._refresh_check_status(url)
+
+        assert source._check_cache[url][1] == {"ci": "passed", "state": "open"}
+    finally:
+        source._check_cache.clear()
+
+
+@pytest.mark.asyncio
+async def test_chip_refresh_lets_a_clean_empty_rollup_clear_a_stale_ci(monkeypatch) -> None:
+    """A rollup that SUCCEEDS with zero checks carries no marker: the CI glyph
+    was legitimately withdrawn (no checks configured), so it must clear."""
+    url = "https://github.com/acme/repo/pull/12"
+    source._CACHE.clear()
+    source._check_cache.clear()
+    source._check_inflight.clear()
+    source._check_cache[url] = (source.time.monotonic(), {"ci": "passed", "state": "open"})
+    monkeypatch.setattr(
+        source,
+        "_fetch_check_status",
+        AsyncMock(return_value={"state": "open"}),
+    )
+
+    try:
+        await source._refresh_check_status(url)
+
+        assert source._check_cache[url][1] == {"state": "open"}
+    finally:
+        source._CACHE.clear()
+        source._check_cache.clear()
 
 
 @pytest.mark.asyncio
@@ -2616,7 +2884,7 @@ async def test_fetch_github_checks_uses_one_call_without_rewriting_cache(monkeyp
         "view",
         url,
         "--json",
-        "statusCheckRollup",
+        "statusCheckRollup,headRefOid",
         max_output_bytes=source._CHECKS_OUTPUT_BYTES,
     )
     assert checks[0]["bucket"] == "pending"
@@ -7279,6 +7547,9 @@ class TestGetJiraAuth:
             def load(cls):
                 return cls()
 
+            def load_credentials(self):
+                return {}
+
         monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
         assert source._get_jira_auth("acme.atlassian.net") is None
 
@@ -7325,6 +7596,46 @@ class TestGetJiraAuth:
         monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
         result = source._get_jira_auth("jira.internal")
         assert result == ("", "pat-token")
+
+    def test_raises_value_error_on_config_load_failure(self, monkeypatch):
+        """Config errors propagate as ValueError, not silent None."""
+
+        class BrokenConfig:
+            @classmethod
+            def load(cls):
+                raise RuntimeError("corrupt config.json")
+
+        monkeypatch.setattr(source, "KiroCrewConfig", BrokenConfig)
+        with pytest.raises(ValueError, match="jira_config_error"):
+            source._get_jira_auth("acme.atlassian.net")
+
+    def test_per_host_token_takes_precedence(self, monkeypatch):
+        """JIRA_TOKEN_<hex> is preferred over global JIRA_API_TOKEN."""
+
+        class FakeEntry:
+            host = "acme.atlassian.net"
+            email = "dev@acme.com"
+
+        class FakeDashboard:
+            jira_auth = [FakeEntry()]
+
+        class FakeConfig:
+            dashboard = FakeDashboard()
+
+            @classmethod
+            def load(cls):
+                return cls()
+
+            def load_credentials(self):
+                host_key = "acme.atlassian.net".encode().hex().upper()
+                return {
+                    "JIRA_API_TOKEN": "global-fallback",
+                    f"JIRA_TOKEN_{host_key}": "per-host-secret",
+                }
+
+        monkeypatch.setattr(source, "KiroCrewConfig", FakeConfig)
+        result = source._get_jira_auth("acme.atlassian.net")
+        assert result == ("dev@acme.com", "per-host-secret")
 
 
 class TestJiraIsCloud:
@@ -7377,3 +7688,152 @@ def test_parse_jira_self_hosted_url(monkeypatch) -> None:
     assert ref.host == "jira.internal.corp"
     assert ref.repo == "TEAM"
     assert ref.number == 99
+
+
+# --- Jira linked issues (issue #2584) ---
+
+
+class TestJiraLinkedChanges:
+    """Tests for _jira_linked_changes parsing."""
+
+    def test_outward_link_parsed(self) -> None:
+        """An outward issue link is parsed with the correct relation label."""
+        fields = {
+            "issuelinks": [
+                {
+                    "type": {"name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+                    "outwardIssue": {
+                        "key": "PROJ-456",
+                        "fields": {
+                            "summary": "Blocked task",
+                            "status": {"statusCategory": {"key": "new"}},
+                        },
+                    },
+                }
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://acme.atlassian.net")
+        assert len(result) == 1
+        assert result[0]["provider"] == "jira"
+        assert result[0]["url"] == "https://acme.atlassian.net/browse/PROJ-456"
+        assert result[0]["number"] == 456
+        assert result[0]["title"] == "Blocked task"
+        assert result[0]["state"] == "open"
+        assert result[0]["relation"] == "blocks"
+        assert result[0]["issueKey"] == "PROJ-456"
+
+    def test_inward_link_parsed(self) -> None:
+        """An inward issue link is parsed with the inward relation label."""
+        fields = {
+            "issuelinks": [
+                {
+                    "type": {"name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+                    "inwardIssue": {
+                        "key": "TEAM-10",
+                        "fields": {
+                            "summary": "Upstream dep",
+                            "status": {"statusCategory": {"key": "indeterminate"}},
+                        },
+                    },
+                }
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://jira.corp/jira")
+        assert len(result) == 1
+        assert result[0]["relation"] == "is blocked by"
+        assert result[0]["url"] == "https://jira.corp/jira/browse/TEAM-10"
+        assert result[0]["state"] == "open"
+        assert result[0]["issueKey"] == "TEAM-10"
+
+    def test_done_status_maps_to_closed(self) -> None:
+        """A linked issue with statusCategory 'done' maps to state 'closed'."""
+        fields = {
+            "issuelinks": [
+                {
+                    "type": {"name": "Relates", "inward": "relates to", "outward": "relates to"},
+                    "outwardIssue": {
+                        "key": "FIX-7",
+                        "fields": {
+                            "summary": "Done fix",
+                            "status": {"statusCategory": {"key": "done"}},
+                        },
+                    },
+                }
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://acme.atlassian.net")
+        assert result[0]["state"] == "closed"
+
+    def test_duplicate_keys_deduped(self) -> None:
+        """Duplicate issue keys are folded."""
+        link = {
+            "type": {"name": "Relates", "inward": "relates to", "outward": "relates to"},
+            "outwardIssue": {
+                "key": "DUP-1",
+                "fields": {"summary": "Dup", "status": {"statusCategory": {"key": "new"}}},
+            },
+        }
+        fields = {"issuelinks": [link, link]}
+        result = source._jira_linked_changes(fields, "https://acme.atlassian.net")
+        assert len(result) == 1
+
+    def test_empty_issuelinks(self) -> None:
+        """Empty or missing issuelinks returns an empty list."""
+        assert source._jira_linked_changes({}, "https://x") == []
+        assert source._jira_linked_changes({"issuelinks": []}, "https://x") == []
+
+    def test_malformed_link_skipped(self) -> None:
+        """A link with neither inwardIssue nor outwardIssue is skipped."""
+        fields = {
+            "issuelinks": [
+                {"type": {"name": "Bad", "inward": "x", "outward": "y"}},
+                "not a dict",
+                None,
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://acme.atlassian.net")
+        assert result == []
+
+    def test_missing_summary_uses_key_as_title(self) -> None:
+        """When summary is missing, the issue key is used as the title."""
+        fields = {
+            "issuelinks": [
+                {
+                    "type": {"name": "Rel", "inward": "r", "outward": "r"},
+                    "outwardIssue": {
+                        "key": "NO-SUM-1",
+                        "fields": {"status": {"statusCategory": {"key": "new"}}},
+                    },
+                }
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://acme.atlassian.net")
+        assert result[0]["title"] == "NO-SUM-1"
+
+    def test_multiple_links(self) -> None:
+        """Multiple links are all returned in order."""
+        fields = {
+            "issuelinks": [
+                {
+                    "type": {"name": "Blocks", "inward": "is blocked by", "outward": "blocks"},
+                    "outwardIssue": {
+                        "key": "A-1",
+                        "fields": {"summary": "First", "status": {"statusCategory": {"key": "new"}}},
+                    },
+                },
+                {
+                    "type": {"name": "Duplicates", "inward": "is duplicated by", "outward": "duplicates"},
+                    "inwardIssue": {
+                        "key": "B-2",
+                        "fields": {"summary": "Second", "status": {"statusCategory": {"key": "done"}}},
+                    },
+                },
+            ]
+        }
+        result = source._jira_linked_changes(fields, "https://x.atlassian.net")
+        assert len(result) == 2
+        assert result[0]["issueKey"] == "A-1"
+        assert result[0]["relation"] == "blocks"
+        assert result[1]["issueKey"] == "B-2"
+        assert result[1]["relation"] == "is duplicated by"
+        assert result[1]["state"] == "closed"

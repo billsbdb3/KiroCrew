@@ -1,20 +1,31 @@
-import { memo, useState, useMemo, useCallback, useRef } from 'react'
-import { Download, FileText } from 'lucide-react'
+import { memo, useState, useMemo, useCallback, useEffect, useRef } from 'react'
+import { Download, FileText, Film, Music } from 'lucide-react'
 import DOMPurify from 'dompurify'
 
 import { i18nT } from '../i18n/t'
 import { ExcalidrawBlock } from './ExcalidrawBlock'
-import { fileDownloadUrl } from '../utils/fileReadUrl'
+import { fileDownloadUrl, fileStreamUrl } from '../utils/fileReadUrl'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /* ── extension helpers ── */
 const IMG_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico'])
 const CSV_EXTS = new Set(['.csv', '.tsv'])
+// Media served through /api/file-stream (Range-capable). Split decides the
+// element: <video> renders a picture surface, <audio> a compact control bar.
+// .ogg goes to audio -- the extension is overwhelmingly audio in practice and
+// the .ogv variant exists for video.
+const VIDEO_EXTS = new Set(['.mp4', '.m4v', '.webm', '.mov', '.mkv', '.ogv'])
+const AUDIO_EXTS = new Set(['.mp3', '.wav', '.m4a', '.flac', '.ogg', '.oga'])
 const JSON_EXTS = new Set(['.json'])
 const JSONL_EXTS = new Set(['.jsonl'])
 const HTML_EXTS = new Set(['.html', '.htm'])
 const PDF_EXTS = new Set(['.pdf'])
 // Excalidraw scene JSON. Without this the extension falls through to `code` and
-// the user gets a wall of raw element JSON in Monaco instead of the diagram.
+// the user gets a wall of raw element JSON in the code editor instead of the diagram.
 const EXCALIDRAW_EXTS = new Set(['.excalidraw'])
+// OOXML spreadsheets rendered inline by SheetViewer via /api/file-sheet
+// (server-side openpyxl parse). Legacy .xls (OLE compound) and ODF .ods stay
+// on the OfficeViewer download card — openpyxl reads neither.
+const SHEET_EXTS = new Set(['.xlsx', '.xlsm'])
 // Office binary formats (ZIP-based OOXML + legacy OLE + ODF). These cannot be
 // rendered inline by browsers and produce garbled output when routed through
 // /api/file-read (which decodes as UTF-8 with errors='replace'). OfficeViewer
@@ -23,12 +34,12 @@ const EXCALIDRAW_EXTS = new Set(['.excalidraw'])
 // PDF renderer.
 const OFFICE_EXTS = new Set([
   '.docx', '.doc',
-  '.xlsx', '.xls',
+  '.xls',
   '.pptx', '.ppt',
   '.odt', '.ods', '.odp',
 ])
 
-export type FileType = 'image' | 'svg' | 'csv' | 'json' | 'jsonl' | 'html' | 'pdf' | 'excalidraw' | 'office' | 'code' | 'markdown'
+export type FileType = 'image' | 'svg' | 'csv' | 'json' | 'jsonl' | 'html' | 'pdf' | 'excalidraw' | 'video' | 'audio' | 'sheet' | 'office' | 'code' | 'markdown'
 
 /**
  * Map a filesystem path to a FileType. Note: SVG files (path-backed) are
@@ -45,6 +56,9 @@ export function detectFileType(filePath: string): FileType {
   if (HTML_EXTS.has(ext)) return 'html'
   if (PDF_EXTS.has(ext)) return 'pdf'
   if (EXCALIDRAW_EXTS.has(ext)) return 'excalidraw'
+  if (VIDEO_EXTS.has(ext)) return 'video'
+  if (AUDIO_EXTS.has(ext)) return 'audio'
+  if (SHEET_EXTS.has(ext)) return 'sheet'
   if (OFFICE_EXTS.has(ext)) return 'office'
   if (['.md', '.markdown', '.mdx', '.txt', ''].includes(ext)) return 'markdown'
   return 'code'
@@ -54,6 +68,7 @@ function extOf(fp: string) { const i = fp.lastIndexOf('.'); return i >= 0 ? fp.s
 
 /* ── Image viewer ── */
 export const ImageViewer = memo(function ImageViewer({ filePath }: { filePath: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   return (
     <div className="flex items-center justify-center h-full overflow-auto p-4 bg-bg-elevated rounded-md border border-border">
       <img
@@ -71,6 +86,7 @@ export const ImageViewer = memo(function ImageViewer({ filePath }: { filePath: s
  * content, not on disk. DOMPurify with the SVG profile strips dangerous
  * elements (script, foreignObject) while preserving normal SVG markup. */
 export const SvgViewer = memo(function SvgViewer({ content }: { content: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const safe = useMemo(
     () => DOMPurify.sanitize(content, { USE_PROFILES: { svg: true, svgFilters: true } }),
     [content],
@@ -88,6 +104,7 @@ export const SvgViewer = memo(function SvgViewer({ content }: { content: string 
  * surfaces share one renderer and stay in sync. Read-only: opening a scene
  * never mutates the file on disk. */
 export const ExcalidrawViewer = memo(function ExcalidrawViewer({ content }: { content: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   return (
     <div className="h-full overflow-auto p-4 bg-bg-elevated rounded-md border border-border">
       <ExcalidrawBlock code={content} className="flex justify-center min-h-[60px]" />
@@ -97,6 +114,7 @@ export const ExcalidrawViewer = memo(function ExcalidrawViewer({ content }: { co
 
 /* ── CSV table viewer ── */
 export const CsvViewer = memo(function CsvViewer({ content, filePath }: { content: string; filePath: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const delimiter = extOf(filePath) === '.tsv' ? '\t' : ','
   const rows = useMemo(() => {
     const lines = content.split('\n').filter(l => l.trim())
@@ -141,6 +159,7 @@ export const CsvViewer = memo(function CsvViewer({ content, filePath }: { conten
 
 /* ── JSON tree viewer ── */
 export const JsonViewer = memo(function JsonViewer({ content }: { content: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const parsed = useMemo(() => {
     try { return { ok: true as const, value: JSON.parse(content) } }
     catch (e) { return { ok: false as const, error: e instanceof Error ? e.message : String(e) } }
@@ -210,6 +229,7 @@ function JsonNode({ value, depth }: { value: unknown; depth: number }) {
 const JSONL_PAGE_SIZE = 100
 
 export const JsonlViewer = memo(function JsonlViewer({ content }: { content: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const lines = useMemo(() => content.split('\n').filter(l => l.trim()), [content])
   const [visible, setVisible] = useState(JSONL_PAGE_SIZE)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -239,6 +259,7 @@ export const JsonlViewer = memo(function JsonlViewer({ content }: { content: str
 
 /* ── HTML preview (sandboxed iframe) ── */
 export const HtmlViewer = memo(function HtmlViewer({ content }: { content: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   return (
     <div className="h-full border border-border rounded-md overflow-hidden bg-white">
       <iframe
@@ -253,6 +274,7 @@ export const HtmlViewer = memo(function HtmlViewer({ content }: { content: strin
 
 /* ── PDF viewer (embedded + fallback open externally) ── */
 export const PdfViewer = memo(function PdfViewer({ filePath }: { filePath: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const url = '/api/file-raw?path=' + encodeURIComponent(filePath)
   return (
     <div className="h-full border border-border rounded-md overflow-hidden bg-white flex flex-col">
@@ -276,7 +298,8 @@ export const PdfViewer = memo(function PdfViewer({ filePath }: { filePath: strin
  * rendering with a filename + extension badge + Download button pointing at
  * /api/file-download, which streams the original bytes with attachment
  * disposition + nosniff so the file downloads cleanly instead. */
-export const OfficeViewer = memo(function OfficeViewer({ filePath }: { filePath: string }) {
+export const OfficeViewer = memo(function OfficeViewer({ filePath, hideHint }: { filePath: string; hideHint?: boolean }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // Split on BOTH separators — Kiro Crew ships native on Windows where paths
   // arrive as `C:\Users\…\report.docx`, and a `/`-only split would surface the
   // whole path as the "filename". Matches the pattern in MarkdownRenderer.tsx
@@ -295,9 +318,11 @@ export const OfficeViewer = memo(function OfficeViewer({ filePath }: { filePath:
           >{ext}</span>
         </div>
         <div className="text-sm text-text break-all">{filename}</div>
-        <div className="text-xs text-muted">
-          {i18nT('components.fileRenderers.office_download_hint')}
-        </div>
+        {!hideHint && (
+          <div className="text-xs text-muted">
+            {i18nT('components.fileRenderers.office_download_hint')}
+          </div>
+        )}
         <a
           href={url}
           download={filename}
@@ -308,6 +333,224 @@ export const OfficeViewer = memo(function OfficeViewer({ filePath }: { filePath:
           {i18nT('components.fileRenderers.download')}
         </a>
       </div>
+    </div>
+  )
+})
+
+/* ── Media player (inline video/audio via /api/file-stream) ── */
+export const MediaPlayer = memo(function MediaPlayer({ filePath, kind }: { filePath: string; kind: 'video' | 'audio' }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const [failed, setFailed] = useState(false)
+  const filename = filePath.split(/[\\/]/).pop() || filePath
+  const src = fileStreamUrl(filePath)
+  const Icon = kind === 'video' ? Film : Music
+  if (failed) {
+    // Endpoint refusal (unsupported container, oversize) or a codec the
+    // browser cannot decode -- same fallback contract as the other rich
+    // viewers: never render a broken surface, always offer the bytes.
+    return (
+      <div className="h-full flex items-center justify-center p-4 bg-bg-elevated rounded-md border border-border">
+        <div className="flex flex-col items-center gap-3 max-w-md text-center">
+          <Icon size={64} className="text-muted" strokeWidth={1.25} aria-hidden="true" />
+          <div className="text-sm text-text break-all">{filename}</div>
+          <div className="text-xs text-muted">
+            {i18nT('components.fileRenderers.media_preview_failed')}
+          </div>
+          <a
+            href={fileDownloadUrl(filePath)}
+            download={filename}
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-sm bg-accent text-white hover:opacity-90 no-underline"
+            aria-label={i18nT('components.fileRenderers.download_file', { filename })}
+          >
+            <Download size={16} aria-hidden="true" />
+            {i18nT('components.fileRenderers.download')}
+          </a>
+        </div>
+      </div>
+    )
+  }
+  if (kind === 'video') {
+    return (
+      <div className="h-full flex items-center justify-center p-3 bg-bg-elevated">
+        {/* eslint-disable-next-line jsx-a11y/media-has-caption -- local files carry no track sidecar; captions are out of scope */}
+        <video
+          controls
+          preload="metadata"
+          src={src}
+          className="max-h-full max-w-full rounded-md"
+          onError={() => setFailed(true)}
+          aria-label={filename}
+        />
+      </div>
+    )
+  }
+  return (
+    <div className="h-full flex flex-col items-center justify-center gap-3 p-4 bg-bg-elevated">
+      <Icon size={40} className="text-muted" strokeWidth={1.25} aria-hidden="true" />
+      <div className="text-sm text-text break-all text-center max-w-md">{filename}</div>
+      {/* eslint-disable-next-line jsx-a11y/media-has-caption -- local files carry no track sidecar; captions are out of scope */}
+      <audio
+        controls
+        preload="metadata"
+        src={src}
+        className="w-full max-w-md"
+        onError={() => setFailed(true)}
+        aria-label={filename}
+      />
+    </div>
+  )
+})
+
+
+/* ── Sheet viewer (inline xlsx preview) ──────────────────────────────────────
+ *
+ * Renders OOXML spreadsheets as a real grid: sheet tabs, a column-letter
+ * header row, and a row-number gutter — a spreadsheet has no reason to promote
+ * its first row to <th> the way CsvViewer does. Cell data comes from
+ * GET /api/file-sheet (server-side openpyxl parse), already capped server-side
+ * at 500 rows × 100 columns per sheet with explicit truncation flags. Cells
+ * holding a formula with no cached value render the formula source ("=…") in
+ * muted styling. Any endpoint failure (legacy format, parse error, endpoint
+ * unavailable) degrades to the OfficeViewer download card, so the viewer is
+ * never worse than what it replaces. */
+type SheetGrid = {
+  name: string
+  rows: (string | number | boolean | null)[][]
+  truncated_rows: boolean
+  truncated_cols: boolean
+}
+type SheetPayload = { sheets: SheetGrid[]; total_sheets: number; truncated_sheets: boolean }
+
+/** 0-based column index → spreadsheet letters (0→A, 25→Z, 26→AA). */
+export function columnLetter(index: number): string {
+  let n = index + 1, s = ''
+  while (n > 0) { n--; s = String.fromCharCode(65 + (n % 26)) + s; n = Math.floor(n / 26) }
+  return s
+}
+
+export const SheetViewer = memo(function SheetViewer({ filePath }: { filePath: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const [payload, setPayload] = useState<SheetPayload | null>(null)
+  const [failed, setFailed] = useState(false)
+  const [active, setActive] = useState(0)
+
+  useEffect(() => {
+    const ctrl = new AbortController()
+    setPayload(null); setFailed(false); setActive(0)
+    fetch('/api/file-sheet?path=' + encodeURIComponent(filePath), { signal: ctrl.signal })
+      .then(async r => {
+        if (!r.ok) throw new Error(String(r.status))
+        const body: SheetPayload = await r.json()
+        if (!Array.isArray(body?.sheets)) throw new Error('malformed payload')
+        setPayload(body)
+      })
+      .catch((e: unknown) => {
+        if (e instanceof DOMException && e.name === 'AbortError') return
+        setFailed(true)
+      })
+    return () => ctrl.abort()
+  }, [filePath])
+
+  if (failed) {
+    return (
+      <div className="h-full flex flex-col">
+        <div className="text-center text-[11px] py-1.5 text-warning">
+          {i18nT('components.fileRenderers.sheet_preview_failed')}
+        </div>
+        <div className="flex-1 min-h-0"><OfficeViewer filePath={filePath} hideHint /></div>
+      </div>
+    )
+  }
+  if (!payload) {
+    return (
+      <div className="h-full flex items-center justify-center p-4 bg-bg-elevated rounded-md border border-border">
+        <div className="text-sm text-muted animate-pulse">{i18nT('components.fileRenderers.sheet_loading')}</div>
+      </div>
+    )
+  }
+
+  const sheet = payload.sheets[Math.min(active, Math.max(payload.sheets.length - 1, 0))]
+  const colCount = sheet ? sheet.rows.reduce((m, r) => Math.max(m, r.length), 0) : 0
+  const hasFormulas = !!sheet && sheet.rows.some(r => r.some(c => typeof c === 'string' && c.startsWith('=')))
+
+  return (
+    <div className="h-full flex flex-col border border-border rounded-md bg-bg-elevated overflow-hidden">
+      {payload.sheets.length > 1 && (
+        <div className="flex gap-1 px-2 pt-2 pb-0 bg-chrome border-b border-border overflow-x-auto shrink-0">
+          {payload.sheets.map((s, i) => (
+            <button
+              key={i}
+              aria-pressed={i === active}
+              onClick={() => setActive(i)}
+              className={`px-3 py-1.5 rounded-t text-[12px] whitespace-nowrap cursor-pointer border border-b-0 ${
+                i === active ? 'bg-bg-elevated text-text border-border font-semibold' : 'bg-transparent text-muted border-transparent hover:text-text'
+              }`}
+            >{s.name}</button>
+          ))}
+        </div>
+      )}
+      {sheet && hasFormulas && (
+        <div className="text-center text-muted text-[12px] py-1.5 border-b border-border bg-chrome shrink-0">
+          {i18nT('components.fileRenderers.sheet_formulas_note')}
+          {' · '}
+          <a href={fileDownloadUrl(filePath)} download className="text-accent no-underline hover:underline">
+            {i18nT('components.fileRenderers.download')}
+          </a>
+        </div>
+      )}
+      <div className="flex-1 overflow-auto">
+        {!sheet || sheet.rows.length === 0 ? (
+          <div className="p-4 text-muted text-sm">{i18nT('components.fileRenderers.sheet_empty')}</div>
+        ) : (
+          <table className="text-sm font-mono border-collapse">
+            <thead className="sticky top-0 z-10 bg-chrome">
+              <tr>
+                <th className="px-2 py-1 text-[10px] font-semibold text-muted border-b border-r border-border bg-chrome sticky left-0" aria-hidden="true" />
+                {Array.from({ length: colCount }, (_, c) => (
+                  <th key={c} scope="col" className="px-3 py-1 text-center text-[10px] font-semibold text-muted border-b border-border whitespace-nowrap min-w-[64px]">{columnLetter(c)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sheet.rows.map((row, ri) => (
+                <tr key={ri} className="hover:bg-bg-hover">
+                  <th scope="row" className="px-2 py-1 text-right text-[10px] font-semibold text-muted border-b border-r border-border/50 bg-chrome sticky left-0">{ri + 1}</th>
+                  {Array.from({ length: colCount }, (_, ci) => {
+                    const cell = row[ci]
+                    const isFormula = typeof cell === 'string' && cell.startsWith('=')
+                    const display = cell === null || cell === undefined ? '' : typeof cell === 'boolean' ? (cell ? 'TRUE' : 'FALSE') : String(cell)
+                    return (
+                      <td
+                        key={ci}
+                        className={`px-3 py-1 border-b border-border/50 whitespace-nowrap ${
+                          typeof cell === 'number' ? 'text-right text-text' : isFormula ? 'text-muted italic' : 'text-text'
+                        }`}
+                      >{display}</td>
+                    )
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+      {sheet && (sheet.truncated_rows || sheet.truncated_cols || payload.truncated_sheets) && (
+        <div className="text-center text-muted text-[11px] py-1.5 border-t border-border bg-chrome shrink-0">
+          {sheet.truncated_rows && i18nT('components.fileRenderers.sheet_showing_rows', { shown: sheet.rows.length })}
+          {sheet.truncated_rows && (sheet.truncated_cols || payload.truncated_sheets) ? ' · ' : ''}
+          {sheet.truncated_cols && i18nT('components.fileRenderers.sheet_cols_truncated')}
+          {sheet.truncated_cols && payload.truncated_sheets ? ' · ' : ''}
+          {payload.truncated_sheets && i18nT('components.fileRenderers.sheet_tabs_truncated', { shown: payload.sheets.length, total: payload.total_sheets })}
+          {(sheet.truncated_rows || sheet.truncated_cols || payload.truncated_sheets) && (
+            <>
+              {' · '}
+              <a href={fileDownloadUrl(filePath)} download className="text-accent no-underline hover:underline">
+                {i18nT('components.fileRenderers.download')}
+              </a>
+            </>
+          )}
+        </div>
+      )}
     </div>
   )
 })

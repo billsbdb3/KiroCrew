@@ -30,6 +30,7 @@ from aiohttp import web
 
 from kiro_crew import github_runner, platform_compat
 from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.dashboard.handlers._shared import read_capped_response
 
 # Validation policy, well-known install dirs, and the strict-mode toggle are
 # owned by the shared hardened runner (kiro_crew.github_runner) so every
@@ -47,6 +48,7 @@ from kiro_crew.github_runner import (
 )
 from kiro_crew.github_runner import strict_provider_bins as _strict_provider_bins
 from kiro_crew.github_runner import validate_provider_executable as _validate_provider_executable
+from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -145,7 +147,7 @@ _PROVIDER_AUTH_ENV_KEYS = {
 }
 # url -> (stored_at, serialized_size_bytes, normalized_payload)
 _CACHE: dict[str, tuple[float, int, dict[str, Any]]] = {}
-_CACHE_LOCK = asyncio.Lock()
+_CACHE_LOCK = LoopBoundLock()
 _FULL_FETCH_INFLIGHT: dict[str, asyncio.Task[dict[str, Any]]] = {}
 _FULL_FETCH_TASKS: dict[str, set[asyncio.Task[dict[str, Any]]]] = {}
 _FULL_FETCH_GENERATIONS: dict[str, int] = {}
@@ -157,7 +159,7 @@ _CHECKS_FETCH_INFLIGHT: dict[str, asyncio.Task[list[dict[str, Any]]]] = {}
 # nothing about. No generation map is needed -- this phase never mutates an
 # issue, so there is no post-mutation write to order against.
 _ISSUE_CACHE: dict[str, tuple[float, int, dict[str, Any]]] = {}
-_ISSUE_CACHE_LOCK = asyncio.Lock()
+_ISSUE_CACHE_LOCK = LoopBoundLock()
 _ISSUE_FETCH_INFLIGHT: dict[str, asyncio.Task[dict[str, Any]]] = {}
 _ISSUE_FETCH_TASKS: dict[str, set[asyncio.Task[dict[str, Any]]]] = {}
 _DIRECT_FETCH_RESERVATIONS: dict[asyncio.Task[Any], int] = {}
@@ -319,7 +321,7 @@ _gitlab_hosts_loaded_at = 0.0
 # parse result (per-slot sidebar source links) fold this into their cache key so
 # a later allowlist load invalidates decisions made against the cold snapshot.
 _gitlab_hosts_generation = 0
-_gitlab_hosts_lock = asyncio.Lock()
+_gitlab_hosts_lock = LoopBoundLock()
 
 
 def gitlab_hosts_generation() -> int:
@@ -718,7 +720,14 @@ async def _run_json(
             "OS-level provider sandboxing is unavailable."
         )
     try:
-        resolved_executable = _resolve_provider_executable(executable)
+        # Off the loop: resolution walks every candidate dir and stats the whole
+        # parent chain of each hit (github_runner.validate_provider_executable),
+        # and a miss re-walks all of PATH. The sidebar chip refresh reaches this
+        # on a timer with no user present, so on the loop thread one slow
+        # filesystem freezes every task -- including the liveness heartbeat --
+        # until the loop watchdog kills the gateway and the supervisor respawns
+        # into the same condition.
+        resolved_executable = await asyncio.to_thread(_resolve_provider_executable, executable)
     except SourceProviderError:
         _audit_provider_cli(executable, "denied", "executable_untrusted")
         raise
@@ -1375,6 +1384,11 @@ async def _gitlab_settled_merge_state(
 
 
 async def _fetch_github(ref: SourceRef) -> dict[str, Any]:
+    # `statusCheckRollup` is deliberately ABSENT from this field set: `gh`
+    # resolves a `--json` field set atomically, so bundling the rollup (which
+    # needs Checks read access that fine-grained tokens commonly lack) would
+    # fail the whole panel read over the one section the token cannot see. The
+    # rollup rides a separate degradable read below (#5115).
     fields = ",".join(
         [
             "additions",
@@ -1395,7 +1409,6 @@ async def _fetch_github(ref: SourceRef) -> dict[str, Any]:
             "number",
             "reviews",
             "state",
-            "statusCheckRollup",
             "title",
             "updatedAt",
             "url",
@@ -1412,7 +1425,14 @@ async def _fetch_github(ref: SourceRef) -> dict[str, Any]:
     review_comments_raw: Any
     review_threads_raw: Any
     merge_state_raw: Any
-    files_raw, review_comments_raw, review_threads_raw, merge_state_raw = await asyncio.gather(
+    rollup_raw: Any
+    (
+        files_raw,
+        review_comments_raw,
+        review_threads_raw,
+        merge_state_raw,
+        rollup_raw,
+    ) = await asyncio.gather(
         _run_json(
             "gh",
             "api",
@@ -1442,6 +1462,7 @@ async def _fetch_github(ref: SourceRef) -> dict[str, Any]:
         # Runs alongside the secondary calls so its re-read wait overlaps with
         # fetches this request was making anyway.
         _github_settled_merge_state(ref, details),
+        _github_rollup_read(ref),
         return_exceptions=True,
     )
     partial_sections: list[str] = []
@@ -1451,6 +1472,31 @@ async def _fetch_github(ref: SourceRef) -> dict[str, Any]:
         review_threads_raw, BaseException
     ):
         _mark_partial(partial_sections, "inline review comments")
+    checks: list[dict[str, Any]] = []
+    if isinstance(rollup_raw, BaseException):
+        # The rollup is read separately from the core fields precisely so a
+        # token without Checks read access (or a transient rollup failure)
+        # costs the checks SECTION, never the panel. Name it in
+        # `partialSections` so the empty list cannot read as "no checks": the
+        # frontend banner surfaces the degraded section, and
+        # `record_full_payload_status` keeps a known CI glyph alive while
+        # `checks` is partial instead of erasing it.
+        _mark_partial(partial_sections, "checks")
+    else:
+        rollup_checks, rollup_head = rollup_raw
+        head_oid = str(details.get("headRefOid") or "")
+        # A missing sha on either side DELIBERATELY fails open (accepts the
+        # rollup): treating it as unverifiable would degrade every read where
+        # the provider omits the field, which is worse than the narrow race
+        # this guard exists for.
+        if head_oid and rollup_head and rollup_head != head_oid:
+            # The core read and the rollup read straddled a push: these checks
+            # describe a different commit than the rest of the payload. Mark
+            # the section unavailable rather than pin another head's CI to
+            # this one; the next refresh re-pairs them.
+            _mark_partial(partial_sections, "checks")
+        else:
+            checks = rollup_checks
     files = _or_empty(files_raw)
     review_comments = _or_empty(review_comments_raw)
     thread_map = _github_thread_map(_or_empty(review_threads_raw))
@@ -1539,7 +1585,7 @@ async def _fetch_github(ref: SourceRef) -> dict[str, Any]:
         "deletions": details.get("deletions") or 0,
         "changedFiles": details.get("changedFiles") or len(normalized_files),
         "commits": commits,
-        "checks": _github_checks(_as_list(details.get("statusCheckRollup"))),
+        "checks": checks,
         "comments": comments,
         "files": normalized_files,
         "partialSections": partial_sections,
@@ -1785,23 +1831,44 @@ async def _fetch_gitlab(ref: SourceRef) -> dict[str, Any]:
     return payload
 
 
-async def _fetch_github_checks(ref: SourceRef) -> list[dict[str, Any]]:
+async def _github_rollup_read(ref: SourceRef) -> tuple[list[dict[str, Any]], str]:
+    """Read the check rollup ALONE, paired with the head sha it was read at.
+
+    ``gh pr view`` resolves a ``--json`` field set atomically: one unreadable
+    field fails the whole read. ``statusCheckRollup`` needs Checks read access
+    that fine-grained tokens commonly lack, so it must never share a field set
+    with data the token IS authorized for (#5115) — every rollup consumer
+    routes through this one isolated query instead of growing its own copy.
+    ``headRefOid`` rides along (core pull-request data, readable whenever the
+    PR itself is) so callers that pair this read with a separate core read can
+    detect the two straddling a push and refuse to render another commit's
+    checks.
+    """
     data = await _run_json(
         "gh",
         "pr",
         "view",
         ref.url,
         "--json",
-        "statusCheckRollup",
+        "statusCheckRollup,headRefOid",
         max_output_bytes=_CHECKS_OUTPUT_BYTES,
     )
     if not isinstance(data, dict):
         raise SourceProviderError("GitHub returned an invalid checks payload")
-    # The panel polls this endpoint while checks are pending and writes the result
-    # straight over the full payload's `checks`, so it MUST collapse identically —
-    # an uncollapsed reply here would re-inflate the counts and resurrect a
-    # superseded CANCELLED failure on the first poll after the panel opens.
-    return _github_checks(_as_list(data.get("statusCheckRollup")))
+    # The panel polls the checks endpoint while checks are pending and writes
+    # the result straight over the full payload's `checks`, so every consumer
+    # MUST collapse identically — an uncollapsed reply would re-inflate the
+    # counts and resurrect a superseded CANCELLED failure on the first poll
+    # after the panel opens.
+    return (
+        _github_checks(_as_list(data.get("statusCheckRollup"))),
+        str(data.get("headRefOid") or ""),
+    )
+
+
+async def _fetch_github_checks(ref: SourceRef) -> list[dict[str, Any]]:
+    checks, _head = await _github_rollup_read(ref)
+    return checks
 
 
 async def _fetch_gitlab_checks(ref: SourceRef) -> list[dict[str, Any]]:
@@ -2208,14 +2275,19 @@ def _get_jira_auth(host: str) -> tuple[str, str] | None:
     The token comes from the protected .env file (JIRA_API_TOKEN env var),
     following the same credential isolation pattern as Slack/Discord/Telegram
     tokens — never stored in the agent-readable config.json.
+
+    Raises ValueError on config load failures so callers can distinguish
+    "config is broken" from "no credentials configured" (None).
     """
     try:
         cfg = KiroCrewConfig.load()
         entries = cfg.dashboard.jira_auth
         # Token is resolved from .env / environment, not config.json
         creds = cfg.load_credentials()
-    except Exception:
-        return None
+    except Exception as exc:
+        raise ValueError(
+            f"jira_config_error: Could not load Jira configuration: {exc}"
+        ) from exc
     normalized = host.lower().removesuffix(":443")
     for entry in entries:
         entry_host = entry.host.strip().lower().removesuffix(":443")
@@ -2283,6 +2355,59 @@ def _adf_to_plain_text(node: Any, *, _depth: int = 0) -> str:
     return text
 
 
+def _jira_linked_changes(fields: dict[str, Any], base_url: str) -> list[dict[str, Any]]:
+    """Parse Jira issuelinks into the linkedChanges format.
+
+    Jira issue links have an inward and outward side.  Each link object
+    contains either an ``inwardIssue`` or ``outwardIssue`` (never both).
+    We normalise both directions into a flat list with the relationship
+    type visible to the user.
+    """
+    raw_links = _as_list(fields.get("issuelinks"))
+    changes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for link in raw_links:
+        if not isinstance(link, dict):
+            continue
+        link_type = _as_dict(link.get("type"))
+        # Determine direction and extract the linked issue object
+        if isinstance(link.get("outwardIssue"), dict):
+            linked_issue = link["outwardIssue"]
+            relation = str(link_type.get("outward") or "")
+        elif isinstance(link.get("inwardIssue"), dict):
+            linked_issue = link["inwardIssue"]
+            relation = str(link_type.get("inward") or "")
+        else:
+            continue
+        issue_key = str(linked_issue.get("key") or "")
+        if not issue_key or issue_key in seen:
+            continue
+        seen.add(issue_key)
+        # Derive browse URL from base_url
+        url = f"{base_url}/browse/{issue_key}"
+        # Extract state from statusCategory
+        status_obj = _as_dict(linked_issue.get("fields", {}).get("status") if isinstance(linked_issue.get("fields"), dict) else {})
+        status_cat = _as_dict(status_obj.get("statusCategory"))
+        cat_key = str(status_cat.get("key") or "").lower()
+        state = "closed" if cat_key == "done" else "open"
+        # Extract issue number (numeric portion after the dash)
+        parts = issue_key.rsplit("-", 1)
+        number = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else 0
+        # Summary for title
+        linked_fields = linked_issue.get("fields") if isinstance(linked_issue.get("fields"), dict) else {}
+        title = str(linked_fields.get("summary") or "") if isinstance(linked_fields, dict) else ""
+        changes.append({
+            "provider": "jira",
+            "url": url,
+            "number": number,
+            "title": title or issue_key,
+            "state": state,
+            "relation": relation,
+            "issueKey": issue_key,
+        })
+    return changes
+
+
 async def _fetch_jira_issue(ref: SourceRef) -> dict[str, Any]:
     """Fetch a Jira issue via the REST API using configured credentials.
 
@@ -2294,10 +2419,12 @@ async def _fetch_jira_issue(ref: SourceRef) -> dict[str, Any]:
     # the event loop. Same discipline as _load_provider_hosts in this file.
     auth_pair = await asyncio.to_thread(_get_jira_auth, ref.host)
     if auth_pair is None:
+        host_key = ref.host.lower().removesuffix(":443").encode().hex().upper()
         raise ValueError(
             "jira_no_credentials: No Jira credentials configured for "
             f"{ref.host}. Add a jira_auth entry to config.json and set "
-            "JIRA_API_TOKEN in your .env file."
+            f"JIRA_API_TOKEN (or JIRA_TOKEN_{host_key} for multi-host) "
+            "in your .env file."
         )
     email, token = auth_pair
     is_cloud = _jira_is_cloud(ref.host)
@@ -2314,7 +2441,8 @@ async def _fetch_jira_issue(ref: SourceRef) -> dict[str, Any]:
     issue_url = (
         f"{base_url}/rest/api/{api_version}/issue/{issue_key}"
         f"?fields=summary,status,issuetype,assignee,description,labels,"
-        f"comment,priority,reporter,created,updated,resolution,resolutiondate"
+        f"comment,priority,reporter,created,updated,resolution,resolutiondate,"
+        f"issuelinks"
     )
 
     # Build auth header
@@ -2350,8 +2478,11 @@ async def _fetch_jira_issue(ref: SourceRef) -> dict[str, Any]:
                         f"Jira returned HTTP {resp.status} for {issue_key}."
                     )
                 # Bound response size to prevent memory exhaustion from an
-                # oversized or malicious payload before JSON decoding.
-                body = await resp.content.read(_MAX_PAYLOAD_BYTES + 1)
+                # oversized or malicious payload before JSON decoding. Streamed
+                # to EOF: a single read(n) resolves on the first buffered chunk
+                # of a chunked response and would hand json.loads a truncated
+                # document.
+                body = await read_capped_response(resp, _MAX_PAYLOAD_BYTES)
                 if len(body) > _MAX_PAYLOAD_BYTES:
                     raise SourceProviderError(
                         f"Jira response for {issue_key} exceeds the size limit."
@@ -2368,7 +2499,7 @@ async def _fetch_jira_issue(ref: SourceRef) -> dict[str, Any]:
         raise SourceProviderError(
             f"Could not reach Jira at {ref.host}: {type(exc).__name__}"
         ) from exc
-    except (json.JSONDecodeError, ValueError) as exc:
+    except ValueError as exc:
         raise SourceProviderError(
             f"Jira returned an unparseable response for {issue_key}."
         ) from exc
@@ -2485,7 +2616,7 @@ async def _fetch_jira_issue(ref: SourceRef) -> dict[str, Any]:
         "locked": False,  # Jira has no issue locking concept
         "reactions": None,  # Jira has no reactions
         "comments": comments,
-        "linkedChanges": [],  # Could add linked issues later
+        "linkedChanges": _jira_linked_changes(fields, base_url),
         "partialSections": partial_sections,
     }
 
@@ -2872,7 +3003,12 @@ async def api_issue_source(request: web.Request) -> web.Response:
         raise
     except ValueError as exc:
         msg = str(exc)
-        code = "jira_no_credentials" if msg.startswith("jira_no_credentials:") else "invalid_request"
+        if msg.startswith("jira_no_credentials:"):
+            code = "jira_no_credentials"
+        elif msg.startswith("jira_config_error:"):
+            code = "jira_config_error"
+        else:
+            code = "invalid_request"
         _audit_source_api(request, "source.issue.read", "failed", code)
         return web.json_response({"error": msg, "code": code}, status=400)
     except SourceProviderError as exc:
@@ -3957,6 +4093,52 @@ async def _github_dismiss_review(ref: SourceRef, review_id: str) -> bool:
 
 _LOCAL_DASHBOARD_OWNER_SUBJECTS = frozenset({"local-app", "local-startup"})
 
+# The one owner-gate denial that gets a machine-readable label of its own. A
+# token subject is fixed at mint time as ``owner_id or <bootstrap subject>``,
+# and every refresh re-mints from the INCOMING subject, so a session signed in
+# before ``KIROCREW_OWNER_ID`` was configured carries `local-app` /
+# `local-startup` for its whole life. Once an owner exists, the gate denies
+# that subject — correctly — but a generic ``403 forbidden`` gives the user no
+# way to tell "sign in again" apart from any other authorization failure.
+STALE_OWNER_SESSION_CODE = "stale_session_reauth"
+
+
+def stale_owner_session_response(request: web.Request) -> web.Response | None:
+    """The distinct denial label for a signed pre-owner bootstrap session.
+
+    Called strictly AFTER an owner-gate deny decision has been made: it never
+    grants, widens, or re-orders access — it only chooses the response body for
+    a request that is already refused. Returns the ``401 stale_session_reauth``
+    body when the denied caller is a SIGNED dashboard-user bootstrap subject
+    while an owner is configured, and ``None`` for every other denied caller,
+    who keeps the call site's existing generic response. The discriminator is
+    reserved for already-authenticated callers on purpose: an unsigned, absent,
+    or app-token caller must not learn which denial class it hit.
+
+    401 rather than 403 because re-authentication is the remedy — the caller's
+    credential is stale, not merely under-privileged. Only a fresh sign-in (a
+    newly minted token, whose subject is derived from the now-configured owner)
+    clears it; a token refresh cannot, since refresh preserves the subject.
+    """
+    caller = str(request.get("user") or "")
+    if request.get("app") != "":
+        # App tokens keep their generic denial, and an absent app claim means
+        # the middleware never authenticated this caller as a dashboard user.
+        return None
+    if caller not in _LOCAL_DASHBOARD_OWNER_SUBJECTS:
+        return None
+    state = request.app["state"]
+    owner_id = str(getattr(state, "owner_id", "") or "")
+    if not owner_id:
+        return None
+    return web.json_response(
+        {
+            "error": "this session predates the configured owner; sign in again",
+            "code": STALE_OWNER_SESSION_CODE,
+        },
+        status=401,
+    )
+
 
 def is_owner_dashboard_request(request: web.Request) -> bool:
     """Return whether request has a configured or implicit local owner identity."""
@@ -4019,6 +4201,11 @@ def _authorize_owner_request(
         return web.json_response({"error": "forbidden"}, status=403)
     if caller != owner_id:
         _audit_source_api(request, operation, "denied", "non_owner")
+        # Deny decision made above; the helper only relabels the response for a
+        # signed pre-owner bootstrap subject. Every other caller stays generic.
+        stale = stale_owner_session_response(request)
+        if stale is not None:
+            return stale
         return web.json_response({"error": "forbidden"}, status=403)
     return None
 
@@ -4681,6 +4868,16 @@ def request_check_refresh_now(
     return refreshing
 
 
+# Internal marker `_fetch_check_status` sets when the core chip read succeeded
+# but the isolated rollup read alone failed (or described a different head).
+# `_refresh_check_status` — the sole consumer — POPS it before the status is
+# cached or compared, so only the documented chip keys
+# ({state, ci, mergeable, mergeStateStatus}) ever reach slot serialization.
+# It exists because "rollup unavailable" and "rollup empty" are otherwise the
+# same absent `ci` key, and only the former may keep a previously known glyph.
+_CHIP_CI_UNAVAILABLE = "ciUnavailable"
+
+
 async def _refresh_check_status(url: str, on_update: _CheckUpdateCallback | None = None) -> None:
     previous = _check_cache.get(url)
     generation = _check_generations.get(url, 0)
@@ -4705,10 +4902,33 @@ async def _refresh_check_status(url: str, on_update: _CheckUpdateCallback | None
         # result describes the pre-mutation state. Drop it rather than let it
         # overwrite the invalidated entry.
         return
+    ci_unavailable = False
+    if status is not None:
+        # Strip the internal marker BEFORE the status is cached or compared:
+        # cache entries feed owner slot serialization, which must only ever
+        # carry the documented chip keys.
+        ci_unavailable = bool(status.pop(_CHIP_CI_UNAVAILABLE, None))
+        if not status:
+            status = None
     # A transient provider failure must not erase a known status. It still
     # refreshes the timestamp so repeated slots requests respect the TTL.
     if status is None and previous:
         status = previous[1]
+    elif (
+        ci_unavailable
+        and status is not None
+        and "ci" not in status
+        and previous
+        and previous[1]
+        and "ci" in previous[1]
+    ):
+        # The CI portion ALONE was unavailable this round (rollup read failed
+        # or straddled a push) while the authorized core fields survived.
+        # Mirror `record_full_payload_status`'s keep-known rule for a partial
+        # `checks` section: a degraded read must not erase a glyph the cache
+        # already knows — but a SUCCESSFUL rollup with zero checks (no marker)
+        # must still be allowed to clear a stale one.
+        status = {**status, "ci": previous[1]["ci"]}
     # Re-read the cache AFTER the provider await. The turn-boundary design makes
     # a concurrent full fetch the COMMON case: on `chat_done` the client
     # invalidates the detail payload (starting a full fetch) at the same moment
@@ -4774,25 +4994,52 @@ async def _fetch_check_status(url: str) -> dict[str, str] | None:
     ref = _require_change_ref(parse_source_url(url))
     result: dict[str, str] = {}
     if ref.provider == "github":
-        data = await _run_json(
-            "gh",
-            "pr",
-            "view",
-            ref.url,
-            "--json",
-            "statusCheckRollup,state,isDraft,mergeable,mergeStateStatus",
+        # The rollup is read separately from the core fields (#5115): `gh`
+        # resolves a `--json` field set atomically, so bundling
+        # `statusCheckRollup` here made a token without Checks read access lose
+        # the state/draft/merge data it WAS authorized to read. The two reads
+        # run concurrently; only the core read is load-bearing.
+        data_raw, rollup_raw = await asyncio.gather(
+            _run_json(
+                "gh",
+                "pr",
+                "view",
+                ref.url,
+                "--json",
+                "state,isDraft,mergeable,mergeStateStatus,headRefOid",
+            ),
+            _github_rollup_read(ref),
+            return_exceptions=True,
         )
+        if isinstance(data_raw, BaseException):
+            raise data_raw
+        data = data_raw
         if not isinstance(data, dict):
             return None
-        # Same projection AND the same latest-run collapsing as the full payload
-        # (`_github_checks`), so the chip glyph cannot disagree with the panel's
-        # own rollup — a superseded CANCELLED row must not paint either red.
-        buckets = [
-            check["bucket"] for check in _github_checks(_as_list(data.get("statusCheckRollup")))
-        ]
-        ci = _rollup_ci(buckets)
-        if ci is not None:
-            result["ci"] = ci
+        if isinstance(rollup_raw, BaseException):
+            # Core data survives; flag the CI portion unavailable so the cache
+            # writer can keep a previously known glyph instead of erasing it.
+            result[_CHIP_CI_UNAVAILABLE] = "1"
+        else:
+            checks, rollup_head = rollup_raw
+            head_oid = str(data.get("headRefOid") or "")
+            # A missing sha on either side deliberately fails open, same as
+            # the full-payload guard: unverifiable must not mean unavailable.
+            if head_oid and rollup_head and rollup_head != head_oid:
+                # The two reads straddled a push — this rollup describes a
+                # different commit. Treat it as unavailable rather than paint
+                # another head's CI on this one; the next refresh re-pairs.
+                result[_CHIP_CI_UNAVAILABLE] = "1"
+            else:
+                # Same projection AND the same latest-run collapsing as the
+                # full payload (`_github_checks`, applied inside
+                # `_github_rollup_read`), so the chip glyph cannot disagree
+                # with the panel's own rollup — a superseded CANCELLED row must
+                # not paint either red.
+                buckets = [check["bucket"] for check in checks]
+                ci = _rollup_ci(buckets)
+                if ci is not None:
+                    result["ci"] = ci
         raw_state = str(data.get("state") or "").upper()
         state = _project_state(raw_state, draft=bool(data.get("isDraft")))
         if state is not None:

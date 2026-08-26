@@ -7,6 +7,8 @@ each frame to the right destination —
   - JSON-RPC response whose id is in _pending_requests  → resolve that Future
   - JSON-RPC response whose id is in _routed_requests   → that session's queue
   - notification carrying params.sessionId              → that session's queue
+  - request (method + id) with no sessionId             → answered ONCE at
+                                                           connection level (-32601)
   - notification with no sessionId                       → broadcast to all
   - empty read (process exit)                            → _mark_dead: fail all
                                                            futures + poison queues
@@ -40,9 +42,12 @@ from kiro_crew.acp.runtime import (
     AcpSessionHandle,
 )
 from kiro_crew.acp.types import (
+    ACP_BACKEND_KAS,
     EVENT_COMPLETE,
     EVENT_TEXT_CHUNK,
+    JSONRPC_METHOD_NOT_FOUND,
     METHOD_COMMANDS_EXECUTE,
+    METHOD_KAS_AUTH_GET_ACCESS_TOKEN,
     METHOD_MCP_OAUTH_REQUEST,
     METHOD_SESSION_LOAD,
     METHOD_SESSION_NEW,
@@ -299,6 +304,164 @@ async def test_null_session_notification_broadcasts_to_all():
         assert a.method == "some/global"
         assert b.method == "some/global"
     finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_ownerless_request_answered_once_not_broadcast():
+    """A server→client REQUEST with no sessionId gets exactly ONE -32601 reply.
+
+    Before the fix it took the broadcast branch: every registered session's
+    dispatch loop classified it as server_request_unknown and each replied
+    -32601 on the shared stdin — one request id, N responses (issue #4864).
+    The runtime now answers it once at connection level and never enqueues it.
+    """
+    rt, reader, proc = _make_runtime()
+    q = _register(rt, "sA", "sB")
+    task = await _start_reader(rt)
+    try:
+        _feed(reader, {"id": 4864, "method": "unknown/ownerless", "params": {}})
+        # The answer task runs off the reader loop; give it ticks to complete.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        replies = [
+            json.loads(call.args[0].decode())
+            for call in proc.stdin.write.call_args_list
+        ]
+        errors = [r for r in replies if r.get("id") == 4864 and "error" in r]
+        assert len(errors) == 1, f"expected exactly one reply, got {replies}"
+        assert errors[0]["error"]["code"] == -32601
+        # Not enqueued to ANY session — no dispatch loop ever sees it.
+        assert q["sA"].empty()
+        assert q["sB"].empty()
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_kas_auth_waits_for_shared_answer_capacity_then_answers():
+    """A temporary full cap delays, rather than drops, the next KAS answer."""
+    rt, reader, _ = _make_runtime()
+    rt._max_answer_tasks = 1
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    second_capacity_check = asyncio.Event()
+    release_first = asyncio.Event()
+    release_second = asyncio.Event()
+    capacity_checks = 0
+
+    async def blocked_answer(request_id: int | str) -> None:
+        if request_id == 1:
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_started.set()
+            await release_second.wait()
+
+    wait_for_capacity = rt._wait_for_answer_capacity
+
+    async def observed_capacity(*args, **kwargs) -> bool:
+        nonlocal capacity_checks
+        capacity_checks += 1
+        if capacity_checks == 2:
+            second_capacity_check.set()
+        return await wait_for_capacity(*args, **kwargs)
+
+    rt._answer_get_access_token = blocked_answer  # type: ignore[method-assign]
+    rt._wait_for_answer_capacity = observed_capacity  # type: ignore[method-assign]
+    task = await _start_reader(rt)
+    try:
+        _feed(reader, {"id": 1, "method": METHOD_KAS_AUTH_GET_ACCESS_TOKEN})
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+        assert len(rt._answer_tasks) == 1
+
+        _feed(reader, {"id": 2, "method": METHOD_KAS_AUTH_GET_ACCESS_TOKEN})
+        await asyncio.wait_for(second_capacity_check.wait(), timeout=1.0)
+        assert not second_started.is_set()
+
+        release_first.set()
+        await asyncio.wait_for(second_started.wait(), timeout=1.0)
+        assert len(rt._answer_tasks) == 1
+        assert sum(rt._dropped_frames.values()) == 0
+
+        retained = next(iter(rt._answer_tasks))
+        discarded = asyncio.Event()
+        retained.add_done_callback(lambda _task: discarded.set())
+        release_second.set()
+        await asyncio.wait_for(discarded.wait(), timeout=1.0)
+        assert rt._answer_tasks == set()
+    finally:
+        release_first.set()
+        release_second.set()
+        await asyncio.gather(*rt._answer_tasks, return_exceptions=True)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_ownerless_response_with_null_result_is_not_answered():
+    """An id-carrying frame with NO method is a response, not a request.
+
+    A response whose result is null slips past the result/error routing check;
+    it must not be mistaken for an ownerless request and answered -32601 —
+    that would inject a spurious error reply for an id the backend owns.
+    """
+    rt, reader, proc = _make_runtime()
+    _register(rt, "sA")
+    task = await _start_reader(rt)
+    try:
+        _feed(reader, {"id": 77, "result": None})  # response shape, no method
+        for _ in range(20):
+            await asyncio.sleep(0)
+        replies = [
+            json.loads(call.args[0].decode())
+            for call in proc.stdin.write.call_args_list
+        ]
+        assert not [r for r in replies if r.get("id") == 77]
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_kas_auth_cap_timeout_marks_runtime_dead_without_growth():
+    """A wedged shared cap fails the runtime instead of losing a KAS request."""
+    rt, reader, _ = _make_runtime()
+    rt._max_answer_tasks = 1
+    rt._answer_cap_wait_secs = 0.0
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    marked_dead = asyncio.Event()
+    dead_reasons: list[str] = []
+
+    async def blocked_answer(request_id: int | str) -> None:
+        if request_id == 1:
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_started.set()
+
+    def mark_dead(reason: str) -> None:
+        dead_reasons.append(reason)
+        rt._dead = True
+        marked_dead.set()
+
+    rt._answer_get_access_token = blocked_answer  # type: ignore[method-assign]
+    rt._mark_dead = mark_dead  # type: ignore[method-assign]
+    task = await _start_reader(rt)
+    try:
+        _feed(reader, {"id": 1, "method": METHOD_KAS_AUTH_GET_ACCESS_TOKEN})
+        await asyncio.wait_for(first_started.wait(), timeout=1.0)
+
+        _feed(reader, {"id": 2, "method": METHOD_KAS_AUTH_GET_ACCESS_TOKEN})
+        await asyncio.wait_for(marked_dead.wait(), timeout=1.0)
+
+        assert not second_started.is_set()
+        assert len(rt._answer_tasks) == 1
+        assert sum(rt._dropped_frames.values()) == 0
+        assert dead_reasons and "KAS auth" in dead_reasons[0]
+    finally:
+        release_first.set()
+        await asyncio.gather(*rt._answer_tasks, return_exceptions=True)
         await _stop_reader(task)
 
 
@@ -762,6 +925,122 @@ async def test_mark_dead_is_idempotent():
     rt._mark_dead("second")  # no-op, must not double-poison or raise
     assert await asyncio.wait_for(q["sA"].get(), timeout=1.0) is None
     assert q["sA"].empty()
+
+
+# ── Death-log severity: deliberate teardown vs genuine death (#4052) ──
+#
+# A warm-pool TTL recycle tears runtimes down via kill() on a schedule; logging
+# that at the same severity and shape as a crash made `kirocrew logs` misreport
+# routine recycling as process death. These tests pin the split: kill() → INFO,
+# every genuine death path → WARNING, and the state transitions identical.
+
+
+def _death_records(caplog):
+    """The 'AcpRuntime dead' records, selected by the raw log template so the
+    assertions can check levelname (severity) separately from message shape."""
+    return [r for r in caplog.records if str(r.msg).startswith("AcpRuntime dead")]
+
+
+def _neuter_kill_side_effects(monkeypatch, proc):
+    """Keep kill() away from the host: never signal the fake PID (4242 could be
+    a real process), never touch the PID-tracking files."""
+    import kiro_crew.acp.runtime as rt_mod
+
+    proc.wait = AsyncMock(return_value=0)
+    monkeypatch.setattr(rt_mod.platform_compat, "kill_process_tree", lambda *a, **k: None)
+    monkeypatch.setattr(rt_mod.platform_compat, "pid_exists", lambda pid: False)
+    monkeypatch.setattr(rt_mod, "_untrack_pid", lambda p: None)
+    monkeypatch.setattr(rt_mod, "_untrack_session_pid", lambda p: None)
+
+
+@pytest.mark.asyncio
+async def test_deliberate_kill_logs_info_and_still_fails_pending_futures(caplog, monkeypatch):
+    """A deliberate kill(expected=True) of a LIVE runtime (pool recycle /
+    session shutdown) must log the death at INFO — no WARNING — while
+    everything non-log stays identical: pending futures still fail with
+    AcpRuntimeDead and session queues are poisoned."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    q = _register(rt, "sA")
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    rt._pending_requests[7] = fut
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(expected=True)
+
+    records = _death_records(caplog)
+    assert [r.levelname for r in records] == ["INFO"]
+    assert "killed" in records[0].getMessage()
+    # Severity-only change: waiters still learn the runtime died.
+    with pytest.raises(AcpRuntimeDead):
+        await asyncio.wait_for(fut, timeout=1.0)
+    assert await asyncio.wait_for(q["sA"].get(), timeout=1.0) is None
+
+
+@pytest.mark.asyncio
+async def test_kill_default_is_unexpected_and_warns(caplog, monkeypatch):
+    """A bare kill() keeps the WARNING: the default is fail-safe so every
+    cleanup kill on a failure path — initialize()'s failed-spawn cleanup, a
+    failed session setup — and any future call site stays a WARNING without
+    opting in."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill()
+
+    assert [r.levelname for r in _death_records(caplog)] == ["WARNING"]
+
+
+@pytest.mark.asyncio
+async def test_kill_refuses_info_downgrade_when_process_already_exited(caplog, monkeypatch):
+    """A replacement path can observe is_alive() == False (returncode set by
+    the child watcher) and kill() before the reader loop marks the death.
+    That is a genuine death being reaped, not a teardown this caller started:
+    expected=True must be refused and the WARNING kept."""
+    import logging
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    proc.returncode = 1  # process already exited on its own; _dead still False
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        await rt.kill(expected=True)
+
+    records = _death_records(caplog)
+    assert [r.levelname for r in records] == ["WARNING"]
+    assert "returncode=1" in records[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_unexpected_process_exit_still_warns_with_diagnostic_shape(caplog):
+    """A genuine death (process exited) keeps today's WARNING and its full
+    diagnostic shape — reason with rc, returncode=, stderr_tail: — unchanged."""
+    import logging
+
+    rt, reader, proc = _make_runtime()
+    proc.returncode = 1
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    rt._pending_requests[3] = fut
+    task = await _start_reader(rt)
+    try:
+        with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+            reader.feed_eof()  # empty readline → process exited
+            with pytest.raises(AcpRuntimeDead):
+                await asyncio.wait_for(fut, timeout=1.0)
+    finally:
+        await _stop_reader(task)
+
+    records = _death_records(caplog)
+    assert [r.levelname for r in records] == ["WARNING"]
+    msg = records[0].getMessage()
+    assert "process exited (rc=1)" in msg
+    assert "returncode=1" in msg
+    assert "stderr_tail: <none>" in msg
 
 
 # ── Send paths ──
@@ -2142,7 +2421,7 @@ async def test_dispatch_unknown_server_request_gets_error_response():
         for call in calls:
             data = json.loads(call.args[0].decode())
             if data.get("id") == 9999 and "error" in data:
-                assert data["error"]["code"] == -32601
+                assert data["error"]["code"] == JSONRPC_METHOD_NOT_FOUND
                 error_sent = True
         assert error_sent, "Expected -32601 error response for unknown server request"
     finally:
@@ -3330,6 +3609,118 @@ class TestAcpRuntimeLoadSession:
         assert "sid-y" not in rt._session_queues
 
     @pytest.mark.asyncio
+    async def test_load_session_reinjects_the_kas_agent_definition(self, monkeypatch):
+        """Resume must re-send the agent, for the same reason session/new sends it.
+
+        KAS registers client agents PER SESSION and has no ``--agent`` flag, so a
+        resumed session that is not handed them again advertises only the modes it
+        can find on disk — and that set is not a superset of what session/new had,
+        because KAS skips an agent profile written for kiro-cli. Omitting this made
+        the requested mode genuinely absent on resume, and the mode guard then
+        refused the load rather than silently running the backend default.
+        """
+        from kiro_crew.acp._dispatch import build_session_new_params
+
+        rt, _, _ = _make_runtime()
+        rt._can_load_session = True
+        sent: list[tuple[str, dict]] = []
+
+        async def _fake_send(method, params, timeout=None):
+            sent.append((method, params))
+            if method == METHOD_SESSION_LOAD:
+                return {"modes": {"currentModeId": "kirocrew"}, "models": []}
+            return {}
+
+        async def _fake_agents(agent):
+            return [{"id": agent, "prompt": "p", "tools": []}]
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
+        rt._acp_backend = ACP_BACKEND_KAS
+
+        await rt.load_session("", "sid-kas", cwd="/work", agent="kirocrew")
+
+        load_params = sent[0][1]
+        assert load_params["_meta"]["kiro"]["customAgents"] == [
+            {"id": "kirocrew", "prompt": "p", "tools": []}
+        ]
+        # Same envelope as session/new, because both go through one builder. Two
+        # hand-built copies of this nesting would be free to drift, and a resumed
+        # session that got a subtly different shape would fail the same way the
+        # missing injection did: mode absent, load refused.
+        assert (
+            load_params["_meta"]["kiro"]
+            == build_session_new_params(
+                "/work", kas_custom_agents=[{"id": "kirocrew", "prompt": "p", "tools": []}]
+            )["_meta"]["kiro"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_load_session_keeps_the_transcript_path_alongside_the_agents(
+        self, monkeypatch
+    ):
+        """Merged, not assigned: a third _meta writer must not drop an earlier one.
+
+        The two envelopes belong to different backends today (a transcript path is
+        kiro-cli-only), so in practice they do not collide — which is exactly why a
+        plain assignment would survive review and then lose a field later.
+        """
+        rt, _, _ = _make_runtime()
+        rt._can_load_session = True
+        sent: list[tuple[str, dict]] = []
+
+        async def _fake_send(method, params, timeout=None):
+            sent.append((method, params))
+            if method == METHOD_SESSION_LOAD:
+                return {"modes": {"currentModeId": "kirocrew"}, "models": []}
+            return {}
+
+        async def _fake_agents(agent):
+            return [{"id": agent, "prompt": "p", "tools": []}]
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
+        rt._acp_backend = ACP_BACKEND_KAS
+
+        await rt.load_session("/t.json", "sid-both", cwd="/work", agent="kirocrew")
+
+        meta = sent[0][1]["_meta"]
+        assert meta["_kiro.dev/session_file"] == "/t.json"
+        assert "kiro" in meta
+
+    @pytest.mark.asyncio
+    async def test_the_kiro_resume_path_never_reaches_the_adapter(self, monkeypatch):
+        """harness-parity H13: the kiro construction path must not change at all.
+
+        Relying on ``_kas_custom_agents`` to answer ``None`` would leave the kiro
+        resume awaiting an adapter coroutine — working, but changed, and free to
+        grow a failure mode later. The backend guard is what makes the kiro path
+        reach a comparison and stop, so this asserts the adapter is never called.
+        """
+        rt, _, _ = _make_runtime()
+        rt._can_load_session = True
+        sent: list[tuple[str, dict]] = []
+        calls: list[str] = []
+
+        async def _fake_send(method, params, timeout=None):
+            sent.append((method, params))
+            if method == METHOD_SESSION_LOAD:
+                return {"modes": {"currentModeId": "kirocrew"}, "models": []}
+            return {}
+
+        async def _fake_agents(agent):
+            calls.append(agent)
+            return [{"id": agent, "prompt": "p", "tools": []}]
+
+        monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+        monkeypatch.setattr(rt, "_kas_custom_agents", _fake_agents)
+
+        await rt.load_session("/t.json", "sid-kiro", cwd="/work", agent="kirocrew")
+
+        assert calls == []
+        assert sent[0][1]["_meta"] == {"_kiro.dev/session_file": "/t.json"}
+
+    @pytest.mark.asyncio
     async def test_load_session_params_match_acp_client(self, monkeypatch):
         """Drift guard: the kiro (non-claude) session/load payload built here
         must equal the one AcpClient._initialize_session builds, so the two
@@ -4335,11 +4726,48 @@ async def test_handle_steer_sends_session_steer():
     rt.send_request = _send_request
     handle = AcpSessionHandle("sA", asyncio.Queue(), rt)
     assert handle.supports_steer is True
+    assert handle.last_steer_monotonic == 0.0  # never steered
     ok = await handle.steer("please focus on X")
     assert ok is True
     assert sent["method"] == "_session/steer"
     assert "please focus on X" in sent["params"]["message"]
     assert await handle.steer("   ") is False
+
+
+@pytest.mark.asyncio
+async def test_handle_steer_stamps_write_time_and_provider_passes_it_through():
+    """The stamp lives at the innermost write because that is the one point
+    every steer funnels through — the dashboard steers the client directly
+    while the IM transports steer the provider wrapper. The dashboard's
+    keepalive route reads it to decide whether a sleeping `wait` should return
+    early, so a refused steer must not move it.
+    """
+    rt = MagicMock()
+
+    async def _send_request(method, params):
+        return 1
+
+    rt.send_request = _send_request
+    handle = AcpSessionHandle("sA", asyncio.Queue(), rt)
+    from kiro_crew.acp.session_provider import AcpSessionProvider
+
+    prov = AcpSessionProvider.__new__(AcpSessionProvider)
+    prov._handle = handle
+    prov._runtime = rt
+
+    assert prov.last_steer_monotonic == 0.0
+    before = time.monotonic()
+    assert await handle.steer("focus on X") is True
+    after = time.monotonic()
+    stamped = handle.last_steer_monotonic
+    assert before <= stamped <= after
+    # The wrapper the IM transports hold must report the same fact.
+    assert prov.last_steer_monotonic == stamped
+
+    # A refused steer (empty text) never reached the wire, so it must not
+    # look newer than the sleep it would otherwise cut short.
+    assert await handle.steer("  ") is False
+    assert handle.last_steer_monotonic == stamped
 
 
 # ── Round-3 fixes: cancel_session grace + idempotent cancel ──
@@ -4613,7 +5041,13 @@ def test_build_permission_event_sets_raw_tool_params():
     )
     event, _recorded = build_permission_event(msg, raw_params_cache=raw_cache)
     assert event.raw_tool_params == {"path": "/home/u/.ssh/id_rsa", "content": "x"}
-    assert "tc-1" not in raw_cache  # consumed on use
+    # RETAINED on use (.get, matching the sibling caches): a second permission
+    # frame for the same toolCallId (re-ask after reject_once, re-prompt after
+    # a mode change) must still find the params — the per-turn dispatch
+    # .clear() handles cleanup.
+    assert "tc-1" in raw_cache
+    event2, _ = build_permission_event(msg, raw_params_cache=raw_cache)
+    assert event2.raw_params_trusted is True
 
 
 def test_build_permission_event_raw_params_none_without_cache():
@@ -4838,12 +5272,11 @@ def test_periodic_sweep_skips_protected_runtime_pid():
 
 
 @pytest.mark.asyncio
-async def test_runtime_spawn_scrubs_channel_creds_on_default_auto(monkeypatch):
-    """AcpRuntime.spawn strips gateway channel creds on the default auto tier.
+async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
+    """AcpRuntime.spawn applies the full ACP child scrub on the default tier.
 
-    Mirrors the AcpClient guard: the runtime copies a raw os.environ + wrap_argv
-    (not sandboxed_spawn_argv), and the default tier launcher does not strip
-    _AGENT_DENIED_ENV_KEYS, so scrub_agent_denied_env must remove them.
+    This parent-side enforcement is what protects raw Windows Kiro delegation;
+    POSIX launchers apply the same sensitive/Python scrub inline.
     """
     import kiro_crew.acp.runtime as runtime_mod
 
@@ -4852,6 +5285,10 @@ async def test_runtime_spawn_scrubs_channel_creds_on_default_auto(monkeypatch):
     monkeypatch.setenv("WECOM_SECRET", "FAKE-wecom-secret")
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-FAKE")
     monkeypatch.setenv("KIROCREW_OWNER_ID", "U_FAKE_OWNER")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "FAKE-secret")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/fake-agent.sock")
+    monkeypatch.setenv("PYTHONPATH", "/gateway/pythonpath")
+    monkeypatch.setenv("PYTHONPYCACHEPREFIX", "/gateway/pycache")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "FAKE-akid")
     monkeypatch.setenv("KIROCREW_UNRELATED_KEEPME", "keep-this-value")
 
@@ -4894,8 +5331,12 @@ async def test_runtime_spawn_scrubs_channel_creds_on_default_auto(monkeypatch):
         "WECOM_SECRET",
         "SLACK_BOT_TOKEN",
         "KIROCREW_OWNER_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "SSH_AUTH_SOCK",
+        "PYTHONPATH",
+        "PYTHONPYCACHEPREFIX",
     ):
-        assert key not in env, f"{key} leaked into default-auto runtime child env"
+        assert key not in env, f"{key} leaked into runtime child env"
     assert env.get("KIROCREW_UNRELATED_KEEPME") == "keep-this-value"
     assert env.get("AWS_ACCESS_KEY_ID") == "FAKE-akid"
 
@@ -5505,3 +5946,1175 @@ async def test_send_and_await_timeout_error_names_the_budget():
     assert "timed out" in msg
     assert "0.01s" in msg
     assert "probe/method" in msg
+
+
+# ── Unroutable permission requests (backend-internal subagents) ──────────────
+#
+# A `session/request_permission` REQUEST for a sessionId this client never
+# registered comes from a backend-internal subagent (e.g. kiro-cli's own
+# `subagent` tool). Dropping it strands the backend's response oneshot and
+# wedges the child's whole tool batch until process teardown — the 2026-08-15
+# crew incident hung 13 such approvals for 2 hours. These tests pin the fix:
+# the runtime answers the request itself, with the request's own reject
+# option, and never counts it as a dropped frame.
+
+
+def _last_written_frame(proc) -> dict:
+    """The most recent JSON frame written to the fake process stdin."""
+    assert proc.stdin.write.call_args is not None, "nothing was written to stdin"
+    raw = proc.stdin.write.call_args[0][0]
+    return json.loads(raw.decode())
+
+
+@pytest.fixture(autouse=True)
+def _stub_sel_for_permission_tests(request, monkeypatch):
+    """Stub the SEL for the auto-reject tests in this section.
+
+    The production path fires the audit on a background ``asyncio.to_thread``
+    task; letting it hit the real SEL from unit tests is slow (first-use
+    filesystem setup) and races the test's event-loop teardown ("Event loop is
+    closed" noise on loaded CI shards). Scoped by test-name prefix so the rest
+    of the module keeps its behavior.
+    """
+    if not request.node.name.startswith(
+        ("test_unroutable", "test_registered_session_permission", "test_ambiguous")
+    ):
+        yield
+        return
+    import kiro_crew.sel as sel_mod
+
+    class _StubSel:
+        def log_tool_invocation(self, **kwargs):  # noqa: D401 - stub
+            return None
+
+    monkeypatch.setattr(sel_mod, "sel", lambda: _StubSel())
+    yield
+
+
+async def _drain_audits(rt) -> None:
+    """Await in-flight audit tasks so none outlives the test's event loop."""
+    if rt._audit_tasks:
+        await asyncio.gather(*list(rt._audit_tasks), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_unroutable_permission_request_is_auto_rejected(caplog):
+    """Unknown-session permission REQUEST → answered with its reject option."""
+    import logging
+
+    rt, reader, proc = _make_runtime()
+    task = await _start_reader(rt)
+    try:
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.acp.runtime"):
+            _feed(
+                reader,
+                {
+                    "jsonrpc": "2.0",
+                    "id": 77,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": "ghost-child",
+                        "toolCall": {"toolCallId": "tc-1", "title": "glob /home"},
+                        "options": [
+                            {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                            {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                        ],
+                    },
+                },
+            )
+            await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 77
+        assert frame["result"] == {
+            "outcome": {"outcome": "selected", "optionId": "reject_once"}
+        }
+        # Answered, not dropped: the drop counter must stay empty so the
+        # summary log cannot misattribute an answered request as a drop.
+        assert rt._dropped_frames == {}
+        warnings = [r.getMessage() for r in caplog.records if "ghost-child" in r.getMessage()]
+        assert warnings and "auto-rejected" in warnings[0]
+        assert "glob /home" in warnings[0]
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unroutable_permission_never_picks_an_allow_option():
+    """A payload with ONLY allow options must answer `cancelled`, never allow."""
+    rt, reader, proc = _make_runtime()
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 78,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "ghost-child",
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "allow_always", "name": "Always", "kind": "allow_always"},
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 78
+        assert frame["result"] == {"outcome": {"outcome": "cancelled"}}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unroutable_permission_legacy_options_without_kind():
+    """Legacy kiro options omit `kind`; only a well-known reject id matches."""
+    rt, reader, proc = _make_runtime()
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 79,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "ghost-child",
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow"},
+                        {"optionId": "reject_once", "name": "Reject"},
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["result"]["outcome"] == {"outcome": "selected", "optionId": "reject_once"}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_registered_session_permission_still_routes_to_queue():
+    """The fix must not intercept permission requests for registered sessions."""
+    rt, reader, proc = _make_runtime()
+    queues = _register(rt, "known-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 80,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "known-session",
+                    "options": [{"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}],
+                },
+            },
+        )
+        await _drain(reader)
+
+        routed = queues["known-session"].get_nowait()
+        assert routed.id == 80
+        # The runtime did not answer on the session's behalf.
+        proc.stdin.write.assert_not_called()
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unroutable_non_permission_request_still_drops():
+    """Only permission requests get the auto-answer; other unknown-session
+    frames keep the counted-drop behavior."""
+    rt, reader, proc = _make_runtime()
+    task = await _start_reader(rt)
+    try:
+        _feed(reader, {"method": "session/update", "params": {"sessionId": "ghost"}})
+        await _drain(reader)
+        assert rt._dropped_frames == {("ghost", "session/update"): 1}
+        proc.stdin.write.assert_not_called()
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_subagent_list_update_snapshots_child_ids():
+    """A broadcast list_update replaces the known-child set (full list each time)."""
+    rt, reader, _ = _make_runtime()
+    _register(rt, "parent-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {
+                    "subagents": [
+                        {"sessionId": "child-a", "sessionName": "correctness"},
+                        {"sessionId": "child-b", "sessionName": "security"},
+                    ],
+                    "pendingStages": [],
+                },
+            },
+        )
+        await _drain(reader)
+        assert rt._subagent_sessions == {"child-a", "child-b"}
+
+        # Next update omits child-a (terminated) — the set is replaced, not grown.
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-b"}]},
+            },
+        )
+        await _drain(reader)
+        assert rt._subagent_sessions == {"child-b"}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_known_subagent_permission_routes_to_slot_queue():
+    """A child the backend announced gets the SAME policy pipeline as the main
+    agent: its permission request lands on the slot's session queue instead of
+    being auto-rejected."""
+    rt, reader, proc = _make_runtime()
+    queues = _register(rt, "parent-session")
+    # An explicitly marked active turn — requests are only routed while the
+    # owner's prompt dispatch loop is consuming the queue. (_routed_requests
+    # is NOT a proxy for this: it also holds set_mode/steer/config ids.)
+    rt.mark_turn_active("parent-session", True)
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 90,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "child-a",
+                    "toolCall": {"toolCallId": "tc-9", "title": "glob /home"},
+                    "options": [
+                        {"optionId": "allow_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        # list_update broadcast + the routed permission request both arrive.
+        frames = []
+        while not queues["parent-session"].empty():
+            frames.append(queues["parent-session"].get_nowait())
+        assert any(f.id == 90 for f in frames), frames
+        # The runtime did NOT answer it — the slot's consumer owns the decision.
+        proc.stdin.write.assert_not_called()
+        assert rt._dropped_frames == {}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unannounced_session_permission_still_auto_rejected():
+    """A sessionId the backend never announced cannot ride the routing path —
+    it keeps the fail-closed auto-reject."""
+    rt, reader, proc = _make_runtime()
+    _register(rt, "parent-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 91,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "never-announced",
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 91
+        assert frame["result"]["outcome"] == {"outcome": "selected", "optionId": "reject_once"}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_multi_session_runtime_falls_back_to_reject():
+    """With several registered sessions the child→consumer mapping is ambiguous
+    — the frame names no owner — so the runtime fails closed instead of handing
+    the approval to an arbitrary sibling's policy."""
+    rt, reader, proc = _make_runtime()
+    queues = _register(rt, "session-one", "session-two")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 92,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "child-a",
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 92
+        assert frame["result"]["outcome"] == {"outcome": "selected", "optionId": "reject_once"}
+        # Neither sibling consumer received the request frame.
+        for q in queues.values():
+            while not q.empty():
+                assert q.get_nowait().id != 92
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_announced_child_session_update_routes_for_cache_population():
+    """A child's session/update (tool_call) frame is routed to the slot queue
+    so the consumer's caches capture the real command bytes for a later
+    permission request — the payload full mode-parity depends on."""
+    rt, reader, proc = _make_runtime()
+    queues = _register(rt, "parent-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        _feed(
+            reader,
+            {
+                "method": "session/update",
+                "params": {
+                    "sessionId": "child-a",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-child-1",
+                        "title": "Running: sha256sum README.md",
+                        "kind": "execute",
+                        "rawInput": {"command": "sha256sum README.md"},
+                    },
+                },
+            },
+        )
+        await _drain(reader)
+
+        frames = []
+        while not queues["parent-session"].empty():
+            frames.append(queues["parent-session"].get_nowait())
+        routed = [f for f in frames if f.method == "session/update"]
+        assert routed, "child session/update must reach the slot queue"
+        assert (routed[0].params or {}).get("sessionId") == "child-a"
+        # Not answered by the runtime, not counted as a drop.
+        proc.stdin.write.assert_not_called()
+        assert rt._dropped_frames == {}
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_unannounced_child_session_update_still_drops():
+    """Updates for sessions the backend never announced keep the counted-drop
+    path — routing is gated on the announce, same as permission requests."""
+    rt, reader, proc = _make_runtime()
+    q = _register(rt, "parent-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "session/update",
+                "params": {"sessionId": "never-announced", "update": {"sessionUpdate": "tool_call"}},
+            },
+        )
+        await _drain(reader)
+        assert rt._dropped_frames == {("never-announced", "session/update"): 1}
+        assert q["parent-session"].empty()
+    finally:
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_session_swap_on_warm_runtime_does_not_inherit_child_routing():
+    """A new session registered after the announcing owner departs must NOT
+    receive the stale child's permission requests — they fail closed."""
+    rt, reader, proc = _make_runtime()
+    _register(rt, "owner-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        await _drain(reader)
+        assert rt._subagent_owner == "owner-session"
+
+        # Owner departs; a different session takes the warm runtime.
+        rt.unregister_session("owner-session")
+        assert rt._subagent_owner is None and rt._subagent_sessions == set()
+        q2 = _register(rt, "successor-session")
+
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 95,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "child-a",
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 95
+        assert frame["result"]["outcome"] == {"outcome": "selected", "optionId": "reject_once"}
+        assert q2["successor-session"].empty()
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+def test_child_low_fidelity_requires_structured_security_context():
+    """A rendered-diff tool_input alone is NOT fidelity: the child gate
+    requires cache-provenance structured params, a resolved shell
+    classification, and (for shells) a recoverable command."""
+    from kiro_crew.acp.types import AcpEvent
+
+    # Child edit refinement: diff text cached, no structured params → LOW.
+    ev = AcpEvent(kind="permission_request", sub_session_id="child-a", tool_input="--- a\n+++ b")
+    assert ev.child_low_fidelity is True
+    # Child shell with params but unrecoverable command → LOW.
+    ev = AcpEvent(
+        kind="permission_request", sub_session_id="child-a",
+        is_shell=True, raw_tool_params={"note": "no command key"},
+        raw_params_trusted=True, shell_classified=True,
+    )
+    assert ev.child_low_fidelity is True
+    # Inline (agent-authored) params without cache provenance → LOW even
+    # with a recoverable command.
+    ev = AcpEvent(
+        kind="permission_request", sub_session_id="child-a",
+        is_shell=True, raw_tool_params={"command": "sha256sum README.md"},
+        raw_params_trusted=False, shell_classified=True,
+    )
+    assert ev.child_low_fidelity is True
+    # Unresolved shell classification (cache miss defaults is_shell=False) → LOW.
+    ev = AcpEvent(
+        kind="permission_request", sub_session_id="child-a",
+        raw_tool_params={"path": "/tmp/x"},
+        raw_params_trusted=True, shell_classified=False,
+    )
+    assert ev.child_low_fidelity is True
+    # Child with full provenance context → parity (not low).
+    ev = AcpEvent(
+        kind="permission_request", sub_session_id="child-a",
+        is_shell=True, raw_tool_params={"command": "sha256sum README.md"},
+        raw_params_trusted=True, shell_classified=True,
+    )
+    assert ev.child_low_fidelity is False
+    # Non-child events are never low-fidelity.
+    ev = AcpEvent(kind="permission_request")
+    assert ev.child_low_fidelity is False
+
+
+@pytest.mark.asyncio
+async def test_between_turns_child_permission_is_answered_not_queued():
+    """With no in-flight prompt nothing consumes the slot queue until the next
+    turn's drain — a queued request would strand the backend. It is answered
+    fail-closed immediately instead."""
+    rt, reader, proc = _make_runtime()
+    queues = _register(rt, "parent-session")
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 96,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "child-a",
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+        await _drain_audits(rt)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 96
+        assert frame["result"]["outcome"] == {"outcome": "selected", "optionId": "reject_once"}
+        # Nothing left queued for a consumer that may not exist for hours.
+        while not queues["parent-session"].empty():
+            assert queues["parent-session"].get_nowait().id != 96
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_pending_non_prompt_request_does_not_enable_routing():
+    """A pending set_mode/steer/config request leaves an entry in
+    _routed_requests but proves nothing about a consuming prompt loop — a
+    child permission arriving then must be answered fail-closed, not parked
+    on a queue nobody reads."""
+    rt, reader, proc = _make_runtime()
+    _register(rt, "parent-session")
+    rt._routed_requests[5] = "parent-session"  # e.g. an unanswered set_mode
+    task = await _start_reader(rt)
+    try:
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 97,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "child-a",
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            },
+        )
+        await _drain(reader)
+        await _drain_audits(rt)
+
+        frame = _last_written_frame(proc)
+        assert frame["id"] == 97
+        assert frame["result"]["outcome"] == {"outcome": "selected", "optionId": "reject_once"}
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_notice_yield_abandonment_clears_turn_state():
+    """The drain-time rejection notices are yields, i.e. abandonment points.
+    A consumer that closes the stream at a notice yield must not leave the
+    handle permanently turn-active (mark_turn_active leaked True /
+    _turn_done cleared) — the notice loop must live inside the same
+    try/finally as the dispatch loop."""
+    from kiro_crew.acp.types import EVENT_SUBAGENT_ACTIVITY
+
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=7)
+    handle._pending_reject_notices.append(("child-a", "Running: sha256sum x"))
+
+    gen = handle.prompt("hi", timeout=3.0)
+    first = await gen.__anext__()
+    assert first.kind == EVENT_SUBAGENT_ACTIVITY
+    assert "auto-rejected" in (first.text or "")
+    # Consumer abandons the stream at the notice yield.
+    await gen.aclose()
+
+    assert handle.is_turn_active is False
+    assert "sA" not in rt._turn_active_sessions
+
+
+@pytest.mark.asyncio
+async def test_handle_owned_rejections_are_sel_audited():
+    """Every permission decision leaves a SEL record (repo convention). The
+    fail-close fidelity gate and the pre-turn drain answer requests that no
+    consumer ever sees, so the handle must emit the denial audit itself —
+    otherwise those rejections are invisible to SEL."""
+    import contextlib
+
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+
+    audited: list[tuple[object, str, str]] = []
+    handle._audit_handle_reject = (  # type: ignore[method-assign]
+        lambda request_id, title, error, sub_session_id="": audited.append(
+            (request_id, title, error)
+        )
+    )
+    rt.send_response = AsyncMock()
+
+    # Pre-turn drain path: a stranded permission request in the queue.
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict(
+            {
+                "jsonrpc": "2.0",
+                "id": 55,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "child-a",
+                    "toolCall": {"toolCallId": "tc-9", "title": "Running: rm -rf x"},
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            }
+        )
+    )
+    rt.send_request = AsyncMock(return_value=9)
+    gen = handle.prompt("hi", timeout=0.2)
+    with contextlib.suppress(StopAsyncIteration, asyncio.TimeoutError, Exception):
+        await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+    await gen.aclose()
+
+    assert audited, "pre-turn drain reject was not SEL-audited"
+    assert audited[0][2] == "stranded_request_pre_turn_drain"
+
+
+def test_missing_kind_is_not_a_resolved_shell_classification():
+    """A tool_call whose `kind` never arrived must NOT cache a shell
+    classification: the miss-default False would otherwise read as a RESOLVED
+    non-shell on the later permission frame (shell_classified=True), skipping
+    the low-fidelity downgrade without any classification having happened."""
+    from kiro_crew.acp._dispatch import _build_tool_call_event, build_permission_event
+    from kiro_crew.acp.types import METHOD_REQUEST_PERMISSION
+
+    shell_cache: dict[str, bool] = {}
+    raw_cache: dict[str, dict] = {}
+    # No `kind` key at all — classification unresolved.
+    _build_tool_call_event(
+        {"title": "Doing something", "toolCallId": "tc-nk", "rawInput": {"path": "/tmp/x"}},
+        None,
+        shell_cache=shell_cache,
+        raw_params_cache=raw_cache,
+    )
+    assert "tc-nk" not in shell_cache  # unresolved, NOT cached False
+
+    msg = JsonRpcMessage.from_dict(
+        {
+            "id": 7,
+            "method": METHOD_REQUEST_PERMISSION,
+            "params": {
+                "sessionId": "child-a",
+                "toolCall": {"toolCallId": "tc-nk", "title": "Doing something"},
+                "options": [],
+            },
+        }
+    )
+    event, _ = build_permission_event(
+        msg, shell_cache=shell_cache, raw_params_cache=raw_cache
+    )
+    event.sub_session_id = "child-a"
+    assert event.shell_classified is False
+    assert event.child_low_fidelity is True  # downgrade applies
+
+    # An explicit kind DOES resolve (even a non-shell one).
+    _build_tool_call_event(
+        {"title": "Reading", "kind": "read", "toolCallId": "tc-rk"},
+        None,
+        shell_cache=shell_cache,
+        raw_params_cache=raw_cache,
+    )
+    assert shell_cache.get("tc-rk") is False  # resolved non-shell
+
+
+def test_refinement_fills_raw_params_cache_for_following_permission():
+    """A tool_call_update refinement carrying rawInput must make the FOLLOWING
+    permission frame full-provenance (raw_params_trusted=True) — this is the
+    path that keeps backends streaming an empty initial rawInput out of the
+    low-fidelity downgrade. Pins the required frame ordering explicitly."""
+    from kiro_crew.acp._dispatch import build_permission_event, parse_session_update
+    from kiro_crew.acp.types import METHOD_REQUEST_PERMISSION
+
+    shell_cache: dict[str, bool] = {}
+    raw_cache: dict[str, dict] = {}
+    input_cache: dict[str, str] = {}
+    # Initial tool_call with EMPTY rawInput but a real kind.
+    parse_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-rf",
+            "title": "Running: sha256sum x",
+            "kind": "execute",
+        },
+        tool_input_cache=input_cache,
+        shell_cache=shell_cache,
+        raw_params_cache=raw_cache,
+    )
+    assert "tc-rf" not in raw_cache
+    # Refinement supplies the complete params.
+    parse_session_update(
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-rf",
+            "rawInput": {"command": "sha256sum x"},
+        },
+        tool_input_cache=input_cache,
+        shell_cache=shell_cache,
+        raw_params_cache=raw_cache,
+    )
+    assert raw_cache.get("tc-rf") == {"command": "sha256sum x"}
+
+    msg = JsonRpcMessage.from_dict(
+        {
+            "id": 8,
+            "method": METHOD_REQUEST_PERMISSION,
+            "params": {
+                "sessionId": "child-a",
+                "toolCall": {"toolCallId": "tc-rf", "title": "Running: sha256sum x"},
+                "options": [],
+            },
+        }
+    )
+    event, _ = build_permission_event(
+        msg, shell_cache=shell_cache, raw_params_cache=raw_cache
+    )
+    event.sub_session_id = "child-a"
+    assert event.raw_params_trusted is True
+    assert event.shell_classified is True
+    assert event.child_low_fidelity is False
+
+
+@pytest.mark.asyncio
+async def test_fidelity_unaware_consumer_gate_rejects_and_audits():
+    """The fail-close choke point protecting every non-dashboard consumer:
+    a low-fidelity child permission request reaching _dispatch_events on a
+    handle whose consumer never opted in must be REJECTED (answered, never
+    yielded as a permission event) and SEL-audited."""
+    from kiro_crew.acp.types import (
+        EVENT_PERMISSION_REQUEST,
+        METHOD_REQUEST_PERMISSION,
+    )
+
+    rt, reader, proc = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    assert handle.child_fidelity_aware is False
+
+    audited: list[tuple[object, str, str]] = []
+    handle._audit_handle_reject = (  # type: ignore[method-assign]
+        lambda request_id, title, error, sub_session_id="": audited.append(
+            (request_id, title, error)
+        )
+    )
+
+    task = await _start_reader(rt)
+    try:
+        events = []
+
+        async def drive():
+            async for ev in handle.prompt("hi", timeout=3.0):
+                events.append(ev)
+
+        driver = asyncio.ensure_future(drive())
+        req_id = (await _await_routed(rt, "sA"))["sA"]
+        # Announce the child so the frame routes to the owner's queue.
+        _feed(
+            reader,
+            {
+                "method": "_kiro.dev/subagent/list_update",
+                "params": {"subagents": [{"sessionId": "child-a"}]},
+            },
+        )
+        # Child permission frame with NO preceding tool_call → low fidelity.
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": METHOD_REQUEST_PERMISSION,
+                "params": {
+                    "sessionId": "child-a",
+                    "toolCall": {"toolCallId": "tc-77", "title": "Running: rm -rf /"},
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            },
+        )
+        _feed(reader, {"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}})
+        await asyncio.wait_for(driver, timeout=5.0)
+
+        kinds = [ev.kind for ev in events]
+        assert EVENT_PERMISSION_REQUEST not in kinds  # never yielded
+        assert audited and audited[0][2] == "child_low_fidelity_unaware_consumer"
+        # The reject was actually SENT (answered, not dropped).
+        answer = None
+        for call in proc.stdin.write.call_args_list:
+            frame = json.loads(call.args[0].decode())
+            if frame.get("id") == 77 and "result" in frame:
+                answer = frame
+        assert answer is not None
+        assert answer["result"]["outcome"]["outcome"] in ("selected", "cancelled")
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+@pytest.mark.asyncio
+async def test_answer_task_cap_marks_dead_instead_of_growing_unbounded():
+    """A backend that floods permission frames while never reading stdin
+    blocks each answer task on drain(). The in-flight set must be BOUNDED,
+    and the overflow must be neither a hang nor an unaudited drop: past the
+    cap the runtime is marked dead (teardown resolves EVERY pending wait)
+    and the denial is SEL-audited."""
+    rt, _, _ = _make_runtime()
+    rt._max_answer_tasks = 3
+
+    import asyncio as _asyncio
+
+    _never = _asyncio.Event()
+
+    async def _blocked_answer(msg, session_id, *, reason="x"):
+        await _never.wait()  # simulates send_response stuck on drain()
+
+    rt._answer_unroutable_permission = _blocked_answer  # type: ignore[method-assign]
+    audited: list[str] = []
+    rt._audit_denied_off_loop = (  # type: ignore[method-assign]
+        lambda msg, session_id, reason, title=None: audited.append(reason)
+    )
+    dead: list[str] = []
+
+    def _fake_mark_dead(reason):
+        dead.append(reason)
+        rt._dead = True  # mirror the real _mark_dead contract
+
+    rt._mark_dead = _fake_mark_dead  # type: ignore[method-assign]
+
+    def _frame(i):
+        return JsonRpcMessage.from_dict(
+            {
+                "jsonrpc": "2.0",
+                "id": 500 + i,
+                "method": "session/request_permission",
+                "params": {"sessionId": f"child-{i}", "options": []},
+            }
+        )
+
+    rt._answer_cap_wait_secs = 0.05
+    for i in range(5):
+        await rt._spawn_answer_task(_frame(i), f"child-{i}")
+    await _asyncio.sleep(0)  # let the tasks start (and block)
+
+    assert len(rt._answer_tasks) == 3  # capped, not 5
+    # Overflow was audited and escalated to mark-dead — not silently dropped.
+    # Only the FIRST overflow frame audits + marks dead; once dead, further
+    # frames are gated out entirely (no audit-task growth on a dead runtime).
+    assert audited == ["answer_task_cap_runtime_dead"]
+    assert dead and "cap" in dead[0]
+    # A frame arriving after death spawns NOTHING.
+    await rt._spawn_answer_task(_frame(9), "child-9")
+    await _asyncio.sleep(0)
+    assert len(rt._answer_tasks) == 3
+    assert audited == ["answer_task_cap_runtime_dead"]
+    _never.set()
+    await _asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_capacity_freed_but_runtime_died_still_audits_the_refusal():
+    """A waiter parked at the cap can be woken by a completing answer AND find
+    the runtime condemned by a concurrent waiter in the same moment. Capacity
+    was freed, so this is not the timeout path, but admission still fails — and
+    a refused permission decision must leave a SEL record either way."""
+    rt, _, _ = _make_runtime()
+    rt._max_answer_tasks = 1
+
+    import asyncio as _asyncio
+
+    audited: list[str] = []
+    rt._audit_denied_off_loop = (  # type: ignore[method-assign]
+        lambda msg, session_id, reason, title=None: audited.append(reason)
+    )
+
+    release = _asyncio.Event()
+
+    async def _held() -> None:
+        await release.wait()
+
+    holder = _asyncio.ensure_future(_held())
+    rt._answer_tasks.add(holder)
+
+    frame = JsonRpcMessage.from_dict(
+        {
+            "jsonrpc": "2.0",
+            "id": 907,
+            "method": "session/request_permission",
+            "params": {"sessionId": "child-x", "options": []},
+        }
+    )
+
+    async def _condemn_then_release() -> None:
+        await _asyncio.sleep(0)
+        rt._dead = True  # a sibling waiter's _mark_dead lands first
+        release.set()
+
+    condemner = _asyncio.ensure_future(_condemn_then_release())
+    admitted = await rt._wait_for_answer_capacity(
+        frame,
+        request_kind="permission",
+        session_id="child-x",
+        audit_reason="answer_task_cap_runtime_dead",
+    )
+    await condemner
+
+    assert admitted is False
+    assert audited == ["answer_task_cap_runtime_dead"], "the refusal must be audited"
+
+
+@pytest.mark.asyncio
+async def test_sel_audit_tasks_do_not_count_toward_answer_cap():
+    """SEL audit tasks are short-lived thread offloads; a burst of them must
+    never satisfy the flood cap and trip a false mark_dead that kills every
+    multiplexed session."""
+    rt, _, _ = _make_runtime()
+    rt._max_answer_tasks = 2
+
+    import asyncio as _asyncio
+
+    # Simulate pending SEL audits filling the AUDIT set well past the cap.
+    for _ in range(5):
+        _t = _asyncio.ensure_future(_asyncio.sleep(30))
+        rt._audit_tasks.add(_t)
+        _t.add_done_callback(rt._audit_tasks.discard)
+
+    dead: list[str] = []
+    rt._mark_dead = lambda reason: dead.append(reason)  # type: ignore[method-assign]
+
+    answered: list[object] = []
+
+    async def _quick_answer(msg, session_id, *, reason="x"):
+        answered.append(msg.id)
+
+    rt._answer_unroutable_permission = _quick_answer  # type: ignore[method-assign]
+
+    await rt._spawn_answer_task(
+        JsonRpcMessage.from_dict(
+            {
+                "jsonrpc": "2.0",
+                "id": 700,
+                "method": "session/request_permission",
+                "params": {"sessionId": "child-x", "options": []},
+            }
+        ),
+        "child-x",
+    )
+    await _asyncio.sleep(0)
+
+    assert answered == [700]  # answered normally
+    assert dead == []  # audit backlog did NOT trip the cap
+    for _t in list(rt._audit_tasks):
+        _t.cancel()
+    await _asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_buffered_burst_with_responsive_backend_does_not_trip_cap():
+    """129+ frames can be buffered so readline() never suspends; the reader
+    must still yield between spawns so QUICK answers drain and a responsive
+    backend is not falsely marked dead by the flood cap. (The cap fires only
+    when answers genuinely cannot complete — a wedged pipe.)"""
+    rt, reader, proc = _make_runtime()
+    _register(rt, "sA")
+    rt._max_answer_tasks = 4
+    dead: list[str] = []
+    rt._mark_dead = lambda reason: dead.append(reason)  # type: ignore[method-assign]
+
+    # Buffer MORE frames than the cap before the reader runs at all.
+    for i in range(10):
+        _feed(
+            reader,
+            {
+                "jsonrpc": "2.0",
+                "id": 800 + i,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": f"child-{i}",
+                    "options": [
+                        {"optionId": "reject_once", "name": "Reject", "kind": "reject_once"}
+                    ],
+                },
+            },
+        )
+    task = await _start_reader(rt)
+    try:
+        await _drain(reader)
+        await _drain_audits(rt)
+        # Responsive backend (writes complete immediately): every request
+        # answered, cap never tripped.
+        assert dead == []
+        answered = {
+            json.loads(c.args[0].decode()).get("id")
+            for c in proc.stdin.write.call_args_list
+            if "result" in json.loads(c.args[0].decode())
+        }
+        assert {800 + i for i in range(10)} <= answered
+    finally:
+        await _drain_audits(rt)
+        await _stop_reader(task)
+
+
+def test_cross_session_toolcallid_replay_does_not_inherit_provenance():
+    """A child session reusing a PARENT's toolCallId must NOT inherit the
+    parent's trusted provenance (raw params / shell class / MCP identity) —
+    cache keys are origin-scoped, so cross-session replay misses and the
+    request stays low fidelity, while a SAME-origin repeat frame still
+    resolves."""
+    from kiro_crew.acp._dispatch import build_permission_event, parse_session_update
+    from kiro_crew.acp.types import METHOD_REQUEST_PERMISSION
+
+    shell_cache: dict[str, bool] = {}
+    raw_cache: dict[str, dict] = {}
+    input_cache: dict[str, str] = {}
+
+    # Parent's tool_call writes trusted provenance under the PARENT scope.
+    parse_session_update(
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-shared",
+            "title": "Reading README.md",
+            "kind": "read",
+            "rawInput": {"path": "README.md"},
+        },
+        tool_input_cache=input_cache,
+        shell_cache=shell_cache,
+        raw_params_cache=raw_cache,
+        cache_scope="parent-session",
+    )
+
+    def _perm(req_id):
+        return JsonRpcMessage.from_dict(
+            {
+                "id": req_id,
+                "method": METHOD_REQUEST_PERMISSION,
+                "params": {
+                    "toolCall": {"toolCallId": "tc-shared", "title": "Reading README.md"},
+                    "options": [],
+                },
+            }
+        )
+
+    # CHILD replays the same toolCallId under its own scope: provenance MISS.
+    child_ev, _ = build_permission_event(
+        _perm(1),
+        shell_cache=shell_cache,
+        raw_params_cache=raw_cache,
+        cache_scope="child-session",
+    )
+    child_ev.sub_session_id = "child-session"
+    assert child_ev.raw_params_trusted is False
+    assert child_ev.shell_classified is False
+    assert child_ev.child_low_fidelity is True  # downgrade applies
+
+    # SAME-origin permission frame (and a repeat of it) still resolves.
+    for req_id in (2, 3):
+        parent_ev, _ = build_permission_event(
+            _perm(req_id),
+            shell_cache=shell_cache,
+            raw_params_cache=raw_cache,
+            cache_scope="parent-session",
+        )
+        assert parent_ev.raw_params_trusted is True
+        assert parent_ev.shell_classified is True
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_drain_reject_does_not_wedge_handle():
+    """_turn_done is cleared before the pre-turn drain; a cancellation while
+    the drain awaits reject_tool() must restore it (the BaseException guard
+    wraps only the later send_request) — otherwise the handle reports
+    turn-active forever and every subsequent prompt() is rejected."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+
+    import asyncio as _asyncio
+
+    async def _cancelled_reject(_rid):
+        raise _asyncio.CancelledError()
+
+    handle.reject_tool = _cancelled_reject  # type: ignore[method-assign]
+    q["sA"].put_nowait(
+        JsonRpcMessage.from_dict(
+            {
+                "jsonrpc": "2.0",
+                "id": 60,
+                "method": "session/request_permission",
+                "params": {"sessionId": "child-a", "options": []},
+            }
+        )
+    )
+    gen = handle.prompt("hi", timeout=1.0)
+    with pytest.raises(_asyncio.CancelledError):
+        await gen.__anext__()
+    assert handle.is_turn_active is False  # not wedged
+    # The stranded request went back on the queue for the next drain.
+    assert not q["sA"].empty()

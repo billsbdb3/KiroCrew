@@ -2,7 +2,7 @@
  * ProjectList — the Papyrus landing view: create a paper, clone one, or open one.
  *
  * This is the view that carries the page-layout pattern (`PageHeader` +
- * `px-6 pb-8 overflow-y-auto flex-1 min-h-0` container + a `StatCard` row +
+ * `px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0` container + a `StatCard` row +
  * `Card`/`CardTitle` sections), because it is the page-shaped half of the app. The
  * editor is a full-bleed split pane by necessity — a paper and its PDF need the
  * whole viewport — and it carries its own toolbar instead.
@@ -18,6 +18,7 @@ import { papyrusApi, type Project } from './api'
 import { pruneSlots } from './lib'
 
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 
 export interface ProjectListProps {
   onOpenProject: (name: string) => void
@@ -38,6 +39,8 @@ function formatModified(epochSeconds: number): string {
 }
 
 export default function ProjectList({ onOpenProject }: ProjectListProps) {
+  // One instance covers both inputs; the binding's focus/blur reset makes sharing safe.
+  const ime = useImeGuard()
   const queryClient = useQueryClient()
   const [newName, setNewName] = useState('')
   const [cloneUrl, setCloneUrl] = useState('')
@@ -148,7 +151,7 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
         title={i18nT('apps.papyrus.page.papyrus')}
         subtitle={i18nT('apps.papyrus.page.latex_papers_with_a_live_pdf_preview')}
       />
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(150px,1fr))] mb-6">
           <StatCard
             label={i18nT('apps.papyrus.page.papers')}
@@ -253,7 +256,7 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
               placeholder={i18nT('apps.papyrus.page.new_paper_name_placeholder')}
               value={newName}
               onChange={e => setNewName(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') submitCreate() }}
+              {...ime.bindEnter({ onEnter: submitCreate })}
             />
             <SendBtn onClick={submitCreate} disabled={!newName.trim() || createMutation.isPending}>
               {createMutation.isPending
@@ -269,7 +272,7 @@ export default function ProjectList({ onOpenProject }: ProjectListProps) {
               placeholder={i18nT('apps.papyrus.page.clone_url_placeholder')}
               value={cloneUrl}
               onChange={e => setCloneUrl(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter') submitClone() }}
+              {...ime.bindEnter({ onEnter: submitClone })}
             />
             <Btn onClick={submitClone} disabled={!cloneUrl.trim() || cloneMutation.isPending}>
               {cloneMutation.isPending

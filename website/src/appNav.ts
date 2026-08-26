@@ -1,4 +1,5 @@
 import { appPageLabel } from './components/appstore/appManifest'
+import { manifestArt } from './components/appstore/useHeroArt'
 
 /**
  * Where an installed app lives in the dashboard — one definition, shared by every
@@ -13,6 +14,14 @@ import { appPageLabel } from './components/appstore/appManifest'
  * its glyph for a 16px row while the palette does not.
  */
 
+/** A UI page an app publishes in `manifest.ui.pages`. */
+export interface AppNavPage {
+  route: string
+  icon?: string
+  iconUrl?: string
+  label?: string
+}
+
 /**
  * The subset of `GET /api/apps` this module reads. Pinned locally (rather than
  * imported from a consumer) so a field this derivation depends on cannot quietly
@@ -24,12 +33,16 @@ export interface AppNavRecord {
   enabled?: boolean
   origin?: string
   orphaned?: boolean
+  /** Git URL the install recorded — the repo an external app's art resolves against. */
+  sourceUrl?: string
   manifest?: {
     iconUrl?: string
     iconUrlDark?: string
+    /** The repo a manifest declares for its own art paths, when it declares one. */
+    repo?: string
     ui?: {
       entry?: string
-      pages?: Array<{ route: string; icon?: string; iconUrl?: string; label?: string }>
+      pages?: AppNavPage[]
     }
   }
 }
@@ -65,13 +78,27 @@ export interface AppNavTarget {
 }
 
 /**
+ * The UI page a navigable app opens at, or `null` when it has none.
+ *
+ * The guard and the read are ONE expression on purpose. Asking
+ * `manifest?.ui?.pages?.length` in one place and then asserting
+ * `manifest!.ui!.pages![0]` in another is the shape that produced #3689: the
+ * assertion outlives the guard it was written against. Returning the page makes
+ * "navigable" and "here is the page" the same answer, so they cannot disagree.
+ */
+function firstUiPage(app: AppNavRecord): AppNavPage | null {
+  const pages = app.manifest?.ui?.pages
+  return pages && pages.length > 0 ? pages[0] : null
+}
+
+/**
  * Whether *app* contributes a dashboard destination at all.
  *
  * Disabled apps and apps with no UI page have nowhere to go, so no surface should
  * offer to open them.
  */
 export function isAppNavigable(app: AppNavRecord): boolean {
-  return !!app.enabled && (app.manifest?.ui?.pages?.length ?? 0) > 0
+  return !!app.enabled && !!firstUiPage(app)
 }
 
 /**
@@ -87,13 +114,12 @@ export function isAppNavigable(app: AppNavRecord): boolean {
  *     registered at the page's own route.
  */
 export function appNavTarget(app: AppNavRecord): AppNavTarget | null {
-  // `!page` re-narrows what `isAppNavigable` already guarantees, so the
-  // destination read can never drift from the eligibility check.
-  const page = app.manifest?.ui?.pages?.[0]
-  if (!isAppNavigable(app) || !page) return null
+  const page = app.enabled ? firstUiPage(app) : null
+  if (!page) return null
   const isBuiltin = app.origin === 'builtin'
   const orphaned = !!app.orphaned
   const appHostRouted = !isBuiltin || !!app.manifest?.ui?.entry
+  const artRepo = app.manifest?.repo || app.sourceUrl || ''
   const route = orphaned
     ? `/apps/migrate/${app.name}`
     : appHostRouted
@@ -103,11 +129,17 @@ export function appNavTarget(app: AppNavRecord): AppNavTarget | null {
     name: app.name,
     route,
     id: appHostRouted ? `app-${app.name}` : app.name,
-    label: appPageLabel(app.name, page.label, app.displayName),
+    label: appPageLabel(app.name, page.label, app.displayName, app.origin),
     orphaned,
     builtin: isBuiltin,
-    iconUrl: app.manifest?.iconUrl || '',
-    iconUrlDark: app.manifest?.iconUrlDark || '',
+    // Routed through the shared resolver rather than taken raw: an installed
+    // `app.json` is untrusted content, and both consumers of this target (the
+    // left rail and the command palette) render for EVERY enabled app on every
+    // dashboard load — so a manifest naming an external host would leak the
+    // viewer to it without them opening anything. A built-in's absolute
+    // `/app-assets/…` still passes through unchanged.
+    iconUrl: manifestArt(app.manifest?.iconUrl, artRepo),
+    iconUrlDark: manifestArt(app.manifest?.iconUrlDark, artRepo),
     iconName: page.icon || '',
     pageIconUrl: page.iconUrl || '',
   }

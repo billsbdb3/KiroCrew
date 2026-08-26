@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from unittest.mock import AsyncMock, MagicMock
 
@@ -10,6 +11,13 @@ from aiohttp import web
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import ConversationLog
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+#: Draining is a LOOP because a drained task may register another -- not because any
+#: current one does (``chat_slack`` has a single ``create_task``, and the backfill
+#: posts sequentially). Bounded rather than `while` so a task that re-arms itself
+#: forever fails the test instead of hanging until the 120s pytest timeout, whose
+#: report names the timeout and not the task.
+_DRAIN_ROUNDS = 20
 
 
 def move_transcript_past(log: ConversationLog, key: str, sig: float) -> None:
@@ -25,6 +33,46 @@ def move_transcript_past(log: ConversationLog, key: str, sig: float) -> None:
     """
     path = log._path(key)
     os.utime(path, (sig + 1, sig + 1))
+
+
+async def drain_background_tasks(state) -> None:
+    """Await every task *state* spawned, so an assertion cannot race one.
+
+    Handlers that must answer the request before their work finishes hand it to
+    ``asyncio.create_task`` and register it in ``state._background_tasks`` — the
+    Slack link-time backfill (``_spawn_slack_backfill``) is the one this exists for.
+    The response arriving therefore proves only that the task was CREATED, so reading
+    the Slack mock straight afterwards races it: it usually wins on an idle machine and
+    loses under load. That flake surfaces as a plain count mismatch (``assert 0 == 2``)
+    or as ``'NoneType' object has no attribute 'args'``, on a DIFFERENT test in the
+    class each run, and names neither the task nor the race (#4130).
+
+    Awaiting the not-yet-done members is an exact wait on the real completion
+    condition rather than a sleep. An empty set means the task already finished; a
+    done-callback discards each task, so the set is snapshotted before awaiting.
+
+    Never a ``sleep``: a sleep long enough to be reliable on the slowest runner is
+    paid by every run, and it is still only a guess.
+
+    Exceptions are re-raised, so a task that died silently fails its own test
+    instead of surfacing later as an unretrieved-exception warning.
+
+    Scope: this awaits EVERY task in ``state._background_tasks``, which several other
+    handlers also register (``handlers/sessions.py``, ``taskrunner.py``,
+    ``handlers/mcp.py``). That is right for a state a test built and will discard, and
+    wrong for one carrying a long-lived task -- a subscription or a poller would never
+    complete and the wait would run to the pytest timeout. Drain a specific task
+    directly in that case.
+    """
+    for _ in range(_DRAIN_ROUNDS):
+        pending = [t for t in list(getattr(state, "_background_tasks", ())) if not t.done()]
+        if not pending:
+            return
+        await asyncio.gather(*pending)
+    raise AssertionError(
+        f"background tasks still pending after {_DRAIN_ROUNDS} drain rounds: "
+        f"{sorted(t.get_name() for t in state._background_tasks if not t.done())}"
+    )
 
 
 class _ReadyKiroPrerequisiteService(KiroPrerequisiteService):
@@ -75,6 +123,30 @@ def _make_state(tmp_path, **kwargs):
     sessions.set_slack_link = MagicMock(side_effect=_set_slack_link)
     sessions.get_slack_link = MagicMock(side_effect=_get_slack_link)
     sessions.clear_slack_link = MagicMock(side_effect=_clear_slack_link)
+
+    # Real in-memory mirror-link store, for the same reason as the Slack one and
+    # with a sharper failure mode: callers branch on whether a mirror is PRESENT,
+    # and a bare MagicMock is unconditionally truthy, so every session reads as
+    # mirrored to a channel. A guard that refuses mirrored sessions then refuses
+    # ALL of them, which looks like a broken guard rather than a missing double.
+    # Parity with SessionStore: absent -> None.
+    _mirror_links: dict[str, tuple[str, str]] = {}
+
+    def _set_mirror_link(key, channel_id, thread_ts):
+        if channel_id or thread_ts:
+            _mirror_links[key] = (channel_id, thread_ts)
+        else:
+            _mirror_links.pop(key, None)
+
+    def _get_mirror_link(key):
+        return _mirror_links.get(key)
+
+    def _clear_mirror_link(key):
+        return _mirror_links.pop(key, None) is not None
+
+    sessions.set_mirror_link = MagicMock(side_effect=_set_mirror_link)
+    sessions.get_mirror_link = MagicMock(side_effect=_get_mirror_link)
+    sessions.clear_mirror_link = MagicMock(side_effect=_clear_mirror_link)
     state = DashboardState(
         sessions=sessions,
         crons=MagicMock(list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})),
@@ -108,7 +180,21 @@ def _make_app(state: DashboardState) -> web.Application:
         api_chat_slots_cleanup,
     )
 
-    app = web.Application()
+    @web.middleware
+    async def _test_auth_middleware(request: web.Request, handler):
+        """Simulate token_auth_middleware for tests: dashboard owner claims.
+
+        Only sets defaults if not already populated by a test-specific
+        middleware inserted earlier (e.g. app-isolation tests that inject
+        a specific app identity).
+        """
+        if "app" not in request:
+            request["app"] = ""  # dashboard user, not an app
+        if "user" not in request:
+            request["user"] = "local-app"  # recognized as owner
+        return await handler(request)
+
+    app = web.Application(middlewares=[_test_auth_middleware])
     app["state"] = state
     app.router.add_post("/api/chat", api_chat)
     app.router.add_get("/api/chat/slots", api_chat_slots)
@@ -137,6 +223,7 @@ def _make_app_with_agent_routes(state: DashboardState) -> web.Application:
         api_chat_slot_create,
         api_chat_slot_delete,
         api_chat_slot_detail,
+        api_chat_slot_reload,
         api_chat_slot_rename,
         api_chat_slot_resume,
         api_chat_slot_workspace,
@@ -151,6 +238,7 @@ def _make_app_with_agent_routes(state: DashboardState) -> web.Application:
     app.router.add_post("/api/chat/slots/{slot}/approve", api_chat_slot_approve)
     app.router.add_post("/api/chat/slots/{slot}/agent", api_chat_slot_agent)
     app.router.add_post("/api/chat/slots/{slot}/workspace", api_chat_slot_workspace)
+    app.router.add_post("/api/chat/slots/{slot}/reload", api_chat_slot_reload)
     app.router.add_delete("/api/chat/slots/{slot}", api_chat_slot_delete)
     app.router.add_post("/api/chat/slots/{slot}/resume", api_chat_slot_resume)
     app.router.add_patch("/api/chat/slots/{slot}/title", api_chat_slot_rename)

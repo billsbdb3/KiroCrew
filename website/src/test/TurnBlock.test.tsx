@@ -252,6 +252,65 @@ describe('TurnBlock — MCP App-bearing tool calls stay visible', () => {
 })
 
 /**
+ * An edit-tool row whose persisted meta carries a unified diff promotes an
+ * inline diff presentation (ToolCallLine renders a card or summary chip), so
+ * like a workflow_run launch it stays out of BOTH folds — it is the primary
+ * display of the file change now that the model no longer restates tool
+ * edits as ```diff blocks. Density relief is per-card (ToolCallLine's
+ * fold control in the card header), not a mode of this component.
+ */
+describe('TurnBlock — diff-card tool rows', () => {
+  const DIFF = '--- /a/b.py\n+++ /a/b.py\n@@ -1,2 +1,2 @@\n import os\n-x = 1\n+x = 2'
+  const items: TurnItem[] = [
+    { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read_me', ts: '1', meta: { tool_call_id: 'tc-plain' } }, idx: 0 },
+    { kind: 'single', msg: { role: 'tool', content: '🔧 fs_write', ts: '2', meta: { tool_call_id: 'tc-edit', kind: 'edit', input: DIFF } }, idx: 1 },
+    { kind: 'single', msg: { role: 'assistant', content: 'Edited the file with plenty of descriptive text to be substantive here.', ts: '3' }, idx: 2 },
+  ]
+
+  const renderDiffTurn = (collapseAll: boolean) =>
+    render(
+      <TurnBlock
+        turn={makeTurn(items)}
+        collapseAll={collapseAll}
+        renderItem={(it) => (
+          <div data-testid={`item-${it.kind === 'single' ? `${it.msg.role}-${(it.msg.meta?.tool_call_id as string) ?? 'x'}` : 'group'}`} />
+        )}
+      />,
+    )
+
+  it('default mode: the diff-card row renders outside the collapsed tool group', () => {
+    renderDiffTurn(false)
+    expect(screen.getByTestId('item-tool-tc-edit')).toBeInTheDocument()
+    expect(screen.queryByTestId('item-tool-tc-plain')).not.toBeInTheDocument()
+  })
+
+  it('collapseAll mode: the diff row stays visible-inline', () => {
+    renderDiffTurn(true)
+    // The plain read folds ("Worked through 1 step"), the edit row does not.
+    expect(screen.getByText('Worked through 1 step')).toBeInTheDocument()
+    expect(screen.getByTestId('item-tool-tc-edit')).toBeInTheDocument()
+    expect(screen.getByTestId('item-assistant-x')).toBeInTheDocument()
+  })
+
+  it('an execute-kind row with diff-shaped input still collapses (kind gate)', () => {
+    const shellItems: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 shell', ts: '1', meta: { tool_call_id: 'tc-sh', kind: 'execute', input: DIFF } }, idx: 0 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 shell 2', ts: '2', meta: { tool_call_id: 'tc-sh2', kind: 'execute', input: 'ls' } }, idx: 1 },
+      { kind: 'single', msg: { role: 'assistant', content: 'Ran the commands with plenty of descriptive output text here.', ts: '3' }, idx: 2 },
+    ]
+    render(
+      <TurnBlock
+        turn={makeTurn(shellItems)}
+        renderItem={(it) => (
+          <div data-testid={`item-${it.kind === 'single' ? `${it.msg.role}-${(it.msg.meta?.tool_call_id as string) ?? 'x'}` : 'group'}`} />
+        )}
+      />,
+    )
+    expect(screen.queryByTestId('item-tool-tc-sh')).not.toBeInTheDocument()
+  })
+})
+
+/**
  * A turn can hand back to the user and then RESUME in the same turn — after a
  * denied tool call, an auto-nudge / monitor cycle, a queued message, or an
  * injected subagent / workflow completion. The [OPTIONS:] follow-up marker is
@@ -369,5 +428,137 @@ describe('TurnBlock — mid-turn hand-back ([OPTIONS:]) visibility', () => {
     // inline and must NOT inflate the count to 3.
     expect(screen.getByRole('button', { name: /Worked through 2 steps/ })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Worked through 3 steps/ })).not.toBeInTheDocument()
+  })
+})
+
+/**
+ * chatSlice opens one `thinking` message per reasoning burst (one above each
+ * tool step it explains, #4178). A long agentic turn therefore settles into a
+ * WALL of collapsed "Thought process" rows once the interleaved tool calls
+ * fold away. TurnBlock now folds every content-bearing burst of a turn into a
+ * SINGLE reasoning row, anchored at the first burst's position, so the turn
+ * carries one block (render-only; the store keeps the per-burst messages).
+ */
+describe('TurnBlock — reasoning bursts fold into one thinking row', () => {
+  const think = (idx: number, content: string, clientTs: string): TurnItem => ({
+    kind: 'single',
+    msg: { role: 'thinking', content, cls: '', meta: { clientTs }, ts: `${idx}` },
+    idx,
+  })
+
+  const revealThinking = (it: TurnItem, i: number) => (
+    <div
+      data-testid={`item-${i}`}
+      data-role={it.kind === 'single' ? it.msg.role : 'group'}
+    >
+      {it.kind === 'single' ? it.msg.content : 'group'}
+    </div>
+  )
+
+  it('merges every burst of a turn into one row with concatenated content', () => {
+    const items: TurnItem[] = [
+      think(0, 'first burst', 'a'),
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read', ts: '1' }, idx: 1 },
+      think(2, 'second burst', 'b'),
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: shell', ts: '3' }, idx: 3 },
+      think(4, 'third burst', 'c'),
+      { kind: 'single', msg: { role: 'assistant', content: 'Final answer.', ts: '5' }, idx: 5 },
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items)} renderItem={revealThinking} />)
+    // Exactly ONE thinking row, not three.
+    const thinkingRows = container.querySelectorAll('[data-role="thinking"]')
+    expect(thinkingRows.length).toBe(1)
+    // …carrying every burst's text in order.
+    const text = thinkingRows[0].textContent || ''
+    expect(text).toContain('first burst')
+    expect(text).toContain('second burst')
+    expect(text).toContain('third burst')
+    // The conclusion is still visible.
+    expect(screen.getByText('Final answer.')).toBeInTheDocument()
+  })
+
+  it('a single-burst turn is left untouched (no synthetic row)', () => {
+    const items: TurnItem[] = [
+      think(0, 'only burst', 'a'),
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read', ts: '1' }, idx: 1 },
+      { kind: 'single', msg: { role: 'assistant', content: 'Answer.', ts: '2' }, idx: 2 },
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items)} renderItem={revealThinking} />)
+    const thinkingRows = container.querySelectorAll('[data-role="thinking"]')
+    expect(thinkingRows.length).toBe(1)
+    expect(thinkingRows[0].textContent).toBe('only burst')
+  })
+
+  it('folds while the turn is still running (live per-burst wall is prevented)', () => {
+    // An incomplete turn takes TurnBlock's inline early-return path; the merge
+    // must apply there too so a running turn shows ONE growing reasoning line.
+    const items: TurnItem[] = [
+      think(0, 'burst one', 'a'),
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read', ts: '1' }, idx: 1 },
+      think(2, 'burst two', 'b'),
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items, false)} renderItem={revealThinking} />)
+    const thinkingRows = container.querySelectorAll('[data-role="thinking"]')
+    expect(thinkingRows.length).toBe(1)
+    expect(thinkingRows[0].textContent).toContain('burst one')
+    expect(thinkingRows[0].textContent).toContain('burst two')
+  })
+
+  it('skips empty placeholder thinking rows when choosing the merge anchor', () => {
+    // An empty "Thinking…" placeholder must not become the merged row (it would
+    // render nothing); the first CONTENT-bearing burst anchors the block.
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'thinking', content: '', cls: '', meta: { clientTs: 'p' }, ts: '0' }, idx: 0 },
+      think(1, 'real burst one', 'a'),
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read', ts: '2' }, idx: 2 },
+      think(3, 'real burst two', 'b'),
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items, false)} renderItem={revealThinking} />)
+    const withText = Array.from(container.querySelectorAll('[data-role="thinking"]'))
+      .filter(el => (el.textContent || '').trim().length > 0)
+    expect(withText.length).toBe(1)
+    expect(withText[0].textContent).toContain('real burst one')
+    expect(withText[0].textContent).toContain('real burst two')
+  })
+
+  it('hoists the folded reasoning to the turn TOP when bursts arrive at the tail (post-chat_done refresh)', () => {
+    // On the chat_done refresh, mergePreservedThinking can park bursts that lack
+    // a distinct following-tool anchor at the tail, below the answer (#4218
+    // residual). The fold must render the merged reasoning ABOVE the answer
+    // regardless of where the refresh left the bursts.
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: shell', ts: '2' }, idx: 1 },
+      { kind: 'single', msg: { role: 'assistant', content: 'Conclusion first, reasoning was piled below it.', ts: '3' }, idx: 2 },
+      think(3, 'tail burst one', 'a'),
+      think(4, 'tail burst two', 'b'),
+      think(5, 'tail burst three', 'c'),
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items)} renderItem={revealThinking} />)
+    // One merged reasoning row carrying every burst…
+    const thinkingRows = container.querySelectorAll('[data-role="thinking"]')
+    expect(thinkingRows.length).toBe(1)
+    const text = thinkingRows[0].textContent || ''
+    expect(text).toContain('tail burst one')
+    expect(text).toContain('tail burst two')
+    expect(text).toContain('tail burst three')
+    // …rendered ABOVE the answer, not below it.
+    const roled = Array.from(container.querySelectorAll('[data-role="thinking"], [data-role="assistant"]'))
+    expect(roled[0].getAttribute('data-role')).toBe('thinking')
+    expect(roled[roled.length - 1].getAttribute('data-role')).toBe('assistant')
+  })
+
+  it('hoists a SINGLE tail burst to the top too (single-burst reload)', () => {
+    const items: TurnItem[] = [
+      { kind: 'single', msg: { role: 'tool', content: '🔧 Running: read', ts: '1' }, idx: 0 },
+      { kind: 'single', msg: { role: 'assistant', content: 'The answer, with the lone reasoning burst stranded below it.', ts: '2' }, idx: 1 },
+      think(2, 'stranded burst', 'a'),
+    ]
+    const { container } = render(<TurnBlock turn={makeTurn(items)} renderItem={revealThinking} />)
+    const thinkingRows = container.querySelectorAll('[data-role="thinking"]')
+    expect(thinkingRows.length).toBe(1)
+    expect(thinkingRows[0].textContent).toBe('stranded burst')
+    const roled = Array.from(container.querySelectorAll('[data-role="thinking"], [data-role="assistant"]'))
+    expect(roled[0].getAttribute('data-role')).toBe('thinking')
   })
 })

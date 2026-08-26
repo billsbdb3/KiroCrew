@@ -22,18 +22,25 @@ export function clampTintCount(n: unknown): number {
 }
 
 /**
- * Rank the up-to-`count` most-recently-active sessions by `last_ts` (descending),
- * returning a key→rank map where 1 = most recent. `last_ts` is an ISO-8601 UTC string
- * (the last message of any role); sessions with a missing/unparseable `last_ts` are
- * excluded so an empty session never occupies a tint slot.
+ * Rank the up-to-`count` most-recently-active sessions by settled activity
+ * (descending), returning a key→rank map where 1 = most recent. Reads
+ * `last_turn_ts` — the same key the sidebar SORTS by — so the tinted rows are the
+ * top rows; ranking by `last_ts` instead would repaint the stripe on every
+ * streamed tool call and highlight a session sitting further down the list.
+ * Falls back to `last_ts` for a payload without the settled field.
+ *
+ * The ladder stops one rung SHORT of `slotActivityTs`, which continues on to
+ * `created`: a session that has never run must not occupy a tint slot, so an
+ * unparseable or absent instant is excluded here rather than resolved to its
+ * creation time.
  */
 export function computeRecentRank(
-  slots: { key: string; last_ts?: string }[],
+  slots: { key: string; last_turn_ts?: string; last_ts?: string }[],
   count: number,
 ): Map<string, number> {
   const ranked = new Map<string, number>()
   slots
-    .map(s => [s.key, Date.parse(s.last_ts || '') || 0] as [string, number])
+    .map(s => [s.key, Date.parse(s.last_turn_ts || s.last_ts || '') || 0] as [string, number])
     .filter(([, t]) => t > 0)
     .sort((a, b) => b[1] - a[1])
     .slice(0, count)

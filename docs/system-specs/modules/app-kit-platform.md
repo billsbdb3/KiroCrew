@@ -76,6 +76,17 @@ zero-width rendering of our name does not silently lose it. Folding WIDENS the
 match, which is safe only because the `_registry` short-circuit runs first:
 the author is consulted exclusively for rows whose index we ship or sign.
 
+`origin` on a registry row is stamped under the same rule. The install-status
+enrichment matches installed apps by NAME alone, so it withholds the `origin`
+copy from external rows (`_is_external_row`): an external index publishing an
+app named after an installed built-in must not inherit `origin: "builtin"`
+beside the `provenance: "external"` stamped on the same row.
+`_apply_trust_fields` additionally scrubs any `origin` other than the
+server-stamped `"external"` (a `detectInstalled` hit) from `_registry` rows,
+because an index-published `origin` key survives a failed manifest fetch —
+`_resolve_manifest` returns the row unprojected on that path — and would
+otherwise reach the wire.
+
 `"official"` means "an app WE list". The bundled `app-registry.json` is one
 delivery of that list — the offline seed shipped inside the wheel — so it
 carries the same value a signed remote catalog will, not a second one. Two
@@ -342,6 +353,64 @@ skills/crons/MCP registration overwrite in place.
 
 Writer: `apps/bridges.py::reconcile_enabled_app_resources`.
 
+### 7.1 A hung startup lifecycle hook is bounded at the dispatch boundary
+
+`LifecycleDispatcher` invokes startup hooks **serially** in lexicographic app-name
+order, so one hook that never returns would stall the whole loop and keep the
+gateway from ever reaching readiness. An awaited startup coroutine is therefore
+bounded by a per-hook deadline (`lifecycle._HOOK_TIMEOUT_SEC`, 30s). The task
+is registered in the dispatcher-owned map keyed by app immediately when it is
+created, before the dispatcher first awaits it, so parent cancellation cannot
+orphan live work during the pre-deadline window. A completion observer retrieves
+its result and removes proven-terminal ownership. On deadline expiry the same
+owned task remains tracked while startup continues; the dispatcher does not wait
+indefinitely for it to settle and does not cancel it. Cancelling an asyncio task
+awaiting `asyncio.to_thread` makes the wrapper terminal while its worker thread
+still executes app code, so any observed child cancellation records a
+process-lifetime residual marker before releasing the task reference. The timeout
+is treated as a hook failure (the app is marked degraded and the event is
+SEL-recorded with `outcome="timeout"`), and startup **continues with the remaining
+apps**. The deadline is a safety net against a hang, not a performance budget,
+which is why it is generous.
+
+The per-app ownership is also a teardown contract. Dashboard disable, local or
+registry install, update, uninstall, and registry replacement perform a bounded
+ownership preflight and return a retryable refusal without mutating app state when
+retained startup execution cannot be proven stopped. Trust withdrawal also remains
+bounded, but if the hook continues executing, teardown fails and revocation leaves
+the trust grant in place for a retry rather than claiming the app stopped while its
+code remains live. In that failure case an app-declared `on_shutdown` is skipped:
+it is unbounded third-party code and must not overlap the still-running startup
+hook against partially initialized state.
+
+Normal recovery is to retry after retained startup execution exits. If a startup
+hook is permanently wedged, the operator must **stop the gateway completely**,
+run `kirocrew app disable <name>` while no gateway process can execute app code,
+and then restart the gateway. The CLI command only writes `enabled=false` to
+installed-app metadata; it is not runtime teardown and must not be run against a
+live gateway as evidence that old app code stopped. The disabled app is skipped
+on the next startup, allowing the operator to repair or remove it without
+re-entering the wedged hook.
+
+Graceful gateway shutdown sweeps retained startup ownership for **every enabled
+app**, including apps with no `on_shutdown` declaration. All ownership checks
+start concurrently and are non-blocking: ownership that is already terminal
+permits that app's shutdown hook, while active or residual startup work skips only
+the affected hook fail-closed. The sweep consumes none of the gateway's remaining
+10-second cooperative shutdown window, preserving time for unaffected app hooks
+after the existing bounded slot-history save; the service manager's separate
+10-second signal margin is not hook-execution time. An app's `on_shutdown` is
+invoked in reverse lexicographic order only after that app's startup ownership
+settled; otherwise the hook is skipped rather than running concurrently against
+partially initialized state. Once an `on_shutdown` hook is invoked, it is
+intentionally not detached at the deadline: the task still owns its `AppContext`
+capabilities, so teardown awaits it to completion. The startup deadline governs
+**async hooks only**: a synchronous hook returns before the
+`asyncio.iscoroutine` check and runs to completion outside the timeout; a
+successful async startup hook that returns within the deadline is unaffected.
+
+Writer: `apps/lifecycle.py::LifecycleDispatcher._invoke`.
+
 ## 8. An app's EventBus only exists with a real broadcast function
 
 `build_app_context` returns `events=None` when `broadcast_fn` is None, and
@@ -455,13 +524,57 @@ Writers: `apps/dependency_ledger.py`, `apps/dependencies.py`;
 ## 12. Store visibility is a manifest flag, not a code removal
 
 Built-in apps ship default-DISABLED. `manager._DEFAULT_ON_BUILTINS` is the single
-source of truth for the exemption (currently only `projects`, the Task Runner),
+source of truth for the exemption (`projects`, the Task Runner, and `command-bar`,
+which replaces the quick-search gesture rather than adding a sidebar entry),
 read by the policy tests over both the hardcoded list and the file-based
 manifests, so a builtin cannot become default-on through one registration path
 while the other path's test still forbids it. A default-enabled builtin is
 persisted at first registration and never routes through `enable_app`, so the
 governance `apps` activation allowlist is re-applied at that write: a
 governance-denied app registers disabled.
+
+`defaultEnabled` is read on FIRST registration only — every later start preserves
+the user's own state — so ADDING a name to the exemption reaches new installs
+alone. An install that registered the app while it was still default-off keeps
+`enabled: false` through every restart, update and version bump, because the
+record lives in the user's data home and a code update does not touch it. For a
+builtin that replaces a host surface that is terminal rather than inconvenient:
+it has no page, so it is absent from the launcher's own app list, and it is
+absent from Discover unless the published catalog carries a row, which leaves a
+disabled row in Library as the only trace of an app the user never heard of.
+
+`manager.backfill_default_on_builtins()` closes that gap, invoked from
+`agent.run_first_run_setup()`. It reads a SECOND set, `_DEFAULT_ON_BACKFILL`, and
+the separation is load-bearing rather than bookkeeping: `_DEFAULT_ON_BUILTINS`
+answers "what does a fresh install enable", while this one answers "which
+promotion has not yet reached installs that predate it". Reading the first for the
+second question reverses deliberate opt-outs — `projects` has shipped
+`defaultEnabled: true` since it was aligned with the other builtins, long before
+the allowlist existed, so it has been enabled and visible in the sidebar on every
+existing install and a disabled record for it is a user who found it and turned it
+off. A name qualifies only when a fresh install enables it AND existing installs
+were never in a position to choose; a ratchet test pins both halves.
+
+The backfill is ONE-SHOT, and the record of that is
+`InstalledApp.defaultOnBackfilled`, written in the SAME atomic record write that
+flips `enabled`. One document deliberately: a separate marker file has no correct
+ordering, because whichever of the two writes goes first leaves a window the other
+one owns — marker-last loses the record of an enable that happened, so every later
+start re-applies the promotion and reverses the user's own disable forever;
+marker-first can outlive a flip that failed, so the app is skipped forever and the
+promotion is never delivered. Both are real failures; neither is reachable when the
+flag and the state it guards land or fail together. A record created under the
+promoted default is born `True`, because a first registration with `defaultEnabled`
+IS the promotion being received — without that, "install, disable the app in the
+same session, restart" would re-enable it, and no write ordering can fix that since
+on a fresh install the record may not exist yet when first-run setup runs.
+Disabling the app must survive, since it is the only thing that gives a replaced
+host surface back. Both the `_builtin_owns_install` boundary (a user's own install
+under the same name is never touched) and the governance activation gate are
+re-applied, and a governance-denied app is deliberately left unflagged so the
+promotion is still delivered if policy later permits. The activation is recorded in
+the SEL, because it moves an app from inactive to active with no user request
+behind it.
 
 `hidden: true` on a builtin manifest removes it from the Discover catalog while
 leaving its code and routes fully intact. It stays installable and enablable by
@@ -485,7 +598,8 @@ deterministic order (hero art, then verified publishers, then name), so the
 surface is never empty and never arbitrary.
 
 Writers: `apps/manager.py` (`_BUILTIN_APPS`, `_DEFAULT_ON_BUILTINS`,
-`register_builtin_apps`), `apps/discovery.py::discover_builtin_apps`,
+`_DEFAULT_ON_BACKFILL`, `register_builtin_apps`, `backfill_default_on_builtins`),
+`agent.py::run_first_run_setup`, `apps/discovery.py::discover_builtin_apps`,
 `apps/registry.py::_apply_trust_fields`;
 consumers: `website/src/pages/AppsPage.tsx` (`pickFeatured`),
 `website/src/components/appstore/types.ts` (`isVerified`, `sourceLabel`).
@@ -638,3 +752,238 @@ resolution), `dashboard/state.py` (`_send_ws_all`, `_ws_client_allowed`,
 for developer-facing diagnostics, drift-guarded by
 `website/src/test/appSdkEventScope.test.ts`). Runtime-facing summary for app
 authors: [../../../src/kiro_crew/docs/app-platform-trust-model.md](../../../src/kiro_crew/docs/app-platform-trust-model.md).
+
+## 14. The published catalog is the store's inventory
+
+`GET /api/apps/registry` answers from the published catalog when it is reachable:
+`handle_registry` prefers `list_catalog_apps` (`registry.py`), which maps the
+published `official-registry.json` entries through
+`official_catalog.list_catalog_rows` and then applies the same install-status and
+trust stamping as the seed path. The bundled `app-registry.json` seed is the
+catalog's OFFLINE SNAPSHOT, not a peer source: a reachable catalog means the
+store renders the published document's list, display copy, AND installable
+inventory; an unreachable one degrades the listing to the seed.
+
+User-configured external registries (`config.registries`) are a separate,
+always-present source: both `list_registry` and `list_catalog_apps` merge them
+through one shared site, `_append_external_registry_apps`, so the online and
+offline paths enrich, probe (`detectInstalled`), and trust-stamp external rows
+identically and cannot drift. A catalog/seed/builtin row wins a `name`
+collision; the catalog path reserves every catalog name (snapshotted before the
+`git`-installability filter) plus every seed name, so an external row can only
+ADD a name no catalog or seed row claims and can never shadow a name install
+resolves by. External rows keep their `provenance: "external"`/`verified: false`
+stamp.
+
+The catalog is trusted only as far as TLS, so its power is bounded by
+pin-or-refuse rather than by withholding coordinates.
+`official_catalog.inventory()` materialises each `git`-source entry as an
+installable row carrying `gitUrl`/`repo`/`commit` (`builtin` entries produce
+nothing); a row that fails coordinate validation (https-only URL, 40/64-hex
+`ref`, contained relative `subdir`, kebab-case name, no duplicates) is dropped,
+never repaired. What keeps a compromised document from pointing an install at
+attacker-selected code with owner credentials is the posture stack, each layer
+independently load-bearing:
+
+- **Pin or refuse.** A catalog row installs by `_git_fetch_commit` — fetch the
+  pinned SHA, assert the landed commit equals the pin, hard-fail otherwise. The
+  row carries no `branch`, so no code path can quietly clone a tip and succeed.
+- **Credential-free clone posture.** Catalog rows clone anonymously
+  (`anonymous_git_env`); they never inherit the owner-designated credential
+  carve-out.
+- **No provenance minting.** `inventory()` rows never carry `origin`,
+  `author`, or `_registry`; `verified` stays `false` for a catalog `git` app
+  until the catalog signature is checked — wiring signature verification into
+  `official_catalog` is what flips that, not a field the catalog can assert
+  about itself.
+- **Install coordinates never come from a cache.** `inventory_for_install` and
+  `list_registry`'s inventory both resolve through `fetch_inventory_entries`, a
+  fresh HTTPS fetch; the on-disk cache may enrich display fields of a row that
+  exists from another source but may never introduce or rewrite one
+  (`annotate` skips `_catalog` rows).
+- **Refuse, don't fall back.** A catalog fetch failure refuses installs,
+  updates, and execution grants for catalog-listed names rather than falling
+  back to the unpinned seed or an agent-writable external cache —
+  `_resolve_registry_row` distinguishes "the document does not name this app"
+  (seed may answer) from "the document could not be asked" (refuse).
+- **Supersession is URL-scoped.** A catalog row replaces a same-repo seed row
+  (scheme/host case-folded, path case preserved); a different-repo name
+  collision keeps the seed, so a republished document cannot silently re-home
+  an app to a new repository under a familiar name.
+
+A name is a filesystem path on install, so `inventory()` and
+`list_catalog_rows` drop any entry whose name fails the manifest name contract
+(`app_name_error` / `KEBAB_RE`), and the catalog fetch runs off the event loop
+(`asyncio.to_thread`) so a cache-expired request never blocks the gateway loop.
+
+Writers: `apps/official_catalog.py` (`list_catalog_rows`, `inventory`,
+`fetch_inventory_entries`, `inventory_for_install`), `apps/registry.py`
+(`list_catalog_apps`, `_resolve_registry_row`, `_git_fetch_commit`,
+`_append_external_registry_apps`, `_detect_installed_probe`),
+`apps/routes.py` (`handle_registry`).
+
+## 15. A registry's credential posture follows its index's change control
+
+The published catalog serves one deployment's inventory over TLS from a fixed
+URL. An organisation that publishes its OWN catalog uses the external-registry
+path instead: `config.registries` (plus whatever the edition pins via
+`AppsLoader.default_registries()`) names repos whose index this client fetches at
+runtime, so adding an app is a change to that repo rather than a client release.
+
+`_effective_registries()` is the ONE list every consumer reads — index
+fetch/refresh, the trusted-host allowlist, row lookup, install, and the
+blob-proxy allowlist. That is deliberate rather than incidental: a registry
+visible to the listing but not to install would surface apps the install path
+then refuses, which is worse than not listing them.
+
+Whether a registry's apps clone with this machine's git identity is decided by
+`ExternalRegistryConfig.trust`, and the reasoning is about **who controls the
+index**, not which host it lives on:
+
+- **`index` (the default)** — the index is untrusted content. The
+  confused-deputy case is concrete: host trust is host-granular, so an index on
+  a trusted forge can list an app whose `repo` is a *private sibling repo* on
+  that same forge, and the manifest and blob-proxy paths clone automatically on
+  browse. Such clones therefore run credential-free (`anonymous_git_env` +
+  `strict` sandbox), so a private sibling simply fails to clone.
+- **`owner`** — the operator asserts the index itself is under change control
+  they own (a review-gated repo on a protected branch). That retracts the
+  premise the defense rests on, deliberately and per registry, which is what
+  makes an organisation-wide registry usable at all: its apps live in many
+  repos, none equal to the index URL, so the byte-identical same-repo carve-out
+  alone leaves every one of them unclonable on a forge that needs auth.
+
+**The tier is not readable from a cached row, and that is the whole difficulty.**
+By the time a credential decision is made, the row was read from
+`_read_external_registry_cache` — the same agent-writable file
+`_resolve_registry_row` refuses to resolve an install from. Honouring the tier
+there would relocate the confused-deputy read from the index to its cache:
+anything able to write `_registry_<name>.json` could name a private repo on the
+operator's own forge and have it cloned with the gateway's identity. So the
+escalation is split across two predicates with different reach:
+
+- `_is_owner_designated_repo` — the pre-existing byte-identical same-repo
+  ground, and the ONLY escalation the **automatic** browse/refresh paths get. It
+  compares against a URL the operator typed, so a poisoned cache row cannot
+  widen it. `anonymous_git_env`'s contract — automatic clones stay
+  credential-free because no per-repo owner action gates them — therefore still
+  holds unchanged.
+- `_owner_tier_confirmed` — **install only**, and honours the tier only after a
+  FRESH fetch of that registry's index confirms an entry whose clone URL is
+  byte-identical to the row's. Same rule as the official catalog, whose install
+  coordinates likewise never come from a cache.
+
+Four properties keep the tier from becoming a hole, and none is optional:
+
+- **It cannot widen the reachable host set.** Every clone still passes
+  `is_clone_host_trusted` first. The tier only decides whether credentials are
+  offered to a host that gate already allows.
+- **It is never index-supplied.** `_registry_trust_tier` reads the
+  build-pinned registry row. A `trust` key on an index ENTRY
+  is ignored — otherwise a hostile index would grant itself credentials. The
+  freshly fetched index is authority for the URL only, never for the tier.
+- **It fails closed.** An unrecognised value reads as `index`; so does an
+  unknown registry name and any lookup failure. An unreachable or unparseable
+  fresh index refuses the escalation rather than falling back to the cache. Only
+  the exact token, freshly confirmed, grants.
+- **It is audited in both directions, without carrying the credential.** Grants
+  emit `_sel_credential_decision(..., granted=True)` under distinct operation
+  names, so the same-repo ground and the tier are separable in the log. REFUSALS
+  are recorded too, and are the more interesting record: `_owner_tier_confirmed`
+  returns False when a fresh read of the registry's index does not list the
+  coordinates the local row claims, which is what a poisoned cache looks like from
+  here — left to a rotating log alone, the one event an incident responder wants
+  is the one that ages out. Only a decision on an ATTEMPTED escalation is
+  recorded: a default-tier registry or a bundled entry is not a credential
+  decision, and recording it would put a row in SEL per browse and bury the
+  refusals that matter. A clone URL is index-supplied and may
+  embed `user:token@`, and the SEL trail is dashboard-readable and persistent, so
+  `_redact_url_userinfo` strips userinfo from every logged URL. Userinfo is
+  removed rather than the whole URL: a record saying "credentials were offered to
+  clone THIS" is worth little if it cannot name the repository, and a bare host
+  cannot tell two repos on one forge apart.
+
+**A registry name claimed by two different repositories is refused outright.**
+The on-disk index cache is keyed by registry NAME, so if a pinned row and an
+operator row share a name but not a repo, serving either would read the other's
+cached index under the winner's identity — and every reader stamps `_registry`
+from the registry it asked for, so those rows would be attributed to it: apps the
+winning repository does not list, presented as its own and installable under it.
+`_effective_registries` therefore serves NEITHER row for a contested name and
+logs both claimants. Same name AND same repo is not contested: the pinned row
+simply supersedes an operator row that already agreed, and the shared cache is
+correct. `PUT /api/apps/registries` refuses to create such a collision, so the
+case that reaches this rule is a `config.json` that already used the name before
+the build pinned it. (Re-keying the cache on `(name, repo)` would fix the wider
+pre-existing case — an operator repointing a registry's `repo` has the same
+hazard — and is left as separate work.)
+
+**Only the BUILD can grant `owner`.** `_registry_trust_tier` resolves the tier
+solely from `AppsLoader.default_registries()`; a row in `config.json` reads as
+`index` no matter what it declares. The reason is that `config.json` is
+agent-writable — `security.py` says so directly, with the check inline
+(`is_sensitive_bash_command("echo x > …/config.json")` is `None`) — so a tier read
+from there would not be an operator's assertion at all. A prompt-injected shell
+could mint `owner`, and the *same* write also adds its chosen host to
+`_configured_registry_hosts()` and lets it control the index that
+`_owner_tier_confirmed` re-fetches: every layer downstream of that decision would
+already be satisfied by the one write that started it. `default_registries()`
+ships in the wheel, so an `owner` tier is a claim the build makes and the agent
+cannot forge.
+
+Consequences worth stating, because they close off designs that look reasonable:
+
+- The tier is only honoured for a registry that is BOTH build-pinned and in force.
+  A name contested between a pinned row and a config row is served by neither, so
+  reading the tier off the pinned list alone would keep granting `owner` for a
+  registry whose apps are not being listed.
+- `PUT /api/apps/registries` **refuses** `trust: "owner"` rather than storing it,
+  and `GET` reports `index` for every operator row. Persisting or echoing a tier
+  the runtime ignores would report a grant that does not exist, which is worse
+  than declining it. There is correspondingly nothing to preserve across a
+  replace-all PUT: an operator row's tier is always `index`.
+- No dashboard control writes the tier, and adding one would not help — the
+  question is not how the value is typed but whether the file it lands in is
+  agent-writable.
+
+The API reports pinned registries under a separate read-only `pinned` key rather
+than inside `registries`, because `PUT /api/apps/registries` replaces that list
+verbatim: folding them in would let a dashboard round-trip persist an edition
+default into the operator's `config.json`, where a later edition change could no
+longer move it. `PUT` carries `trust` through for the same class of reason —
+dropping it would silently downgrade a registry the operator had marked trusted.
+
+Writers: `apps/registry.py` (`_effective_registries`, `_pinned_registries`,
+`_registry_trust_tier`, `_is_owner_designated_repo`, `_owner_tier_confirmed`,
+`_sel_credential_decision`,
+`anonymous_git_env`), `platform/interfaces.py`
+(`AppsLoader.default_registries`), `config/loader.py`
+(`ExternalRegistryConfig.trust`), `apps/routes.py` (`handle_registries`).
+
+## 16. Store guidance and product screenshots are manifest-owned
+
+An App detail page carries three different kinds of information and does not
+substitute one for another:
+
+- `highlights` describes capabilities;
+- `useCases` says when an operator should reach for the App;
+- `configuration` says how to make it usable, including prerequisites that live
+  outside the page (provider CLIs, credentials, desktop shell, or another App).
+
+All three remain English in `app.json` so catalog-less consumers such as the CLI
+print meaningful copy. Builtins resolve them through the frontend catalogs; the
+manifest/catalog sync gate derives `use_case_N` and `configuration_N` keys and
+requires the English values to stay byte-identical. External apps fall back to
+their manifest copy because a third-party app id is not first-party provenance.
+
+Store artwork and proof are likewise distinct. `heroImage*` is illustrative
+banner art, while `screenshots*` must be a capture of the real App UI. The detail
+page prefers the wide `heroImageDetail*` banner when present and renders the
+screenshot gallery independently. Registry manifests project `useCases` and
+`configuration` as display metadata and rewrite repo-relative screenshot and
+hero paths through the same-origin blob proxy.
+
+Writers: builtin `app.json` manifests, `apps/registry.py` (`_merge_manifest`),
+`website/src/components/appstore/appManifest.ts`,
+`website/src/pages/AppDetailPage.tsx`, and
+`website/scripts/check-app-manifest-sync.mjs`.

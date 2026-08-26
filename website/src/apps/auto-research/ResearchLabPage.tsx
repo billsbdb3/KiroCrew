@@ -12,6 +12,7 @@ import GrillTree from './GrillTree'
 import { grillReducer, promotedResearch, answeredClarifiers, suggestedMaxCycles, GrillNode } from './grillTreeModel'
 
 import { i18nT } from '../../i18n/t'
+import { useImeGuard } from '../../hooks/useImeGuard'
 const ACTIVE_STATUSES = ['running', 'paused', 'stagnant', 'needs_input']
 
 interface Campaign { id: string; name: string; question: string; sub_questions: string; sources: string; max_cycles: number; idle_secs: number; status: string; total_cycles: number; findings?: Finding[]; error_message?: string; pending_question?: string; parent_id?: string; parallel_workers?: number }
@@ -29,6 +30,7 @@ function GrowTextarea({ value, onChange, onSubmit, placeholder, className = '', 
   className?: string
   ariaLabel?: string
 }) {
+  const ime = useImeGuard()
   const ref = useRef<HTMLTextAreaElement>(null)
   useEffect(() => {
     const el = ref.current
@@ -46,9 +48,9 @@ function GrowTextarea({ value, onChange, onSubmit, placeholder, className = '', 
       value={value}
       placeholder={placeholder}
       onChange={e => onChange(e.target.value)}
+      {...ime.bindComposition<HTMLTextAreaElement>()}
       onKeyDown={e => {
-        if (onSubmit && e.key === 'Enter' && !e.shiftKey) {
-          e.preventDefault()
+        if (onSubmit && e.key === 'Enter' && !e.shiftKey && ime.claimEnter(e)) {
           onSubmit()
         }
       }}
@@ -738,11 +740,11 @@ export default function ResearchLabPage() {
 
   const active = campaigns.find((c: Campaign) => ACTIVE_STATUSES.includes(c.status))
 
-  if (view === 'wizard') return <div className="px-6 py-4"><h1 className="text-lg font-semibold mb-4">{i18nT('apps.autoResearch.researchLabPage.new_campaign')}</h1><SetupWizard onCancel={() => setView('list')} onDone={() => { qc.invalidateQueries({ queryKey: ['research-campaigns'] }); setView('list') }} /></div>
-  if (view === 'fork' && forkParentId) return <div className="px-6 py-4"><h1 className="text-lg font-semibold mb-4">{i18nT('apps.autoResearch.researchLabPage.continue_research')}</h1><ForkFlow parentId={forkParentId} onCancel={() => setView('list')} onDone={() => { qc.invalidateQueries({ queryKey: ['research-campaigns'] }); setView('list') }} /></div>
-  if (view === 'detail' && selectedId) return <div className="px-6 py-4"><CampaignDetail id={selectedId} onBack={() => setView('list')} onFork={(id) => { setForkParentId(id); setView('fork') }} onOpen={(pid) => setSelectedId(pid)} /></div>
+  if (view === 'wizard') return <div className="px-4 md:px-6 py-4"><h1 className="text-lg font-semibold mb-4">{i18nT('apps.autoResearch.researchLabPage.new_campaign')}</h1><SetupWizard onCancel={() => setView('list')} onDone={() => { qc.invalidateQueries({ queryKey: ['research-campaigns'] }); setView('list') }} /></div>
+  if (view === 'fork' && forkParentId) return <div className="px-4 md:px-6 py-4"><h1 className="text-lg font-semibold mb-4">{i18nT('apps.autoResearch.researchLabPage.continue_research')}</h1><ForkFlow parentId={forkParentId} onCancel={() => setView('list')} onDone={() => { qc.invalidateQueries({ queryKey: ['research-campaigns'] }); setView('list') }} /></div>
+  if (view === 'detail' && selectedId) return <div className="px-4 md:px-6 py-4"><CampaignDetail id={selectedId} onBack={() => setView('list')} onFork={(id) => { setForkParentId(id); setView('fork') }} onOpen={(pid) => setSelectedId(pid)} /></div>
 
-  return <div className="px-6 py-4">
+  return <div className="px-4 md:px-6 py-4">
     <div className="flex items-center justify-between mb-4">
       <h1 className="text-lg font-semibold flex items-center gap-2"><FlaskConical size={20} /> {i18nT('apps.autoResearch.researchLabPage.research_lab')}</h1>
       <button className="text-sm px-3 py-1.5 rounded-md bg-accent text-accent-fg disabled:opacity-50" disabled={!!active} onClick={() => setView('wizard')} title={active ? i18nT('apps.autoResearch.researchLabPage.one_campaign_at_a_time') : ''}>{i18nT('apps.autoResearch.researchLabPage.new_campaign_2')}</button>

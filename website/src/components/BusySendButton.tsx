@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ArrowUpFromLine, Check, ChevronDown, Target } from 'lucide-react'
 import { useListboxKeyboard } from '../hooks/useListboxKeyboard'
-import { safeSetItem } from '../utils/safeStorage'
+import { safeGetItem, safeSetItem } from '../utils/safeStorage'
 
 import { i18nT } from '../i18n/t'
 
@@ -33,36 +33,70 @@ const BUSY_SEND_MODE_LABEL_KEY: Record<BusySendMode, string> = {
   queue: 'components.chatInput.queue',
 }
 const BUSY_SEND_MODE_DESC_KEY: Record<BusySendMode, string> = {
-  steer: 'components.chatInput.steer_desc',
-  queue: 'components.chatInput.queue_desc',
+  steer: 'components.chatInput.steer_act_on_this_right_away_desc',
+  queue: 'components.chatInput.queue_run_after_the_current_work_finishes_desc',
 }
 const BUSY_SEND_MODES: Array<{ mode: BusySendMode; icon: React.ReactNode }> = [
   { mode: 'steer', icon: <Target size={15} /> },
   { mode: 'queue', icon: <ArrowUpFromLine size={15} /> },
 ]
 
-export function readBusySendMode(): BusySendMode {
-  try { return localStorage.getItem(BUSY_SEND_MODE_LS_KEY) === 'queue' ? 'queue' : 'steer' } catch { return 'steer' }
+/** Storage key for one slot's preference. A slot-less consumer gets a scoped
+ *  sentinel key rather than the legacy unscoped one: the legacy key is a READ-ONLY
+ *  migration source (see readBusySendMode), because a live write to it would
+ *  change the inherited default of every slot that never chose a mode — the exact
+ *  cross-session leak this scoping exists to prevent. */
+function busySendModeKey(slotKey?: string | null): string {
+  return `${BUSY_SEND_MODE_LS_KEY}:${slotKey || 'no-slot'}`
 }
 
-/** Live subscribers to the persisted mode. "What does Enter do while busy" is
- *  ONE user preference, so every composer showing this button (main chat and the
- *  side panel) must move together the moment it changes — localStorage alone
- *  only syncs across tabs, never within one. */
-const modeListeners = new Set<(m: BusySendMode) => void>()
+export function readBusySendMode(slotKey?: string | null): BusySendMode {
+  const scoped = safeGetItem(busySendModeKey(slotKey))
+  if (scoped !== null) return scoped === 'queue' ? 'queue' : 'steer'
+  // Migration fallback: before per-slot scoping the preference lived under the
+  // unscoped key. A slot that has never chosen a mode inherits that value, so
+  // an existing "queue" user keeps their default instead of being reset.
+  return safeGetItem(BUSY_SEND_MODE_LS_KEY) === 'queue' ? 'queue' : 'steer'
+}
 
-/** Read + write the shared busy-send preference. Every mounted consumer updates
- *  on a change from any other consumer. */
-export function useBusySendMode(): [BusySendMode, (m: BusySendMode) => void] {
-  const [mode, setMode] = useState<BusySendMode>(readBusySendMode)
+/** Live subscribers to the persisted mode, grouped by storage key. "What does
+ *  Enter do while busy" is a PER-SLOT preference: the composers sharing one slot
+ *  (main chat and its side panel) must move together the moment it changes —
+ *  localStorage alone only syncs across tabs, never within one — while composers
+ *  bound to OTHER slots must not move at all. */
+const modeListeners = new Map<string, Set<(m: BusySendMode) => void>>()
+
+/** Read + write one slot's busy-send preference. Every mounted consumer of the
+ *  SAME slot updates on a change from any other; other slots are untouched. */
+export function useBusySendMode(slotKey?: string | null): [BusySendMode, (m: BusySendMode) => void] {
+  const storageKey = busySendModeKey(slotKey)
+  const [mode, setMode] = useState<BusySendMode>(() => readBusySendMode(slotKey))
+  // Rebind (a mounted composer switching slots when activeSlot changes) is
+  // resolved DURING render — React's adjust-state-on-prop-change pattern — so
+  // the previous slot's mode is never painted, not even for the one frame an
+  // effect-based re-read would leave it visible (and clickable).
+  const [boundKey, setBoundKey] = useState(storageKey)
+  if (boundKey !== storageKey) {
+    setBoundKey(storageKey)
+    setMode(readBusySendMode(slotKey))
+  }
   useEffect(() => {
-    modeListeners.add(setMode)
-    return () => { modeListeners.delete(setMode) }
-  }, [])
+    let subs = modeListeners.get(storageKey)
+    if (!subs) {
+      subs = new Set()
+      modeListeners.set(storageKey, subs)
+    }
+    subs.add(setMode)
+    return () => {
+      subs.delete(setMode)
+      if (subs.size === 0) modeListeners.delete(storageKey)
+    }
+  }, [storageKey])
   const publish = useCallback((m: BusySendMode) => {
-    safeSetItem(BUSY_SEND_MODE_LS_KEY, m)
-    for (const fn of modeListeners) fn(m)
-  }, [])
+    safeSetItem(storageKey, m)
+    const subs = modeListeners.get(storageKey)
+    if (subs) for (const fn of subs) fn(m)
+  }, [storageKey])
   return [mode, publish]
 }
 
@@ -137,11 +171,14 @@ export default function BusySendButton({
   return (
     <div className="relative flex items-center" ref={splitRef}>
       <div className={`flex items-stretch h-8 rounded-full overflow-hidden transition-colors ${mode === 'steer' ? 'bg-accent text-accent-fg' : 'bg-warn text-warn-fg'}`}>
+        {/* Only the fire half dims when disabled: the caret (mode toggle) stays
+            live because picking steer-vs-queue before typing is a real workflow,
+            and a dimmed control that still works would read as broken. */}
         <button
-          className="w-8 h-8 bg-transparent border-none flex items-center justify-center cursor-pointer hover:bg-black/15 transition-all text-inherit"
+          className="w-8 h-8 bg-transparent border-none flex items-center justify-center cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 hover:bg-black/15 transition-all text-inherit"
           onClick={onFire}
           disabled={disabled}
-          title={mode === 'steer' ? i18nT('components.chatInput.steer_inject_into_the_running_turn_enter') : i18nT('components.chatInput.queue_run_after_the_current_turn_finishes_enter')}
+          title={mode === 'steer' ? i18nT('components.chatInput.steer_act_on_this_as_soon_as_possible_enter') : i18nT('components.chatInput.queue_run_after_the_current_work_finishes_enter')}
           aria-label={mode === 'steer' ? i18nT('components.chatInput.steer') : i18nT('components.chatInput.queue_message')}
           data-testid="busy-send-button"
         >

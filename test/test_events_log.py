@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import make_dir_link
 from kiro_crew.events.base import parse
 from kiro_crew.events.kinds import CronRegistered, SessionMessage
 from kiro_crew.events.log import MAX_LINE_BYTES, EventLog, shard_name_for
@@ -183,7 +184,7 @@ def test_prune_refuses_linked_events_directory(tmp_path: Path) -> None:
     victim.mkdir()
     (victim / "2020-01-01.jsonl").write_text("{}\n", encoding="utf-8")
     linked = tmp_path / "events"
-    linked.symlink_to(victim)
+    make_dir_link(linked, victim)
     log = EventLog(linked)
     with pytest.raises(ValueError, match="linked"):
         log.prune(retention_days=0)

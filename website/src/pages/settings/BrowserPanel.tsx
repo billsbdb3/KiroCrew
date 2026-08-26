@@ -14,9 +14,12 @@ import {
 } from 'lucide-react'
 
 import { api, type BrowserInstallData } from '../../api/client'
-import { SettingsSection, SettingsCard } from '../../components/settings'
+import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import { Badge, Btn, EmptyState, FormSkeleton, Input } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
+import { isElectron } from '../../lib/electron'
+import { useImeGuard } from '../../hooks/useImeGuard'
+import type { DashboardConfig } from '../chat/ChatSettings'
 import { Trans } from 'react-i18next'
 import { i18nT } from '../../i18n/t'
 import { copyToClipboard } from '../../utils/clipboard'
@@ -77,6 +80,22 @@ export function BrowserPanel() {
     refetchInterval: (q) => (q.state.data?.installing ? INSTALLING_POLL_MS : IDLE_POLL_MS),
   })
 
+  // The built-in-browser toggle lives in dashboard config (not the install
+  // status), so it round-trips through /api/dashboard/config like the other
+  // dashboard settings.
+  const dashQ = useQuery<DashboardConfig>({
+    queryKey: ['dashboardConfig'],
+    queryFn: () => api.dashboardConfig(),
+  })
+  const dashMut = useMutation({
+    // Send ONLY the changed key: the config handler applies keys present in the
+    // body, so a full-object PUT built from this query's cache could clobber a
+    // setting another client changed after we cached (lost update).
+    mutationFn: (patch: Partial<DashboardConfig>) => api.updateDashboardConfig(patch),
+    onSettled: () => { void qc.invalidateQueries({ queryKey: ['dashboardConfig'] }) },
+  })
+  const setUseBuiltin = (v: boolean) => { dashMut.mutate({ use_builtin_browser: v }) }
+
   // Never seeded from the server: the status carries only whether a token exists,
   // so there is nothing to prefill and no way for the value to leak back out.
   const [token, setToken] = useState('')
@@ -88,6 +107,7 @@ export function BrowserPanel() {
     mutationFn: (value: string) => api.setBrowserToken(value),
     onSuccess: () => { setToken(''); void qc.invalidateQueries({ queryKey: INSTALL_KEY }) },
   })
+  const ime = useImeGuard()
 
   const installMut = useMutation({
     mutationFn: api.installBrowserCli,
@@ -159,6 +179,28 @@ export function BrowserPanel() {
                 </p>
               </div>
             </div>
+          </SettingsCard>
+
+          {/*
+            Built-in browser toggle. The native panel is a desktop-app-only
+            Electron view, so off the desktop the switch is force-disabled and
+            reads OFF -- the agent uses playwright-cli there regardless. When ON
+            (desktop), the browser tool drives the built-in panel; when the user
+            turns it OFF, the tool falls back to playwright-cli.
+          */}
+          <SettingsCard>
+            <SettingsToggle
+              label={i18nT('pages.settings.browserPanel.use_builtin_label')}
+              configKey="dashboard.use_builtin_browser"
+              description={
+                isElectron
+                  ? i18nT('pages.settings.browserPanel.use_builtin_desc')
+                  : i18nT('pages.settings.browserPanel.use_builtin_desktop_only')
+              }
+              checked={isElectron ? (dashQ.data?.use_builtin_browser ?? true) : false}
+              onChange={setUseBuiltin}
+              disabled={!isElectron || !dashQ.isSuccess || dashMut.isPending}
+            />
           </SettingsCard>
 
           {/*
@@ -266,7 +308,7 @@ export function BrowserPanel() {
             about to drive their logged-in browser.
           */}
           <SettingsCard>
-            <div className="flex items-start gap-3">
+            <div className="flex items-start gap-3" data-setting-label={i18nT('pages.settings.browserPanel.token_label')}>
               <KeyRound size={18} className="text-muted shrink-0 mt-[2px]" />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 flex-wrap">
@@ -287,6 +329,11 @@ export function BrowserPanel() {
                     autoComplete="off"
                     value={token}
                     onChange={(e) => setToken(e.target.value)}
+                    {...ime.bindEnter({
+                      onEnter: () => {
+                        if (!tokenMut.isPending && token.trim()) tokenMut.mutate(token)
+                      },
+                    })}
                     placeholder={
                       data.token
                         ? i18nT('pages.settings.browserPanel.token_set')

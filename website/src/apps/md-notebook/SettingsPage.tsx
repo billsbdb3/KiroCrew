@@ -18,10 +18,13 @@ import {
   COLUMN_MAX_WIDTH,
   COLUMN_PAD_X,
   DEFAULT_SYNC_SHORTCUT,
+  DOC_H1_PX,
+  DOC_HEADING_WEIGHTS,
   FONT_BODY,
   FONT_MONO,
   MAX_AUTO_SYNC_MINS,
   MIN_AUTO_SYNC_MINS,
+  RAIL_TYPE,
 } from './constants'
 import Clickable from '../../components/Clickable'
 import { GithubIcon, Switch, TextLink } from './bits'
@@ -56,6 +59,13 @@ export interface SettingsPageProps {
   autoSync: boolean
   autoSyncMins: number
   autoCommit: boolean
+  /**
+   * A settings read or write that failed, shown inside the Sync section. These
+   * two prefs are stored server-side, so unlike the device-local ones a click
+   * here can be refused — and the page's editor banner is not on screen while
+   * this page is.
+   */
+  syncPrefsError: string | null
   shortcut: Shortcut
   onClose: () => void
   onSwitchVault: (id: string) => void
@@ -78,6 +88,7 @@ export function SettingsPage({
   autoSync,
   autoSyncMins,
   autoCommit,
+  syncPrefsError,
   shortcut,
   onClose,
   onSwitchVault,
@@ -95,7 +106,7 @@ export function SettingsPage({
   const [busy, setBusy] = useState(false)
   // Messages are scoped to the control that produced them, so feedback appears
   // where the click happened rather than at the foot of the page.
-  const [patNote, setPatNote] = useState<string | null>(null)
+  const [patNote, setPatNote] = useState<{ text: string; error?: boolean } | null>(null)
   const [knowledgeMsg, setKnowledgeMsg] = useState<
     Record<string, { text: string; error?: boolean } | null>
   >({})
@@ -127,6 +138,7 @@ export function SettingsPage({
   }, [])
   const [knowledgeBusy, setKnowledgeBusy] = useState<string | null>(null)
   const [confirmForget, setConfirmForget] = useState<string | null>(null)
+  const [forgetError, setForgetError] = useState<string | null>(null)
   const [recording, setRecording] = useState(false)
   const [shortcutError, setShortcutError] = useState<string | null>(null)
 
@@ -291,7 +303,21 @@ export function SettingsPage({
             padding: `24px ${COLUMN_PAD_X}px 14px`,
           }}
         >
-          <div style={{ fontSize: '23px', fontWeight: 700, lineHeight: 1.25 }}>
+          <div
+            style={{
+              // Authored to match the note header's title, and this page already
+              // shares the document column's geometry above. Derived so the two
+              // page titles cannot drift apart the way this one just did.
+              //
+              // This is chrome borrowing a document value, which holds only while
+              // the reading base is a constant. If it ever becomes a user
+              // preference, this needs its own page-title token rather than the
+              // reader's prose size.
+              fontSize: `${DOC_H1_PX}px`,
+              fontWeight: DOC_HEADING_WEIGHTS[0],
+              lineHeight: 1.25,
+            }}
+          >
             {i18nT('apps.mdNotebook.settings.title')}
           </div>
           <div
@@ -458,7 +484,10 @@ export function SettingsPage({
                     )}
                     <button
                       type="button"
-                      onClick={() => setConfirmForget(v.id)}
+                      onClick={() => {
+                        setConfirmForget(v.id)
+                        setForgetError(null)
+                      }}
                       style={{
                         ...pill(false),
                         color: 'var(--danger)',
@@ -540,12 +569,20 @@ export function SettingsPage({
                   </span>
                   <button
                     type="button"
+                    disabled={busy}
                     onClick={async () => {
                       const id = confirmForget
-                      setConfirmForget(null)
+                      if (!id) return
                       setBusy(true)
-                      await onForget(id)
-                      setBusy(false)
+                      setForgetError(null)
+                      try {
+                        await onForget(id)
+                        setConfirmForget(null)
+                      } catch (e) {
+                        setForgetError(e instanceof Error ? e.message : String(e))
+                      } finally {
+                        setBusy(false)
+                      }
                     }}
                     style={{
                       ...pill(false),
@@ -557,11 +594,22 @@ export function SettingsPage({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setConfirmForget(null)}
+                    onClick={() => {
+                      setConfirmForget(null)
+                      setForgetError(null)
+                    }}
                     style={pill(false)}
                   >
                     {i18nT('apps.mdNotebook.connect.cancel')}
                   </button>
+                  {/* This bar only exists while confirmForget is set, so a failure
+                      is reported right here rather than the shared editor banner,
+                      which is unmounted while Settings is open. */}
+                  {forgetError && (
+                    <div role="alert" style={{ flexBasis: '100%', fontSize: '11px' }}>
+                      {i18nT('apps.mdNotebook.settings.removeFailed', { message: forgetError })}
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -598,10 +646,21 @@ export function SettingsPage({
                 disabled={busy || !pat}
                 onClick={async () => {
                   setBusy(true)
-                  await onSetPat(pat)
-                  setPat('')
-                  setPatNote(i18nT('apps.mdNotebook.settings.tokenSaved'))
-                  setBusy(false)
+                  setPatNote(null)
+                  try {
+                    await onSetPat(pat)
+                    setPat('')
+                    setPatNote({ text: i18nT('apps.mdNotebook.settings.tokenSaved') })
+                  } catch (e) {
+                    setPatNote({
+                      text: i18nT('apps.mdNotebook.settings.tokenSaveFailed', {
+                        message: e instanceof Error ? e.message : String(e),
+                      }),
+                      error: true,
+                    })
+                  } finally {
+                    setBusy(false)
+                  }
                 }}
                 style={pill(true)}
               >
@@ -613,9 +672,20 @@ export function SettingsPage({
                   disabled={busy}
                   onClick={async () => {
                     setBusy(true)
-                    await onSetPat('')
-                    setPatNote(i18nT('apps.mdNotebook.settings.tokenCleared'))
-                    setBusy(false)
+                    setPatNote(null)
+                    try {
+                      await onSetPat('')
+                      setPatNote({ text: i18nT('apps.mdNotebook.settings.tokenCleared') })
+                    } catch (e) {
+                      setPatNote({
+                        text: i18nT('apps.mdNotebook.settings.tokenClearFailed', {
+                          message: e instanceof Error ? e.message : String(e),
+                        }),
+                        error: true,
+                      })
+                    } finally {
+                      setBusy(false)
+                    }
                   }}
                   style={pill(false)}
                 >
@@ -626,10 +696,14 @@ export function SettingsPage({
             {/* Result under the token controls, not at the foot of the page. */}
             {patNote && (
               <div
-                role="status"
-                style={{ fontSize: '11px', color: ACCENT, marginTop: '6px' }}
+                role={patNote.error ? 'alert' : 'status'}
+                style={{
+                  fontSize: '11px',
+                  color: patNote.error ? 'var(--danger)' : ACCENT,
+                  marginTop: '6px',
+                }}
               >
-                {patNote}
+                {patNote.text}
               </div>
             )}
           </div>
@@ -703,6 +777,17 @@ export function SettingsPage({
                 <span style={{ fontSize: '12px', color: 'var(--muted)' }}>
                   {i18nT('apps.mdNotebook.settings.minutes')}
                 </span>
+              </div>
+            )}
+
+            {/* Outside the interval block on purpose: the switch itself can be
+                refused, and that report must not depend on auto sync being on. */}
+            {syncPrefsError && (
+              <div
+                role="alert"
+                style={{ fontSize: '11px', color: 'var(--danger)', marginTop: '8px' }}
+              >
+                {syncPrefsError}
               </div>
             )}
 
@@ -821,7 +906,7 @@ export function SettingsBar({
       >
         <span
           style={{
-            fontSize: '13px',
+            ...RAIL_TYPE.row,
             fontWeight: open ? 600 : 400,
             color: open ? 'var(--text)' : 'var(--muted)',
             flex: 1,

@@ -27,7 +27,7 @@ import {
 } from '../hooks/useWebSocket'
 import { api } from '../api/client'
 import { store as globalStore } from '../store'
-import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard } from '../store/chatSlice'
+import chatReducer, { setActiveSlot, clearMessages, sseChatMessage, sseActivityEvent, setQuestionCard, resolveQuestionCard, appendMessage } from '../store/chatSlice'
 import { sseSlots } from '../store/dashboardSlice'
 import { addNotification, removeNotificationByTs } from '../store/notificationsSlice'
 import type { ChatSlot } from '../types'
@@ -630,7 +630,7 @@ describe('useWebSocket frame router', () => {
       })
     })
     expect(chat().folderSuggestions[ACTIVE]).toEqual({
-      folderId: 'f1', folderName: 'Reviews', breadcrumb: 'Work / Reviews', ts: 12,
+      folderId: 'f1', folderName: 'Reviews', breadcrumb: 'Work / Reviews', ts: 12, turns: 0,
     })
 
     act(() => {
@@ -977,6 +977,26 @@ describe('useWebSocket frame router', () => {
     // Draining the last chunk stops the playing indicator.
     act(() => { MockAudio.instances[1].onended?.() })
     expect(chat().voicePlaying).toBe(false)
+  })
+
+  it('uses the WAV MIME type supplied with a local voice chunk', async () => {
+    const blobs: Blob[] = []
+    URL.createObjectURL = vi.fn((blob: Blob) => {
+      blobs.push(blob)
+      return 'blob:voice-wav'
+    })
+    vi.stubGlobal('Audio', MockAudio)
+    const { ws } = mount()
+
+    await act(async () => {
+      ws.simulateMessage({
+        type: 'voice_chunk',
+        data: { slot: ACTIVE, audio: btoa('wav'), audioMime: 'audio/wav' },
+      })
+    })
+
+    expect(blobs).toHaveLength(1)
+    expect(blobs[0].type).toBe('audio/wav')
   })
 
   it('advances past a chunk whose audio element errors', async () => {
@@ -1757,3 +1777,4 @@ describe('useWebSocket slots reconcile', () => {
     expect(testStore.getState().chat.slotMessages[BACKGROUND]).toBeDefined()
   })
 })
+

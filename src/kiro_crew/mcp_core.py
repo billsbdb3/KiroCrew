@@ -39,6 +39,7 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_dir,
     outbox_dir,
+    read_local_secret,
     resolve_agent_bindings,
 )
 from kiro_crew.context_management import summarize_result
@@ -60,7 +61,7 @@ from kiro_crew.mcp_tools import build_tool_list, dispatch
 from kiro_crew.members import record_activity
 from kiro_crew.messaging.link import is_legacy_slack_key, legacy_key
 from kiro_crew.platform import redact_via_context as redact
-from kiro_crew.port_resolution import resolve_client_port_ex
+from kiro_crew.port_resolution import resolve_client_port_src
 from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
@@ -90,10 +91,10 @@ _HANDLER_SURFACE = (
 )
 
 
-def _resolve_api_port() -> tuple[int, bool]:
+def _resolve_api_port() -> tuple[int, str]:
     """Resolve the gateway API port a callback should aim at.
 
-    Delegates to :func:`kiro_crew.port_resolution.resolve_client_port_ex`, the
+    Delegates to :func:`kiro_crew.port_resolution.resolve_client_port_src`, the
     same precedence every client CLI command applies: ``KIROCREW_PORT``, then a
     port **explicitly written** in ``dashboard.url``, then the sole
     gateway-owned run-marker, then the documented default. The marker step is
@@ -102,10 +103,20 @@ def _resolve_api_port() -> tuple[int, bool]:
     substitutes the default for the *server's* benefit (it must bind
     something), which is exactly the wrong guess for a client callback.
 
-    Returns ``(port, positive)`` — ``positive`` is ``False`` when resolution
-    fell through to the default with no evidence behind it.
+    Returns ``(port, source)`` — the source string names the chain step that
+    produced the port (``"env"`` / ``"bound"`` / ``"config"`` / ``"marker"`` /
+    ``"default"``), because the caching rule below differs by source.
     """
-    return resolve_client_port_ex(None)
+    return resolve_client_port_src(None)
+
+
+#: Port sources stable for the process lifetime, safe to pin. Deliberately
+#: excludes ``"marker"``: a marker-discovered port is verified at that instant
+#: only — the gateway can exit or move and any local process may then rebind
+#: the port, so every secret-bearing request must re-run the discovery chain
+#: (which re-proves ownership via ``_gateway_owns_port``) instead of trusting
+#: a pinned value. Also excludes ``"default"``, the no-evidence fall-through.
+_STABLE_PORT_SOURCES = frozenset({"cli", "env", "bound", "config"})
 
 
 # Lazily-resolved caches for the gateway API port, base URL, and unix-socket
@@ -114,30 +125,39 @@ def _resolve_api_port() -> tuple[int, bool]:
 # Deliberately NOT computed at import: resolution reads config and the
 # gateway's live run-marker, both of which can change between process start
 # and the first gateway call — an import-time snapshot froze a wrong guess
-# for the whole process lifetime. The URL and the socket path both derive
-# from the single ``_API_PORT`` resolution, so the two transports can never
-# name different gateways.
+# for the whole process lifetime. A REQUEST derives its URL and socket path
+# from one resolution (``_resolve_api_target``), so the two transports of an
+# attempt can never name different gateways; these caches hold that pair only
+# for the stable sources that are safe to pin.
 _API_PORT: int | None = None
 _API: str | None = None
 _API_UNIX_SOCKET: str | None = None
 
 
 def _api_port() -> int:
-    """Gateway API port, resolved on first use; cached only on evidence.
+    """Gateway API port, resolved on first use; pinned only on stable evidence.
 
-    A resolution that fell through to the default port is returned but NOT
-    cached: it only proves nothing was discoverable at that instant. During
-    gateway boot a broker-descended server can race the asynchronous
-    run-marker write — pinning that fall-through would freeze the wrong port
-    for the process lifetime, with restart as the only recovery. The next
-    call re-resolves and picks the marker up once it exists. Every positive
-    source (env, explicit config, verified marker) is stable, so those are
-    cached as before.
+    Only a *stable* source — env var, exported bound port, or a port the user
+    wrote in ``dashboard.url`` — is cached: those are user decisions that hold
+    for the process lifetime. Two resolutions are returned but NOT cached:
+
+    * The default fall-through: it only proves nothing was discoverable at
+      that instant. During gateway boot a broker-descended server can race
+      the asynchronous run-marker write — pinning that fall-through would
+      freeze the wrong port for the process lifetime, with restart as the
+      only recovery. The next call re-resolves and picks the marker up once
+      it exists.
+    * A **marker-discovered** port: ownership was proven for that instant,
+      not forever. The gateway can exit or move ports, after which any local
+      process — another user's included — may rebind the port; a pinned
+      marker resolution would keep sending the internal secret there. Every
+      call therefore re-runs the discovery chain, whose marker step re-proves
+      ownership (``_gateway_owns_port``) before the port is trusted again.
     """
     global _API_PORT
     if _API_PORT is None:
-        port, positive = _resolve_api_port()
-        if not positive:
+        port, source = _resolve_api_port()
+        if source not in _STABLE_PORT_SOURCES:
             return port
         _API_PORT = port
     return _API_PORT
@@ -177,9 +197,8 @@ def _api_unix_socket() -> str:
     """
     global _API_UNIX_SOCKET
     if _API_UNIX_SOCKET is None:
-        try:
-            path = str(dashboard_socket_path(_api_port()))
-        except Exception:
+        path = _socket_path_for(_api_port())
+        if not path:
             _API_UNIX_SOCKET = ""
             return _API_UNIX_SOCKET
         if _API_PORT is None:
@@ -189,9 +208,97 @@ def _api_unix_socket() -> str:
     return _API_UNIX_SOCKET
 
 
-def _api_urlopen(req: urllib.request.Request | str, timeout: float):
-    """``loopback_urlopen`` against the API base with the unix-socket preference."""
-    return loopback_urlopen(req, timeout=timeout, unix_socket_path=_api_unix_socket() or None)
+def _socket_path_for(port: int) -> str:
+    """Unix-socket path for *port*, or ``""`` when one cannot be derived.
+
+    Split out of :func:`_api_unix_socket` so a caller that already holds a
+    resolved port can derive the socket from THAT port instead of re-running
+    the discovery chain to find one.
+    """
+    try:
+        return str(dashboard_socket_path(port))
+    except Exception:
+        return ""
+
+
+def _resolve_api_target() -> tuple[str, str]:
+    """The ``(base, socket_path)`` pair for ONE request attempt, from ONE resolution.
+
+    ``_api_base`` and ``_api_unix_socket`` are correct for callers that want one
+    of the two, but a request needs BOTH, and on a marker-discovered port
+    neither is cached — so asking each of them ran the discovery chain twice
+    for a single attempt. Two forks of ``lsof`` per gateway call is the cost;
+    the correctness half is that the two answers are independent, and the
+    marker rule exists precisely because the answer can change between them. A
+    gateway that exits and is replaced mid-attempt would leave the TCP base
+    naming one gateway and the unix socket another — and ``loopback_urlopen``
+    PREFERS the socket, so the component actually carrying the request is the
+    one ``_send``'s replay guard never inspected.
+
+    Resolving once and deriving both halves from that single port restores the
+    "both transports derive from one resolution" invariant the cache comment
+    and :func:`_invalidate_api_base` already claim.
+
+    This does NOT weaken the ownership proof. The proof is per ATTEMPT, not per
+    process: a marker resolution is still never pinned, every attempt still
+    re-runs the chain, and the replay in :func:`_send` resolves a FRESH pair
+    rather than reusing the refused one. What changes is that one attempt now
+    proves ownership once instead of twice.
+    """
+    global _API, _API_UNIX_SOCKET
+    if _API is not None and _API_UNIX_SOCKET is not None:
+        # Both memos populated: hand back exactly what the standalone getters
+        # would answer. The condition is deliberately NOT also `_API_PORT is not
+        # None`. `_api_base` / `_api_unix_socket` return a populated memo
+        # whatever the port cache holds, and tests pre-seed these two directly
+        # (the cache comment above documents that) -- requiring the port here
+        # made this resolver discard a seeded pair and re-resolve, which is the
+        # very drift between `_send` and the getters this function exists to
+        # remove. In production the two are written together and
+        # `_invalidate_api_base` clears them together, so they stay consistent.
+        return _API, _API_UNIX_SOCKET
+    port = _api_port()
+    base = f"http://127.0.0.1:{port}"
+    sock = _socket_path_for(port)
+    if _API_PORT is not None:
+        # Stable source (env / bound / config): pin exactly as the individual
+        # getters do. A marker or default resolution is left unpinned.
+        _API = base
+        _API_UNIX_SOCKET = sock
+    return base, sock
+
+
+def _api_urlopen(
+    req: urllib.request.Request | str,
+    timeout: float,
+    *,
+    unix_socket_path: str | None = None,
+):
+    """``loopback_urlopen`` against the API base with the unix-socket preference.
+
+    *unix_socket_path* lets a caller that already resolved a target supply the
+    socket belonging to THAT resolution (see :func:`_resolve_api_target`); the
+    default keeps the standalone behavior for callers holding only a base.
+    """
+    if unix_socket_path is None:
+        unix_socket_path = _api_unix_socket()
+    return loopback_urlopen(req, timeout=timeout, unix_socket_path=unix_socket_path or None)
+
+
+def _invalidate_api_base() -> None:
+    """Forget the pinned port, base and socket path so the next call re-resolves.
+
+    Called when a connection is refused: the pinned base can predate a gateway
+    that has since moved (or a config edit that retargeted it), and the current
+    port is recorded only in the live run-marker. Dropping all three caches
+    together keeps the invariant that both transports derive from one
+    resolution — clearing only the URL would leave the socket path aimed at the
+    old gateway.
+    """
+    global _API_PORT, _API, _API_UNIX_SOCKET
+    _API_PORT = None
+    _API = None
+    _API_UNIX_SOCKET = None
 
 
 # How often a sleeping `wait` polls /api/session-keepalive.
@@ -291,9 +398,14 @@ def _list_tools() -> list[dict[str, Any]]:
 
 
 def _internal_secret() -> str:
-    """Read the per-session secret for IPC authentication."""
+    """Credential for the gateway this client will dial, paired to its port.
+
+    Thin wrapper over ``config.loader.read_local_secret``, which owns the
+    per-listener-then-shared order. The port is passed rather than re-resolved
+    because ``_api_port`` already resolved and cached it for this process.
+    """
     try:
-        return (config_dir() / ".local_secret").read_text().strip()
+        return read_local_secret(_api_port())
     except Exception:
         return ""
 
@@ -562,6 +674,47 @@ def _resolve_session_key_strict() -> str:
     except Exception:
         pass
     return ""
+
+
+def strict_identity_diagnosis(server: str = "kirocrew-core") -> str:
+    """Return the machine-specific reason strict identity is unavailable, or "".
+
+    Every strict refusal already says *what* was refused; none of them says why
+    THIS install cannot answer "which session is calling", so the reader has no
+    next step. This inspects the same three sources
+    :func:`_resolve_session_key_strict` accepts and names the missing channel.
+
+    The distinction that matters to an operator: on the kiro backend a session's
+    kiro-cli process is an ``AcpRuntime``, which is deliberately
+    session-UNBOUND (one process multiplexes N sessions, so it cannot carry a
+    single session's key in its environment — ``acp/runtime.py`` injects none).
+    The gateway's per-call caller injection is therefore the ONLY identity
+    channel for that backend, and it exists only for servers listed in
+    ``mcp_gateway.stub_servers``. An unrouted server on kiro has no channel at
+    all, which is a topology gap an operator can close in one line — not a bug
+    in the calling session.
+
+    Returns "" when identity IS resolvable (the caller should not be refusing),
+    so a caller can append this unconditionally.
+    """
+    if _resolve_session_key_strict():
+        return ""
+    if os.environ.get("KIROCREW_HOST_PID", "").isdigit():
+        # The sandbox launcher declared a host pid, so the channel exists and
+        # the sidecar is what failed — a signing/trust-root problem, not routing.
+        return (
+            f" No identity channel: the signed pid mapping for this session did not "
+            f"verify. Check `kirocrew doctor` (trust root) — {server} does not need "
+            f"routing when this channel works."
+        )
+    return (
+        f" No identity channel on this install: {server} is not in "
+        f"mcp_gateway.stub_servers, so the gateway injects no per-call caller, and "
+        f"the kiro backend's AcpRuntime is session-unbound (it carries no session "
+        f"key in its environment by design). Route {server} from MCP Management "
+        f"(or add it to mcp_gateway.stub_servers and restart) to give this session "
+        f"a verifiable identity. `kirocrew doctor` reports the same check."
+    )
 
 
 def _deny_channel_agent_messaging(caller_session: str, tool_name: str) -> str | None:
@@ -901,29 +1054,56 @@ def _caller_header() -> dict[str, str]:
     return {"X-Internal-Caller": name} if name else {}
 
 
-def _post(path: str, body: dict | None = None, *, timeout: float = 30) -> dict:
-    data = json.dumps(body or {}).encode()
-    headers = {
-        "Content-Type": "application/json",
-        "X-Internal-Secret": _internal_secret(),
-        **_caller_header(),
-    }
-    sk = _resolve_session_key()
-    _sk_err = _session_key_header_error(sk)
-    if _sk_err:
-        return {"error": _sk_err}
-    if sk:
-        headers["X-Session-Key"] = sk
-    req = urllib.request.Request(
-        f"{_api_base()}{path}",
-        data=data,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_api_base() from config/run-marker) + a fixed internal path; never user-controlled  # noqa: E501
-        with _api_urlopen(req, timeout=timeout) as resp:
+def _transport_failure(message: str, mark: bool) -> dict:
+    """Error payload for a request whose outcome is unknown.
+
+    ``transport_error`` means acceptance is undetermined — the request may have
+    reached the gateway before the response failed (a read timeout after spawn
+    acceptance, say), so the caller must not declare a definite rejection nor
+    retry on its own. Only spawn_run's batch reconcile consumes it, and it only
+    ever posts, so the flag stays opt-in per verb rather than becoming a new field
+    on every reply.
+    """
+    out: dict[str, object] = {"error": message}
+    if mark:
+        out["transport_error"] = True
+    return out
+
+
+def _send(
+    path: str,
+    *,
+    data: bytes | None = None,
+    headers: dict[str, str],
+    method: str = "GET",
+    timeout: float = 30,
+    mark_transport_error: bool = False,
+) -> dict:
+    """Send one gateway request, re-resolving the base once if it is refused.
+
+    A refused connection usually means the resolved base is stale: the gateway
+    came up, or moved to another port, after this tool server booted, and that
+    port is recorded only in the run marker. The replay runs only when
+    re-resolution actually produced a different base — retrying an unchanged
+    dead port just doubles the caller's latency to reach the identical failure.
+
+    Every verb goes through here. Keeping the replay in one place is what stops
+    PATCH-shaped calls from staying pinned to a base that POST already learned
+    was wrong.
+    """
+
+    def _once(target: tuple[str, str]) -> dict:
+        base, socket_path = target
+        req = urllib.request.Request(f"{base}{path}", data=data, headers=headers, method=method)
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_resolve_api_target(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never user-controlled  # noqa: E501
+        with _api_urlopen(req, timeout=timeout, unix_socket_path=socket_path) as resp:
             return json.loads(resp.read())
+
+    # ONE resolution for this attempt; both transports derive from it.
+    target = _resolve_api_target()
+    base = target[0]
+    try:
+        return _once(target)
     except urllib.error.HTTPError as e:
         # urlopen raises HTTPError on 4xx/5xx; str(e) is only "HTTP Error 400:
         # Bad Request" — the structured {"error": ...} body lives in e.read().
@@ -931,17 +1111,92 @@ def _post(path: str, body: dict | None = None, *, timeout: float = 30) -> dict:
         # the learn_add "unknown session" mapping) instead of an opaque code.
         return _http_error_body(e)
     except urllib.error.URLError as e:
-        if isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
+        if not isinstance(e.reason, (ConnectionRefusedError, socket.gaierror)):
+            return _transport_failure(str(e), mark_transport_error)
+        _invalidate_api_base()
+        retry_port, retry_source = _resolve_api_port()
+        if retry_source == "default":
+            # Re-resolution produced NO evidence — the default port is an
+            # unverified guess, and a listener there could be any local
+            # process. Replaying would hand it the internal secret and the
+            # request payload; the replay exists to chase POSITIVE evidence
+            # of a moved gateway, so a no-evidence fall-through ends here.
             return {"error": str(e)}
-        # ``transport_error`` is consumed only by spawn_run's batch reconcile:
-        # it means acceptance is unknown, so that member must not be declared
-        # lost. Other _post callers should treat the payload as a normal error.
-        return {"error": str(e), "transport_error": True}
+        # Build BOTH halves from the very resolution whose source was just
+        # checked (same shape as _resolve_api_target) — re-resolving again
+        # could race a marker disappearing between the check and the dial, and
+        # deriving the socket separately let the replay's two transports name
+        # different gateways. This is a FRESH pair, never the refused one: the
+        # ownership proof is per attempt.
+        retry_target = (f"http://127.0.0.1:{retry_port}", _socket_path_for(retry_port))
+        retry_base = retry_target[0]
+        if retry_base == base:
+            # Nothing was ever handed to a live gateway, so this is a definite
+            # rejection: no transport ambiguity to report.
+            return {"error": str(e)}
+        try:
+            return _once(retry_target)
+        except urllib.error.HTTPError as retry_exc:
+            return _http_error_body(retry_exc)
+        except urllib.error.URLError as retry_exc:
+            if isinstance(retry_exc.reason, (ConnectionRefusedError, socket.gaierror)):
+                return {"error": str(e)}
+            return _transport_failure(str(retry_exc), mark_transport_error)
+        except Exception as retry_exc:
+            # The replay reached the gateway and failed afterwards (a read timeout
+            # after a spawn was accepted, say). Acceptance is undetermined, so this
+            # must carry the same ambiguity flag as a first-attempt post-connect
+            # failure — otherwise spawn_run reconciles a still-running member down
+            # and orphans it.
+            return _transport_failure(str(retry_exc), mark_transport_error)
     except Exception as e:
         # The request may have reached the gateway before the response failed
         # (for example, a read timeout after spawn acceptance). Callers must
         # not present this as a definite rejection or retry automatically.
-        return {"error": str(e), "transport_error": True}
+        return _transport_failure(str(e), mark_transport_error)
+
+
+def _post(
+    path: str,
+    body: dict | None = None,
+    *,
+    timeout: float = 30,
+    session_key: str | None = None,
+) -> dict:
+    """POST a gateway endpoint.
+
+    ``session_key``: as in :func:`_patch`, and it matters for the same reason.
+    The default resolution is :func:`_resolve_session_key`, which includes the
+    ``/proc`` ancestor walk, so a caller that already gated itself on
+    :func:`_resolve_session_key_strict` and then let this helper re-resolve
+    would CHECK one identity and WRITE under another — the walk can land on an
+    ancestor slot, which for an app-owned session means the write arrives
+    looking like the unconfined person. Such a caller must pass the key it
+    verified. It is still validated by ``_session_key_header_error``.
+    """
+    data = json.dumps(body or {}).encode()
+    headers = {
+        "Content-Type": "application/json",
+        "X-Internal-Secret": _internal_secret(),
+        **_caller_header(),
+    }
+    sk = _resolve_session_key() if session_key is None else session_key
+    _sk_err = _session_key_header_error(sk)
+    if _sk_err:
+        return {"error": _sk_err}
+    if sk:
+        headers["X-Session-Key"] = sk
+    # ``transport_error`` is consumed only by spawn_run's batch reconcile: it
+    # means acceptance is unknown, so that member must not be declared lost.
+    # Other _post callers should treat the payload as a normal error.
+    return _send(
+        path,
+        data=data,
+        headers=headers,
+        method="POST",
+        timeout=timeout,
+        mark_transport_error=True,
+    )
 
 
 def _http_error_body(exc: urllib.error.HTTPError) -> dict:
@@ -990,6 +1245,23 @@ def _http_error_body(exc: urllib.error.HTTPError) -> dict:
             pass
     message, _ = redact_exfiltration_urls(message)
     message, _ = redact_credentials(message)
+    if code == "internal_auth_mismatch":
+        # Every internal tool receives the auth layer's bare "Forbidden", which
+        # reads as a permission decision about the tool's own subject and sends
+        # the reader after the wrong bug. It is an instance mix-up: the credential
+        # this client read does not belong to the gateway generation that owns the
+        # port it dialled. Rewritten HERE because all tool call sites already flow
+        # through this decoder, so one mapping covers them instead of one branch
+        # per tool -- and it is keyed on the CODE, since a genuine permission
+        # denial produces the same body and must not be given this explanation.
+        message = (
+            "this client authenticated against the wrong Kiro Crew instance. "
+            "The credential it read does not match the gateway now serving that "
+            "port, usually because a second gateway started on this machine and "
+            "replaced the shared credential file. Restart the gateway (or target "
+            "the instance you meant) and retry; the gateway's security event log "
+            "records both credential fingerprints for the mismatch."
+        )
     out: dict = {"error": message}
     if counted:
         out["counted"] = True
@@ -1018,17 +1290,7 @@ def _get(path: str, session_key: str | None = None) -> dict:
         return {"error": _sk_err}
     if sk:
         headers["X-Session-Key"] = sk
-    req = urllib.request.Request(
-        f"{_api_base()}{path}",
-        headers=headers,
-    )
-    try:
-        with _api_urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return _http_error_body(e)
-    except Exception as e:
-        return {"error": str(e)}
+    return _send(path, headers=headers, timeout=10)
 
 
 def _patch(path: str, body: dict | None = None, *, session_key: str | None = None) -> dict:
@@ -1051,21 +1313,7 @@ def _patch(path: str, body: dict | None = None, *, session_key: str | None = Non
         return {"error": _sk_err}
     if sk:
         headers["X-Session-Key"] = sk
-    req = urllib.request.Request(
-        f"{_api_base()}{path}",
-        data=data,
-        headers=headers,
-        method="PATCH",
-    )
-    try:
-        # _api_base() is the loopback dashboard base and `path` is a code
-        # literal — never attacker-controlled, so no file:// scheme risk.
-        with _api_urlopen(req, timeout=30) as resp:  # nosemgrep  # noqa: E501
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return _http_error_body(e)
-    except Exception as e:
-        return {"error": str(e)}
+    return _send(path, data=data, headers=headers, method="PATCH")
 
 
 def _put(path: str, body: dict | None = None, session_key: str | None = None) -> dict:
@@ -1093,21 +1341,7 @@ def _put(path: str, body: dict | None = None, session_key: str | None = None) ->
         return {"error": _sk_err}
     if sk:
         headers["X-Session-Key"] = sk
-    req = urllib.request.Request(
-        f"{_api_base()}{path}",
-        data=data,
-        headers=headers,
-        method="PUT",
-    )
-    try:
-        # _api_base() is the loopback dashboard base and `path` is a code
-        # literal — never attacker-controlled, so no file:// scheme risk.
-        with _api_urlopen(req, timeout=30) as resp:  # nosemgrep  # noqa: E501
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return _http_error_body(e)
-    except Exception as e:
-        return {"error": str(e)}
+    return _send(path, data=data, headers=headers, method="PUT")
 
 
 def _delete(path: str, body: dict | None = None) -> dict:
@@ -1121,19 +1355,7 @@ def _delete(path: str, body: dict | None = None) -> dict:
         headers["X-Session-Key"] = sk
     if data:
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(
-        f"{_api_base()}{path}",
-        data=data,
-        headers=headers,
-        method="DELETE",
-    )
-    try:
-        with _api_urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        return _http_error_body(e)
-    except Exception as e:
-        return {"error": str(e)}
+    return _send(path, data=data, headers=headers, method="DELETE", timeout=10)
 
 
 def _autonudge_binding_key(sk: str) -> str | None:
@@ -1799,6 +2021,24 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
     return dispatch(name, args)
 
 
+#: Whether this server advertises ``kirocrew.caller-identity`` — i.e. whether it
+#: consumes the per-call caller block gatewayd injects (see
+#: :func:`_resolve_session_key`, whose source 0 is that block) instead of reading
+#: identity from its own process. True here because it does.
+#:
+#: A module-level constant rather than a bare argument below so the value is
+#: readable without executing ``run_mcp_core_server``, and so a test can assert it
+#: against the argument actually handed to the shim.
+#:
+#: The shareability assessment does NOT read it: that classification runs on every
+#: render and must answer without spawning the server, so importing this module
+#: there would execute package code from an editable checkout on a path the
+#: sandbox never confines. It answers from ``_MANAGED_SERVERS_CALLER_AWARE`` in
+#: ``mcp_discovery`` instead, and ``test/test_mcp_managed_caller_identity.py``
+#: keeps the two from drifting by comparing them in the test process.
+ADVERTISE_CALLER_IDENTITY = True
+
+
 def run_mcp_core_server() -> None:
     """Run MCP stdio server for core agent tools."""
     run_mcp_stdio_loop(
@@ -1808,8 +2048,11 @@ def run_mcp_core_server() -> None:
         _call_tool,
         # Pooled-operation opt-in: kirocrew-core consumes the per-call
         # ``kirocrew.caller`` identity (see _resolve_session_key*), so it is
-        # safe to share one backend across sessions. kirocrew-cron does NOT
-        # advertise — its tools still read env identity, so gatewayd keeps
-        # it per-session.
-        advertise_caller_identity=True,
+        # safe to share one backend across sessions. kirocrew-cron advertises
+        # too, for the same reason. The two managed servers that do not --
+        # kirocrew-computer and kirocrew-dashboard -- are pooled all the same
+        # (nothing declines to pool an unadvertised backend; see
+        # ``rewriter.UNPOOLABLE_SERVERS``), so what they lack is the injected
+        # block, not co-tenancy.
+        advertise_caller_identity=ADVERTISE_CALLER_IDENTITY,
     )

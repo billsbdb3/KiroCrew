@@ -160,6 +160,72 @@ def test_vet_rejects_multicast_despite_is_global(host: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "embedded", ["10.0.0.1", "127.0.0.1", "192.168.1.1", "169.254.169.254"]
+)
+def test_6to4_is_refused_by_unwrapping_not_by_cpythons_table(
+    embedded: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 6to4 address is judged by the IPv4 address it carries, on every 3.x.
+
+    ``2002::/16`` entered CPython's IPv6 private table only with gh-113171
+    (3.10.14, 3.11.9, 3.12.4). On an older patch release of a version this project
+    supports, ``2002:0a00:0001::1`` reports ``is_global`` and every category flag
+    clean, while the packet is routed to ``10.0.0.1``.
+
+    The table-driven pin above lists ``2002::/16``, but on a fixed interpreter it
+    passes through ``is_private`` alone and so cannot detect a missing unwrap. This
+    drops that entry for the test's duration to reproduce the older behavior: what
+    is asserted is that the refusal comes from unwrapping the embedded address, not
+    from the interpreter agreeing with us.
+    """
+    v4 = ipaddress.ip_address(embedded)
+    sixtofour = ipaddress.ip_address(f"2002:{int(v4) >> 16:04x}:{int(v4) & 0xFFFF:04x}::1")
+    assert sixtofour.sixtofour == v4
+
+    without_6to4 = tuple(
+        net
+        for net in ipaddress._IPv6Constants._private_networks
+        if str(net) != "2002::/16"
+    )
+    monkeypatch.setattr(
+        ipaddress._IPv6Constants, "_private_networks", without_6to4, raising=True
+    )
+    # The premise: with that entry gone the interpreter now calls it public, so a
+    # check that consulted only the flags would let it through.
+    assert ipaddress.ip_address(str(sixtofour)).is_global
+
+    with pytest.raises(lu.UnfurlRejected) as exc:
+        lu.vet_unfurl_url(f"https://[{sixtofour}]/x")
+    assert exc.value.code == "blocked_url"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://\ud800.example/",
+        "https://ex\udcffample.test/",
+        "https://\udfff/",
+    ],
+)
+def test_a_host_the_resolver_cannot_encode_is_refused_not_raised(url: str) -> None:
+    """A lone surrogate in the host is a refusal, not an uncaught ``UnicodeError``.
+
+    ``getaddrinfo`` raises ``UnicodeError`` for these — a ``ValueError``, not an
+    ``OSError`` — so the fail-closed catch around the resolver missed it and the
+    exception escaped the vet. It reaches here intact because a JSON string can
+    carry an unpaired surrogate, so this is an ordinary bad input rather than a
+    contrived one: `link_meta` takes the URL from a request body, and the meetings
+    calendar takes it from a config value.
+
+    Refused rather than merely "not crashing": a host whose addresses were never
+    checked cannot be declared safe to connect to.
+    """
+    with pytest.raises(lu.UnfurlRejected) as exc:
+        lu.vet_unfurl_url(url)
+    assert exc.value.code in {"blocked_url", "invalid_url"}
+
+
+@pytest.mark.parametrize(
     "prefix",
     [
         # IPv4 special-purpose (RFC 6890 + the ones CPython classifies unevenly)
@@ -1214,20 +1280,21 @@ def test_fat_head_with_a_decoy_marker_is_a_502(monkeypatch, shape: str) -> None:
     assert (status, body) == (502, {"code": "fetch_failed"})
 
 
-#: Truncated pages that DO carry their metadata before the cut. Each names the
-#: shape that could be mis-rejected by a stricter guard.
+#: Truncated pages that DO carry their metadata before the cut, as
+#: ``(head_prefix, filler_byte, expected_title)``. Each names the shape that
+#: could be mis-rejected by a stricter guard. Only the prefix is held here: the
+#: filler past the cap is appended in the test body, because a payload built at
+#: module scope is allocated during collection and then held for the whole
+#: session by every xdist worker, including those that never run this file.
 _TRUNCATED_BUT_TITLED = {
     # `<body/>` as the sole head terminator — a byte pattern keyed on `<body[\s>]`
     # misses the self-closing form and would reject this.
-    "self_closing_body": (
-        b"<html><head><title>Ok</title><body/>" + b"A" * (lu.MAX_BODY_BYTES + 4096),
-        "Ok",
-    ),
+    "self_closing_body": (b"<html><head><title>Ok</title><body/>", b"A", "Ok"),
     # No `<title>` at all, but an `og:title` — `extract_meta` prefers og, so the
     # preview is complete and the cut is harmless.
     "og_title_only": (
-        b'<html><head><meta property="og:title" content="Via OG"><style>'
-        + b"z" * (lu.MAX_BODY_BYTES + 4096),
+        b'<html><head><meta property="og:title" content="Via OG"><style>',
+        b"z",
         "Via OG",
     ),
 }
@@ -1237,7 +1304,8 @@ _TRUNCATED_BUT_TITLED = {
 def test_truncated_page_keeps_its_preview_when_the_title_arrived(
     monkeypatch, shape: str
 ) -> None:
-    page, expected = _TRUNCATED_BUT_TITLED[shape]
+    prefix, filler, expected = _TRUNCATED_BUT_TITLED[shape]
+    page = prefix + filler * (lu.MAX_BODY_BYTES + 4096)
     _install(
         monkeypatch,
         {
@@ -1578,3 +1646,102 @@ def test_route_is_registered_on_the_app() -> None:
     lm.setup_link_meta_routes(app)
     routes = {(r.method, r.resource.canonical) for r in app.router.routes()}
     assert ("GET", "/api/link-meta") in routes
+
+
+# --- address_is_not_public: the vet for a caller holding a resolution result ---
+#
+# The channels' attachment downloads consult this instead of enumerating category
+# flags locally, so a gap here is a server-side request forgery in each of them.
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        # The two ranges every hand-rolled category-flag list has missed. Both were
+        # APPROVED by the check this function replaced in `teams/client.py`.
+        "100.64.0.1",  # RFC 6598 shared space: absent from CPython's is_private
+        "100.127.255.254",  # last usable address of the same block
+        "fec0::1",  # deprecated IPv6 site-local: reports is_global True
+        # Tunnel encodings, which that check evaluated as WRITTEN.
+        "::ffff:127.0.0.1",  # v4-mapped loopback: is_loopback is False on the wrapper
+        "::ffff:169.254.169.254",
+        "2002:0a00:0001::1",  # 6to4 naming the v4 tunnel endpoint 10.0.0.1
+        # Classics, which must stay refused.
+        "127.0.0.1",
+        "169.254.169.254",  # the cloud instance-metadata endpoint
+        "10.1.2.3",
+        "192.168.0.9",
+        "::1",
+        "fe80::1",
+        "0.0.0.0",
+        "224.0.0.1",
+        "ff02::1",
+        # Alternate IPv4 encodings the OS resolver accepts but `ipaddress` rejects,
+        # folded by `canonicalize_ip` so the verdict does not ride on getaddrinfo's
+        # reading of a string the vet declined to parse.
+        "0x7f000001",
+        "2130706433",
+        "127.1",
+    ],
+)
+def test_address_is_not_public_refuses_every_non_public_form(address: str) -> None:
+    assert lu.address_is_not_public(address) is True
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["93.184.216.34", "1.1.1.1", "8.8.8.8", "2606:4700::1111"],
+)
+def test_address_is_not_public_allows_globally_routable_addresses(address: str) -> None:
+    """A vet that refused real addresses would break every inbound attachment.
+
+    The refusal half is only half the property: this is the half that keeps the
+    fix from being a channel-wide outage.
+    """
+    assert lu.address_is_not_public(address) is False
+
+
+@pytest.mark.parametrize("address", ["", "   ", "not-an-ip", "example.com", "::gg"])
+def test_address_is_not_public_fails_closed_on_an_unreadable_value(address: str) -> None:
+    """The OPPOSITE default to :func:`_reject_if_internal_ip`, deliberately.
+
+    That function passes a non-literal through because for it a non-literal is a
+    hostname still to be resolved. Here the value is already a resolution result
+    about to reach a socket, so one that cannot be parsed must not be approved --
+    otherwise an unreadable answer reaches the pin unchecked.
+    """
+    assert lu.address_is_not_public(address) is True
+
+
+def test_the_url_vet_still_treats_a_non_literal_as_a_hostname() -> None:
+    """Pins the refactor: extracting the shared helper must not change this contract.
+
+    `_reject_if_internal_ip` returning silently for a hostname is what lets
+    `vet_unfurl_url` fall through to its DNS branch. If the extraction had given it
+    the fail-closed default, every named host would be refused.
+    """
+    lu._reject_if_internal_ip("example.com")  # must not raise
+    with pytest.raises(lu.UnfurlRejected) as exc:
+        lu._reject_if_internal_ip("127.0.0.1")
+    assert exc.value.code == "blocked_url"
+
+
+@pytest.mark.parametrize("address", ["100.64.0.1", "fec0::1"])
+def test_the_replaced_category_flag_list_would_have_approved_these(address: str) -> None:
+    """Proves the finding's premise rather than assuming it.
+
+    Reconstructs the exact six-flag check `teams/client.py::_vet_resolved_address`
+    used to run and shows it says "fine" for both ranges. Without this, a future
+    reader cannot tell whether the delegation fixed a real hole or was cosmetic.
+    """
+    ip = ipaddress.ip_address(address)
+    old_verdict = (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+    assert old_verdict is False, "the old check already caught this; premise is wrong"
+    assert lu.address_is_not_public(address) is True

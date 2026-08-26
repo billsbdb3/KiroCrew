@@ -9,11 +9,17 @@ refused because a session-sharing subagent would misattribute to its parent).
 Rather than invent a per-process identity source, these tools stay STATELESS:
 the tool VALIDATES its arguments and returns a *directive* — a human-readable
 confirmation line plus a machine-readable marker carrying the validated payload
-(and NO session key). The session-aware consumer that processes the tool result
-(:func:`dashboard.chat_runner._run_chat`'s ``EVENT_TOOL_RESULT`` handler, which
-runs for every interactive surface and owns ``slot.key``) decodes the marker and
-applies the effect against ITS OWN session, then strips the marker from the
-stored transcript.
+(and NO session key). A session-aware consumer that processes the tool result
+decodes the marker and applies the effect against ITS OWN session, then keeps
+the marker out of what it stores or renders. There are TWO consumers, one per
+turn loop: :func:`dashboard.chat_runner._run_chat`'s ``EVENT_TOOL_RESULT``
+handler (the dashboard-driven surfaces, which own ``slot.key``), and
+:class:`messaging.driver.TurnDriver` (the standalone channel transports —
+Telegram, Discord, standalone Slack, iMessage, Teams, Webex, WeCom, Weixin —
+whose dispatchers inject a consumer bound to the turn's session key via
+``messaging.dispatch.build_directive_consumer``). Both funnel into
+``dashboard.session_directive_apply.apply_session_directive``, so the security
+boundaries live in one place.
 
 Subagent isolation is therefore STRUCTURAL, not cryptographic: a subagent's
 tool result flows through the subagent's own runner, so it can only ever bind to
@@ -85,6 +91,18 @@ _SENTINEL = "[[KIROCREW_SESSION_DIRECTIVE]]"
 # above this bound instead, leaving headroom under the transport cap.
 MAX_DIRECTIVE_CHARS = 3800
 
+# Stamped on an oversized :func:`encode` result INSTEAD of the directive marker,
+# so the consumer can tell a deliberate refusal apart from a marker that was lost
+# in transport. Both cases decode to "no directive", but only the second is a
+# bug, and the consumer's diagnostic for a lost marker is a WARNING that exists
+# to catch rawOutput-envelope escaping regressions — a by-design refusal firing
+# it trains operators to ignore the one signal that matters.
+#
+# Forgery-inert by construction: unlike the directive marker this token carries
+# no payload and grants no effect, so a model emitting the literal bytes can only
+# change how a log line reads, never what gets applied.
+_REFUSAL_SENTINEL = "[[KIROCREW_SESSION_DIRECTIVE_REFUSED]]"
+
 
 def encode(kind: str, args: dict[str, Any], human: str) -> str:
     """Build a tool-result string: a human confirmation + the directive marker.
@@ -93,9 +111,11 @@ def encode(kind: str, args: dict[str, Any], human: str) -> str:
     payload the consumer needs to apply the effect (never a session key).
 
     When the encoded directive would exceed :data:`MAX_DIRECTIVE_CHARS`, returns a
-    plain ``"Error: …"`` string carrying NO marker: the caller returns it to the
-    model verbatim, so an oversized request fails LOUDLY (and is audited failed)
-    instead of being silently truncated past its marker and dropped.
+    plain ``"Error: …"`` string carrying NO directive marker: the caller returns it
+    to the model verbatim, so an oversized request fails LOUDLY (and is audited
+    failed) instead of being silently truncated past its marker and dropped. The
+    refusal is tagged with :data:`_REFUSAL_SENTINEL` so the consumer reports it as
+    a refusal rather than as a lost marker (see :func:`is_refusal`).
     """
     payload = json.dumps({"kind": kind, "args": args}, separators=(",", ":"), default=str)
     out = f"{human}\n{_SENTINEL}{payload}"
@@ -104,9 +124,21 @@ def encode(kind: str, args: dict[str, Any], human: str) -> str:
             f"Error: {kind} arguments are too large to deliver "
             f"({len(out)} chars, limit {MAX_DIRECTIVE_CHARS}). Shorten them "
             "(e.g. a briefer message / fewer items) and call the tool again — "
-            "nothing was applied."
+            f"nothing was applied.\n{_REFUSAL_SENTINEL}"
         )
     return out
+
+
+def is_refusal(text: str | None) -> bool:
+    """True iff *text* is an :func:`encode` refusal — a validated directive that
+    was deliberately NOT emitted because its payload exceeded
+    :data:`MAX_DIRECTIVE_CHARS`.
+
+    Distinguishes "refused before delivery, and the model was told" from "a marker
+    was expected and did not arrive", which are otherwise indistinguishable at the
+    consumer: both decode to ``None``.
+    """
+    return bool(text) and _REFUSAL_SENTINEL in (text or "")
 
 
 def decode(text: str, expected_tool: str) -> dict[str, Any] | None:
@@ -152,9 +184,36 @@ def match_tool(raw: str) -> str:
     return ""
 
 
+def directive_tool_for(mcp_server_name: str, tool_name: str) -> str:
+    """Return the directive-tool name for a recorded tool CALL, or ``""``.
+
+    THE forgery-gate identity predicate, spelled once: a directive-tool name is
+    honoured ONLY when the call's trusted ``_meta.kiro`` identity says it was
+    served by Kiro Crew's OWN core MCP server (:data:`CORE_MCP_SERVER`) AND its
+    CANONICAL tool name resolves to a :data:`DIRECTIVE_TOOLS` member via
+    :func:`match_tool`. Both ``EVENT_TOOL_CALL`` consumers (the dashboard's
+    ``chat_runner`` and ``messaging.driver.TurnDriver``) MUST call this instead
+    of inlining the two checks, so the boundary cannot silently diverge.
+
+    Both arguments MUST come from the out-of-band ``_meta.kiro`` channel
+    (``mcpServerName`` / ``toolName``) — never the LLM-authored title. A shell
+    tool has no MCP server name and a canonical tool name like
+    ``execute_bash``, so it resolves to ``""``; so does a third-party MCP
+    server that merely exposes a tool named e.g. ``monitor_start``. Absent
+    identity (empty server name) fails closed.
+    """
+    if mcp_server_name != CORE_MCP_SERVER:
+        return ""
+    return match_tool(tool_name or "")
+
+
 def strip_marker(text: str) -> str:
-    """Remove the directive marker line from *text* for transcript display."""
-    idx = text.find(_SENTINEL)
+    """Remove the directive or refusal marker line from *text* for transcript display."""
+    idx = -1
+    for sentinel in (_SENTINEL, _REFUSAL_SENTINEL):
+        found = text.find(sentinel)
+        if found >= 0 and (idx < 0 or found < idx):
+            idx = found
     if idx < 0:
         return text
     # Drop the marker and any immediately-preceding blank separator line.

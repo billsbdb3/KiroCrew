@@ -42,7 +42,6 @@ be called straight from a coroutine without failing the suite.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -52,7 +51,6 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, TypedDict
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 # ``kiro_crew.agent`` is imported as a MODULE, not as symbols: the agents dir and
@@ -60,10 +58,11 @@ from uuid import uuid4
 # path) can substitute them. ``from ... import f`` would freeze this module's own
 # binding.
 from kiro_crew import agent as _agent
-from kiro_crew import hooks as _hooks
 from kiro_crew.acp.client import AcpClient
 from kiro_crew.agent_files import AGENT_FILENAME, OWNED_KIRO_AGENT_FILES
 from kiro_crew.config.loader import data_home
+from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.mcp_grant import grant_observed
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.security import oauth_url_contains_credential
 from kiro_crew.sel import sel
@@ -91,16 +90,6 @@ _MINT_SPEC_ORPHAN_SECONDS = _MINT_TTL_SECONDS * 2
 # Serializes this process's manifest read-modify-writes.
 _MINT_MANIFEST_LOCK = threading.Lock()
 
-# kiro-cli's MCP OAuth artifact directory, and the paired suffixes it writes per
-# authorized server.
-_KIRO_OAUTH_CACHE_RELATIVE = (".aws", "sso", "cache")
-_TOKEN_SUFFIX = ".token.json"
-_REGISTRATION_SUFFIX = ".registration.json"
-_DEFAULT_HTTPS_PORT = 443
-# SEL label for the grant-presence stat, registered in
-# ``hooks._AUDIT_ONLY_READ_IDS``. Emitting with an unregistered id records nothing.
-_GRANT_PRESENCE_READ_ID = "connections_mint.oauth_grant_presence"
-
 
 class MintState(TypedDict, total=False):
     """A mint's row. The holdings are released on teardown, never served."""
@@ -118,7 +107,7 @@ class MintState(TypedDict, total=False):
 
 
 _mints: dict[str, MintState] = {}
-_mints_lock = asyncio.Lock()
+_mints_lock = LoopBoundLock()
 
 
 def _new_mint_token() -> str:
@@ -134,82 +123,9 @@ def _new_mint_token() -> str:
     return uuid4().hex
 
 
-def kiro_oauth_cache_dir(*, home: Path | None = None) -> Path:
-    """The directory kiro-cli writes MCP OAuth artifacts into."""
-    return (home or Path.home()).joinpath(*_KIRO_OAUTH_CACHE_RELATIVE)
-
-
-def grant_key(mcp_url: str) -> str:
-    """kiro-cli's cache key for ``mcp_url``.
-
-    Mirrors ``mcp_client::oauth_util::compute_key``: sha256 over the URL's ASCII
-    origin serialization concatenated with its path. The default HTTPS port is
-    omitted and an empty path normalizes to ``/`` -- both are what the Rust
-    ``url`` crate does before hashing, and getting either wrong makes the key
-    miss, which reports a granted provider as ungranted.
-    """
-    parts = urlsplit(mcp_url)
-    origin = f"{parts.scheme.lower()}://{(parts.hostname or '').lower()}"
-    if parts.port is not None and parts.port != _DEFAULT_HTTPS_PORT:
-        origin = f"{origin}:{parts.port}"
-    return hashlib.sha256(f"{origin}{parts.path or '/'}".encode("utf-8")).hexdigest()
-
-
-def grant_present(mcp_url: str, *, cache_dir: Path | None = None) -> bool:
-    """Whether kiro-cli holds a persisted grant for ``mcp_url``.
-
-    Presence only: the paired artifacts are stat-ed and never opened, so token
-    material cannot reach this process. Both must exist -- a lone token file also
-    matches the single-file SSO naming this directory mixes in.
-
-    Blocking: the stats are sub-millisecond against a local home but stall for as
-    long as the mount does against a network-mounted one, so async callers run this
-    through ``asyncio.to_thread`` rather than on the event loop.
-    """
-    directory = cache_dir if cache_dir is not None else kiro_oauth_cache_dir()
-    key = grant_key(mcp_url)
-    return (directory / f"{key}{_TOKEN_SUFFIX}").is_file() and (
-        directory / f"{key}{_REGISTRATION_SUFFIX}"
-    ).is_file()
-
-
 def _acp_client_factory() -> Any:
     """Indirection so tests can substitute a fake client class."""
     return AcpClient
-
-
-async def _grant_observed(mcp_url: str) -> bool:
-    """:func:`grant_present` off the loop, SEL-audited when a grant is observed.
-
-    Audited on the TRUE result only, and deliberately NOT once per stat. The
-    watcher polls every ``_MINT_GRANT_POLL_SECONDS`` for up to the TTL, so a
-    per-stat audit would write up to ``_MINT_TTL_SECONDS //
-    _MINT_GRANT_POLL_SECONDS`` events for a single flow, each one synchronous by
-    design (``hooks._emit_internal_read_audit`` marks the event critical so it
-    drains the queue and cannot be silently lost). A negative poll observed
-    nothing and changed nothing; the access that owes a trail is the one a caller
-    ACTS on -- it moves a row to ``granted`` or short-circuits a Connect -- and
-    that one is recorded.
-
-    Best-effort, NOT fail-closed, which is a deliberate departure from
-    :func:`hooks.safe_read_file_internal`. That gate denies on an unrecordable
-    audit because a success there hands back live credential BYTES; nothing
-    sensitive crosses this boundary at all -- the artifacts are stat-ed, never
-    opened -- so denying would convert an SEL outage into a Connect that never
-    completes after the user actually consented. An unaudited boolean is the
-    lesser failure, and it still leaves a warning behind.
-    """
-    present = await asyncio.to_thread(grant_present, mcp_url)
-    if present:
-        recorded = await asyncio.to_thread(
-            _hooks.emit_internal_read_audit, _GRANT_PRESENCE_READ_ID, "success"
-        )
-        if not recorded:
-            logger.warning(
-                "grant-presence audit for %r could not be recorded; proceeding unaudited",
-                mcp_url,
-            )
-    return present
 
 
 def _mint_spec_name(alias: str) -> str:
@@ -540,7 +456,7 @@ async def _mint_watcher(slug: str, mcp_url: str, token: str) -> None:
         deadline = time.monotonic() + _MINT_TTL_SECONDS
         while time.monotonic() < deadline:
             await asyncio.sleep(_MINT_GRANT_POLL_SECONDS)
-            if await _grant_observed(mcp_url):
+            if await grant_observed(mcp_url):
                 doomed: MintState | None = None
                 async with _mints_lock:
                     entry = _mints.get(slug)
@@ -610,6 +526,38 @@ async def reserve_mint_row(slug: str) -> tuple[str, MintState | None]:
     return token, prior
 
 
+async def cancel_mint(slug: str, token: str | None = None) -> bool:
+    """Withdraw ``slug``'s in-flight mint, releasing the process it holds.
+
+    Returns True when a row was dropped. The card calls this on Cancel: without
+    it a cancelled mint's dedicated kiro-cli process, its loopback listener and
+    its ephemeral spec stay held until the TTL expires or a later Connect
+    supersedes the row -- a real leak for a flow the user just abandoned.
+
+    ``token`` fences a stale tab. The table is keyed by slug, so a sibling tab
+    connecting the same provider REPLACES the row; a cancel carrying the caller's
+    own row token refuses to dispose a row that is no longer theirs. A cancel
+    with no token disposes whatever row is current -- a caller that never held a
+    token cannot distinguish rows, so its intent is only "cancel this provider".
+
+    Disposal runs OUTSIDE the table lock, for the reason ``reserve_mint_row``
+    hands its displaced row back rather than disposing under the lock: a wedged
+    teardown waits up to the shutdown timeout, and holding the table that long
+    stalls Connect for every other provider.
+    """
+    async with _mints_lock:
+        entry = _mints.get(slug)
+        if entry is None:
+            return False
+        if token is not None and entry.get("token") != token:
+            return False
+        _mints.pop(slug, None)
+        doomed = entry
+    await _dispose_mint(doomed)
+    await asyncio.to_thread(_log_mint_outcome, slug, "ok", "reason=cancelled")
+    return True
+
+
 def _claim_mint_pid(client: Any, holdings: MintState) -> bool:
     """Shield the mint's child PID from the orphan sweep. Idempotent.
 
@@ -659,7 +607,7 @@ async def start_oauth_mint(
     # aged orphans. Off-loop: it reads and rewrites the manifest, and may unlink.
     await asyncio.to_thread(_sweep_mint_specs)
 
-    if await _grant_observed(mcp_url):
+    if await grant_observed(mcp_url):
         # Consent already exists (a reconnect): no URL is needed.
         async with _mints_lock:
             if _mints.get(slug, {}).get("token") == my_token:
@@ -670,7 +618,12 @@ async def start_oauth_mint(
                 }
         # Every POST logs outcome=started, so every path has to log a completion or
         # the audit trail shows starts that never finished.
-        await asyncio.to_thread(_log_mint_outcome, slug, "ok", "reason=already_granted")
+        await asyncio.to_thread(
+            _log_mint_outcome,
+            slug,
+            "ok",
+            "reason=already_granted",
+        )
         return
 
     # Accumulates what this flow owns, so every exit path releases all of it.
@@ -700,7 +653,9 @@ async def start_oauth_mint(
         # sweep reaps it once it ages past the spawn grace. Waiting for readiness
         # would leave that whole initialization window -- up to the readiness
         # timeout -- open to the sweep killing a mint that is still starting.
-        claim = asyncio.get_running_loop().create_task(_claim_mint_pid_when_spawned(client, holdings))
+        claim = asyncio.get_running_loop().create_task(
+            _claim_mint_pid_when_spawned(client, holdings)
+        )
         try:
             await asyncio.wait_for(client.ensure_ready(), timeout=_MINT_READY_TIMEOUT_SECONDS)
         finally:
@@ -780,7 +735,15 @@ async def start_oauth_mint(
         if entry_missing:
             await asyncio.to_thread(_log_mint_outcome, slug, "error", "reason=mint_server_absent")
         else:
-            await asyncio.to_thread(_log_mint_outcome, slug, "ok", f"url_minted={bool(oauth_url)}")
+            # ``url_minted`` records whether the spawn produced an approval URL
+            # or found no challenge (an open endpoint, or a grant that landed
+            # concurrently) -- the route is derivable from it and ``reason``.
+            await asyncio.to_thread(
+                _log_mint_outcome,
+                slug,
+                "ok",
+                f"url_minted={bool(oauth_url)}",
+            )
     except Exception as exc:  # noqa: BLE001 — background task; record, never raise
         logger.warning("OAuth mint for %r failed: %s", slug, type(exc).__name__)
         await _dispose_mint(holdings)

@@ -101,6 +101,43 @@ class TestLifecycle:
         assert client._closed is True
         assert client._task is None
 
+    @pytest.mark.asyncio
+    async def test_close_closes_session_even_when_ws_close_raises(self, client) -> None:
+        """A websocket whose transport is already broken raises on close();
+        that must not take the session close down with it (issue #4627)."""
+
+        class _BadWS(_FakeWS):
+            async def close(self) -> None:
+                raise RuntimeError("transport already broken")
+
+        ws = _BadWS()
+        session = _FakeSession()
+        client._ws = ws  # type: ignore[assignment]
+        client._session = session  # type: ignore[assignment]
+        await client.close()
+        assert client._closed is True
+        assert session.closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_closes_session_even_when_task_died_with_a_bug(self, client) -> None:
+        """A task already dead from an uncaught, non-CancelledError exception
+        makes ``task.cancel()`` a no-op, and re-``await``ing it re-raises that
+        exception -- which must not skip the session close (issue #4627)."""
+        session = _FakeSession()
+        client._session = session  # type: ignore[assignment]
+
+        async def _buggy_loop() -> None:
+            raise ValueError("malformed frame")
+
+        client._task = asyncio.create_task(_buggy_loop())
+        await asyncio.sleep(0)  # let the task actually finish before close()
+
+        with pytest.raises(ValueError, match="malformed frame"):
+            await client.close()
+
+        assert client._task is None
+        assert session.closed is True
+
 
 class _FakeSession:
     def __init__(self) -> None:
@@ -155,8 +192,19 @@ class TestRunLoop:
     async def test_long_lived_connection_resets_the_backoff(
         self, client, no_sleep, monkeypatch
     ) -> None:
-        clock = iter([0.0, 100.0, 200.0, 200.0])
-        monkeypatch.setattr(client_mod.time, "monotonic", lambda: next(clock))
+        # A fixed-length iterator standing in for a monotonic clock is a trap:
+        # the loop reads it an implementation-defined number of times, and once
+        # the values run out `next()` raises StopIteration inside a coroutine,
+        # which PEP 479 surfaces as `RuntimeError: generator raised
+        # StopIteration` -- an error that names neither the clock nor this test.
+        # Hold the final value instead, so the scripted timeline is unchanged
+        # but the clock can be read any number of times.
+        scripted = [0.0, 100.0, 200.0, 200.0]
+
+        def _monotonic() -> float:
+            return scripted.pop(0) if len(scripted) > 1 else scripted[0]
+
+        monkeypatch.setattr(client_mod.time, "monotonic", _monotonic)
         calls = {"n": 0}
 
         async def _serve() -> None:

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
-import { Download, X } from 'lucide-react'
+import { AlertTriangle, Download, Loader2, X } from 'lucide-react'
 
 import { i18nT } from '../i18n/t'
 import type { UpdateState } from '../hooks/useUpdateSubscription'
@@ -57,6 +57,28 @@ export default function UpdateModal() {
   // unexplained quit — which reads as a crash.
   const installing = installMutation.isPending || installMutation.isSuccess
 
+  // A dispatched install normally ends in the app quitting, so isSuccess is a
+  // fine proxy for "about to restart" -- EXCEPT when the main process aborts
+  // the handoff (stage invalidated mid-dispatch) and the app keeps running.
+  // Without a reset, the stale isSuccess keeps `installing` true forever: the
+  // next downloaded version reopens this modal with every button disabled and
+  // no way out short of a reload. The dispatch is only "still live" while the
+  // state is 'installing' or 'downloaded' FOR THE VERSION the user clicked
+  // (tracked below) -- keying on the version matters because the IPC
+  // resolution can land after the abort/supersede states have already been
+  // pushed, at which point a bare state check reads the NEW version's
+  // 'downloaded' as the old dispatch still running.
+  const [installFor, setInstallFor] = useState<string | undefined>(undefined)
+  const state = update?.state
+  const stateVersion = update?.version
+  useEffect(() => {
+    if (!installMutation.isSuccess) return
+    const dispatchStillLive = state === 'installing'
+      || (state === 'downloaded' && stateVersion === installFor)
+    if (!dispatchStillLive) installMutation.reset()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reset identity is stable; keying on state transition
+  }, [state, stateVersion, installFor, installMutation.isSuccess])
+
   const open = !!update && update.state === 'downloaded' && !update.replayed && !dismissed
 
   // Escape dismisses the modal (unless an install is in flight), matching the
@@ -69,6 +91,58 @@ export default function UpdateModal() {
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [open, installing])
+
+  // A live 'installing' push takes over the whole screen: the gateway is
+  // being stopped ON PURPOSE, so every surface underneath is about to look
+  // dead (offline pill, failed requests) — hiding them is the point. There is
+  // deliberately no dismiss affordance and no Escape handling: the app
+  // relaunches itself on success.
+  //
+  // A FAILED install must not simply unmount this surface: the user is
+  // staring at a full-screen "Installing update…" and nothing else, so a
+  // silent vanish leaves them unable to tell failed from succeeded (the
+  // detailed failure card lives in Settings > About, which nothing points
+  // them at). Render the failure in place instead, on the same surface, with
+  // a dismiss affordance — the gateway is being restored by the main process
+  // (onInstallFailed), so dismissing returns to a working dashboard.
+  const installFailed = update?.state === 'error' && update.phase === 'install'
+  if ((update?.state === 'installing' || installFailed) && !dismissed) {
+    return (
+      <div
+        className="fixed inset-0 z-[100] bg-bg/95 backdrop-blur-md flex flex-col items-center justify-center gap-3 animate-rise"
+        role="alert"
+        aria-busy={!installFailed}
+        aria-label={i18nT(installFailed
+          ? 'components.updateModal.install_failed'
+          : 'components.updateModal.installing_update')}
+      >
+        {installFailed ? (
+          <>
+            <span className="text-3xl text-danger"><AlertTriangle className="lucide-inline" /></span>
+            <div className="text-lg font-bold text-text-strong">{i18nT('components.updateModal.install_failed')}</div>
+            <p className="text-sm text-muted max-w-sm text-center px-6">
+              {i18nT('components.updateModal.install_failed_body')}
+            </p>
+            <button
+              type="button"
+              className="mt-1 px-3 py-1.5 text-sm rounded-md bg-accent text-accent-fg hover:opacity-90 cursor-pointer"
+              onClick={() => setDismissed(true)}
+            >
+              {i18nT('components.updateModal.back_to_dashboard')}
+            </button>
+          </>
+        ) : (
+          <>
+            <span className="text-3xl text-accent"><Loader2 className="lucide-inline animate-spin" /></span>
+            <div className="text-lg font-bold text-text-strong">{i18nT('components.updateModal.installing_update')}</div>
+            <p className="text-sm text-muted max-w-sm text-center px-6">
+              {i18nT('components.updateModal.installing_update_body')}
+            </p>
+          </>
+        )}
+      </div>
+    )
+  }
 
   if (!open) return null
 
@@ -132,7 +206,7 @@ export default function UpdateModal() {
           <button
             type="button"
             className="px-3 py-1.5 text-sm rounded-md bg-accent text-accent-fg hover:opacity-90 cursor-pointer disabled:opacity-50"
-            onClick={() => installMutation.mutate()}
+            onClick={() => { setInstallFor(update!.version); installMutation.mutate() }}
             disabled={installing}
           >
             {installing ? i18nT('components.updateModal.restarting') : i18nT('components.updateModal.restart_update')}

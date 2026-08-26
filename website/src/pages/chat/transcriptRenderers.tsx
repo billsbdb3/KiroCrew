@@ -23,7 +23,7 @@ import ThinkingBlock from './ThinkingBlock'
 import ToolCallLine from './ToolCallLine'
 import StopEventCard from './StopEventCard'
 import NudgeCard, { nudgeMatchesLoop } from './NudgeCard'
-import RecoveryCard, { parseRecoveryMessage } from './RecoveryCard'
+import RecoveryCard, { resolveInjectCard } from './RecoveryCard'
 import { ErrorCard } from './ErrorCard'
 import WorkflowRunCard, { extractWorkflowRunId, isWorkflowRunTool } from './WorkflowRunCard'
 import SubagentRunCard, { extractSpawnRunLaunch, isSpawnRunTool } from './SubagentRunCard'
@@ -112,7 +112,7 @@ export function createTranscriptRenderers(
       id: 'subagent_completion',
       roles: ['*'],
       match: isSubagentCompletionMessage,
-      render: (m, ctx) => (
+      render: (m, ctx) => ctx.row(
         <SubagentCompletionCard
           key={ctx.key}
           message={m}
@@ -120,7 +120,8 @@ export function createTranscriptRenderers(
           onFolderOpen={o.onFolderOpen}
           disclosureKey={ctx.key}
           onOpenPanel={o.onOpenSubagentPanel}
-        />
+        />,
+        true,
       ),
     },
 
@@ -137,9 +138,7 @@ export function createTranscriptRenderers(
         // The match already proved this, but a null here must draw the generic
         // line rather than crash the row.
         if (!runId) return toolLine(m, ctx)
-        // No ctx.row: this card lays out its own full-width row (it sets
-        // --mc-content-width itself), so wrapping it would double the padding.
-        return <WorkflowRunCard key={ctx.key} runId={runId} message={m} slot={o.slot} />
+        return ctx.row(<WorkflowRunCard key={ctx.key} runId={runId} message={m} slot={o.slot} />, true)
       },
     },
     {
@@ -149,7 +148,7 @@ export function createTranscriptRenderers(
       render: (m, ctx) => {
         const launch = extractSpawnRunLaunch(m)
         if (!launch) return toolLine(m, ctx)
-        return <SubagentRunCard key={ctx.key} launch={launch} slot={o.slot} />
+        return ctx.row(<SubagentRunCard key={ctx.key} launch={launch} slot={o.slot} />, true)
       },
     },
     {
@@ -206,13 +205,19 @@ export function createTranscriptRenderers(
         ),
     },
     {
-      // Refines `inject`: a synthetic turn-recovery injection is a one-line
-      // card, not the cron-notification bubble the default draws.
+      // Refines `inject`: a gateway-authored injection is a one-line card, not
+      // the cron-notification bubble the default draws.
+      //
+      // Matched via the SHARED resolver rather than the recovery parser alone, so
+      // this registry (ChatPane, SideChat, ChatEmbed) makes the same decision
+      // ChatPage does. Gating only on a recognised recovery marker left every
+      // other injected shape — the sub-agent synthesis prompt included — falling
+      // through to the SDK default, which paints raw machine prose as a bubble.
       id: 'recovery_inject',
       roles: ['inject'],
-      match: m => parseRecoveryMessage(m.content) !== null,
+      match: m => resolveInjectCard(m) !== null,
       render: (m, ctx) => {
-        const parsed = parseRecoveryMessage(m.content)
+        const parsed = resolveInjectCard(m)
         if (!parsed) return null
         return ctx.row(<RecoveryCard parsed={parsed} disclosureKey={ctx.key} />)
       },
@@ -223,14 +228,15 @@ export function createTranscriptRenderers(
       id: 'workflow_completion',
       roles: ['assistant'],
       match: isWorkflowCompletionMessage,
-      render: (m, ctx) => (
+      render: (m, ctx) => ctx.row(
         <WorkflowCompletionCard
           key={ctx.key}
           message={m}
           onFileOpen={o.onFileOpen}
           onFolderOpen={o.onFolderOpen}
           disclosureKey={ctx.key}
-        />
+        />,
+        true,
       ),
     },
     {

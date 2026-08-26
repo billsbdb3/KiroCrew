@@ -7,6 +7,7 @@ import {
   CircleSlash,
   ExternalLink,
   GitPullRequest,
+  Link2,
   Lock,
   MessageSquare,
   Milestone as MilestoneIcon,
@@ -231,14 +232,19 @@ function IssueBody({
     <div>
       {source.linkedChanges.map((change, index) => {
         const changeUrl = safeExternalUrl(change.url)
-        const marker = change.provider === 'github' ? '#' : '!'
+        const isJiraLink = change.provider === 'jira'
+        const marker = isJiraLink ? '' : change.provider === 'github' ? '#' : '!'
+        const identifier = isJiraLink ? (change.issueKey || `${change.number}`) : `${marker}${change.number}`
         const content = (
           <>
-            <GitPullRequest className="lucide-inline text-muted shrink-0 mt-0.5" aria-hidden="true" />
+            {isJiraLink
+              ? <Link2 className="lucide-inline text-muted shrink-0 mt-0.5" aria-hidden="true" />
+              : <GitPullRequest className="lucide-inline text-muted shrink-0 mt-0.5" aria-hidden="true" />}
             <div className="min-w-0 flex-1">
               <div className="text-[13px] font-medium text-text truncate">{change.title || i18nT('components.issuePanel.untitled')}</div>
               <div className="flex items-center gap-2 mt-1 text-[11px] text-muted">
-                <span className="shrink-0">{marker}{change.number}</span>
+                {change.relation && <span className="shrink-0 italic">{change.relation}</span>}
+                <span className="shrink-0">{identifier}</span>
                 {change.state && <span className="capitalize shrink-0">{change.state.toLowerCase()}</span>}
               </div>
             </div>

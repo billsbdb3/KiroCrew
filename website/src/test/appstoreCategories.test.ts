@@ -1,7 +1,16 @@
 import { describe, it, expect } from 'vitest'
 import { categoryFor, categoryCounts } from '../components/appstore/categories'
 import { gradientFor } from '../components/appstore/gradient'
-import { sourceLabel, isVerified, normalizeInstalledApp, normalizeRegistryApp, stringList, type InstalledApp, type RegistryApp } from '../components/appstore/types'
+import {
+  sourceLabel,
+  isVerified,
+  isRegistrySourced,
+  normalizeRegistryApp,
+  normalizeInstalledApp,
+  normalizeInstalledApps,
+  type InstalledApp,
+  type RegistryApp,
+} from '../components/appstore/types'
 import { pickFeatured } from '../pages/AppsPage'
 
 const app = (over: Partial<RegistryApp>): RegistryApp => ({
@@ -134,6 +143,55 @@ describe('provenance helpers', () => {
   })
 })
 
+describe('isRegistrySourced', () => {
+  it('reads the registry: prefix the gateway records on a cloned app', () => {
+    expect(isRegistrySourced({ source: 'registry:secretary' })).toBe(true)
+    expect(isRegistrySourced({ source: 'registry:secretary', origin: 'local' })).toBe(true)
+  })
+
+  it('treats a directory install as local however the path is spelled', () => {
+    expect(isRegistrySourced({ source: '/home/u/apps/orchestrator-switch' })).toBe(false)
+    // A path that merely CONTAINS the word must not read as a registry ref —
+    // only the prefix the gateway writes counts.
+    expect(isRegistrySourced({ source: '/home/u/registry:copy' })).toBe(false)
+    expect(isRegistrySourced({ source: 'C:\\apps\\orchestrator-switch' })).toBe(false)
+  })
+
+  it('falls back to origin for a record written before source was stored', () => {
+    expect(isRegistrySourced({ origin: 'registry' })).toBe(true)
+    expect(isRegistrySourced({ origin: 'local' })).toBe(false)
+    expect(isRegistrySourced({})).toBe(false)
+    // A stored source always wins over origin — it is the value the backend's
+    // own update branch reads.
+    expect(isRegistrySourced({ source: '/srv/app', origin: 'registry' })).toBe(false)
+  })
+
+  it('survives a non-string source from an index-controlled catalog row', () => {
+    // The detail page spreads a CATALOG row into its app object when the
+    // installed-record fetch fails, and registry.py copies index keys verbatim
+    // for a row it has not installed — so `source` can arrive as an object even
+    // though the type says string. This runs inside the autoAction effect, where
+    // an unguarded startsWith throws and Sync never dispatches.
+    const objectSource = { source: { type: 'git' }, origin: 'registry' } as unknown as
+      Parameters<typeof isRegistrySourced>[0]
+    expect(() => isRegistrySourced(objectSource)).not.toThrow()
+    expect(isRegistrySourced(objectSource)).toBe(true)
+
+    // With no usable origin either, it must answer false (treat as path-installed
+    // and let the update endpoint report the real problem) rather than throw.
+    const noOrigin = { source: { type: 'git' } } as unknown as
+      Parameters<typeof isRegistrySourced>[0]
+    expect(() => isRegistrySourced(noOrigin)).not.toThrow()
+    expect(isRegistrySourced(noOrigin)).toBe(false)
+
+    for (const bad of [42, true, [], {}]) {
+      const app = { source: bad } as unknown as Parameters<typeof isRegistrySourced>[0]
+      expect(() => isRegistrySourced(app)).not.toThrow()
+      expect(isRegistrySourced(app)).toBe(false)
+    }
+  })
+})
+
 describe('server-computed trust fields (issue #580)', () => {
   it('isVerified prefers the server verified field over client derivation', () => {
     // Server verified:false wins over a spoofed author/origin — the server
@@ -238,23 +296,119 @@ describe('normalizeRegistryApp', () => {
   })
 })
 
+describe('normalizeInstalledApp', () => {
+  it('supplies a manifest and its lists for a record that has none', () => {
+    // /api/apps mirrors on-disk records, so a hand-written or older app can
+    // arrive with no manifest at all. Every render site indexes these lists.
+    const out = normalizeInstalledApp({ name: 'bare', version: '1.0.0' } as unknown as InstalledApp)
+    expect(out.manifest).toBeTruthy()
+    expect(out.manifest.agents).toEqual([])
+    expect(out.manifest.skills).toEqual([])
+    expect(out.manifest.sops).toEqual([])
+    expect(out.manifest.crons).toEqual([])
+    expect(out.manifest.tags).toEqual([])
+    expect(out.manifest.jobFamilies).toEqual([])
+    expect(out.manifest.screenshots).toEqual([])
+    expect(out.manifest.highlights).toEqual([])
+    // The reads the Apps page and the detail page make, without a gate.
+    expect(() => out.manifest.agents.map(a => a.split('/').pop()).join(', ')).not.toThrow()
+    expect(() => out.manifest.crons.map(c => c.name).join(', ')).not.toThrow()
+  })
+
+  it('coerces every art field, so a wrong TYPE cannot reach a render site', () => {
+    // `app.json` is JSON from disk: a field's type is no more guaranteed than its
+    // presence. Coercing here is what keeps `"iconPath": {}` from reaching a bare
+    // `startsWith` and `"screenshotsDark": {}` a bare `.map` — each of which threw
+    // on the surface that read it rather than degrading to no art.
+    const out = normalizeInstalledApp({
+      name: 'wrong-types',
+      manifest: {
+        iconUrl: {}, iconUrlDark: 1, iconPath: [], iconPathDark: true,
+        heroImage: {}, heroImageDark: 0, heroImageDetail: [], heroImageDetailDark: null,
+        repo: {}, screenshots: { 0: 'a.png' }, screenshotsDark: {},
+      },
+    } as unknown as InstalledApp)
+    const m = out.manifest
+    for (const v of [m.iconUrl, m.iconUrlDark, m.iconPath, m.iconPathDark,
+      m.heroImage, m.heroImageDark, m.heroImageDetail, m.heroImageDetailDark, m.repo]) {
+      expect(v).toBe('')
+    }
+    expect(m.screenshots).toEqual([])
+    expect(m.screenshotsDark).toEqual([])
+    // The reads the store surfaces make, without a gate.
+    expect(() => (m.iconPath as string).startsWith('/')).not.toThrow()
+    expect(() => (m.screenshotsDark as string[]).map(s => s)).not.toThrow()
+  })
+
+  it('keeps a published art field as written', () => {
+    // The coercion must not erase a legitimate value — a built-in's absolute icon
+    // and an external app's repo-relative paths both survive untouched.
+    const out = normalizeInstalledApp({
+      name: 'real-art',
+      manifest: {
+        iconUrl: '/app-assets/real/icon.svg', iconPath: 'assets/icon.webp',
+        heroImageDetail: 'assets/hero-detail.webp', repo: 'octocat/real',
+        screenshotsDark: ['assets/dark-1.webp'],
+      },
+    } as unknown as InstalledApp)
+    expect(out.manifest.iconUrl).toBe('/app-assets/real/icon.svg')
+    expect(out.manifest.iconPath).toBe('assets/icon.webp')
+    expect(out.manifest.heroImageDetail).toBe('assets/hero-detail.webp')
+    expect(out.manifest.repo).toBe('octocat/real')
+    expect(out.manifest.screenshotsDark).toEqual(['assets/dark-1.webp'])
+  })
+
+  it('keeps published list contents and every non-list manifest field', () => {
+    const out = normalizeInstalledApp({
+      name: 'real',
+      manifest: {
+        displayName: 'Real', agents: ['agents/a.json'], crons: [{ name: 'nightly' }],
+        ui: { pages: [{ route: '/apps/real', label: 'Real', icon: 'Box' }] },
+      },
+    } as unknown as InstalledApp)
+    expect(out.manifest.agents).toEqual(['agents/a.json'])
+    expect(out.manifest.crons).toEqual([{ name: 'nightly' }])
+    expect(out.manifest.displayName).toBe('Real')
+    expect(out.manifest.ui?.pages?.[0]?.route).toBe('/apps/real')
+  })
+
+  it('coerces mistyped lists and drops members it cannot render', () => {
+    const out = normalizeInstalledApp({
+      name: 'weird',
+      manifest: { agents: 'agents/a.json', skills: ['s.md', 7, null], crons: [{ name: 'ok' }, {}, null] },
+    } as unknown as InstalledApp)
+    expect(out.manifest.agents).toEqual([])
+    expect(out.manifest.skills).toEqual(['s.md'])
+    // A cron is only ever rendered by name, so a nameless entry is dropped
+    // rather than shown as a blank row.
+    expect(out.manifest.crons).toEqual([{ name: 'ok' }])
+  })
+
+  it('preserves fields callers carry beyond InstalledApp', () => {
+    const out = normalizeInstalledApp({ name: 'x', managed: true, _newVersion: '2.0.0' } as unknown as InstalledApp)
+    expect((out as unknown as { managed: boolean }).managed).toBe(true)
+    expect((out as unknown as { _newVersion: string })._newVersion).toBe('2.0.0')
+  })
+
+  it('passes a non-object payload through instead of inventing a record', () => {
+    // getApp() rejects on 404, but a caller that swallows the failure must not
+    // be handed a synthetic app that looks installed.
+    expect(normalizeInstalledApp(null as unknown as InstalledApp)).toBeNull()
+    expect(normalizeInstalledApps(null as unknown as InstalledApp[])).toBeNull()
+  })
+
+  it('normalizes every row of a list payload', () => {
+    const out = normalizeInstalledApps([{ name: 'a' }, { name: 'b' }] as unknown as InstalledApp[])
+    expect(out.map(a => a.manifest.agents)).toEqual([[], []])
+  })
+})
+
 describe('categoryFor — malformed tags cannot crash the storefront', () => {
   it('tolerates non-array and non-string tags', () => {
     expect(categoryFor('github' as unknown)).toBe('Other')
     expect(categoryFor([7, null, undefined] as unknown)).toBe('Other')
     expect(categoryFor([null, 'github'] as unknown)).toBe('Developer Tools')
     expect(() => categoryCounts([{ tags: 'nope' }, { tags: [1, 2] }])).not.toThrow()
-  })
-})
-
-describe('stringList', () => {
-  it('collapses truthy non-arrays to [] and drops non-string members', () => {
-    // A mistyped truthy value ('abc' || [] yields 'abc') must never reach
-    // .map at a render site; stringList is the shared coercion for that.
-    expect(stringList('abc')).toEqual([])
-    expect(stringList({ 0: 'x' })).toEqual([])
-    expect(stringList(undefined)).toEqual([])
-    expect(stringList(['a', 7, null, 'b'])).toEqual(['a', 'b'])
   })
 })
 

@@ -266,7 +266,12 @@ class TestSetProjectApplier:
         state = _FakeState()
         target = str(tmp_path)
         result = await apply_session_directive(
-            state, slot, slot.key, "set_project", {"project": target, "clear": False}
+            state,
+            slot,
+            slot.key,
+            "set_project",
+            {"project": target, "clear": False},
+            producer_is_user_facing=True,
         )
         assert slot.project == os.path.realpath(target)
         assert slot._pending_reset_history_key is not None
@@ -283,7 +288,12 @@ class TestSetProjectApplier:
             "kiro_crew.security.is_sensitive_path", lambda *a, **k: True
         )
         result = await apply_session_directive(
-            state, slot, slot.key, "set_project", {"project": str(tmp_path), "clear": False}
+            state,
+            slot,
+            slot.key,
+            "set_project",
+            {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=True,
         )
         assert "access denied" in result.lower()
         # Load-bearing: the slot was NOT repointed to the sensitive path.
@@ -294,7 +304,12 @@ class TestSetProjectApplier:
         slot = _FakeSlot(project=str(tmp_path))
         state = _FakeState()
         result = await apply_session_directive(
-            state, slot, slot.key, "set_project", {"project": "", "clear": True}
+            state,
+            slot,
+            slot.key,
+            "set_project",
+            {"project": "", "clear": True},
+            producer_is_user_facing=True,
         )
         assert slot.project == ""
         assert "cleared" in result.lower()
@@ -343,6 +358,7 @@ class TestApplierAuditAndFailSoft:
         result = await apply_session_directive(
             state, slot, "dashboard:chat-1", "set_project",
             {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=True,
         )
         assert "Project set to" in result
         assert len(sel_spy.calls) == 1
@@ -364,6 +380,7 @@ class TestApplierAuditAndFailSoft:
         result = await apply_session_directive(
             state, slot, "dashboard:chat-1", "set_project",
             {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=True,
         )
         assert result == "Error: access denied (sensitive path)."
         assert [c["outcome"] for c in sel_spy.calls] == ["denied"]
@@ -421,6 +438,7 @@ class TestApplierAuditAndFailSoft:
         result = await apply_session_directive(
             state, slot, "dashboard:chat-1", "set_project",
             {"project": "~/.aws/definitely-not-there", "clear": False},
+            producer_is_user_facing=True,
         )
         assert result == "Error: access denied (sensitive path)."
         assert probed == [], f"sensitive path was stat'ed before the deny gate: {probed!r}"
@@ -428,19 +446,17 @@ class TestApplierAuditAndFailSoft:
         assert slot.project == "/existing"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("kind", ["set_project", "suggest_followup", "ask_question"])
+    @pytest.mark.parametrize("kind", ["suggest_followup", "ask_question"])
     @pytest.mark.parametrize("session_key", ["cron:job-abc", "slack:C123.456", "sub:agent-1", ""])
     async def test_slot_targeting_directives_are_dashboard_only(
         self, kind, session_key, tmp_path, monkeypatch, sel_spy
     ):
-        """These three act on a dashboard SLOT, and the endpoints they replaced
-        rejected cron / Slack / sub-agent callers. A cron-linked slot flowing
-        through _run_chat must not have its project retargeted or get a card."""
+        """These two act on a dashboard SLOT card and require a connected
+        dashboard tab. A cron / Slack / sub-agent caller should not get a card."""
         monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
         slot = _FakeSlot(project="/original")
         state = _FakeState()
         args = {
-            "set_project": {"project": str(tmp_path), "clear": False},
             "suggest_followup": {"items": [{"title": "t", "prompt": "p"}]},
             "ask_question": {"questions": [{"question": "q", "options": [{"label": "a"}]}]},
         }[kind]
@@ -449,6 +465,90 @@ class TestApplierAuditAndFailSoft:
         assert [c["outcome"] for c in sel_spy.calls] == ["denied"]
         # No effect landed on the slot.
         assert slot.project == "/original"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "session_key", ["telegram:kirocrew:direct:123:gen1", "slack:C123.456", "discord:guild1:chan2"]
+    )
+    async def test_set_project_works_on_channel_sessions(
+        self, session_key, tmp_path, monkeypatch, sel_spy
+    ):
+        """set_project should apply its CWD effect on any user-facing surface
+        (Telegram, Slack, Discord) — not just dashboard. Only suggest_followup
+        and ask_question are dashboard-only (they render UI cards)."""
+        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
+        slot = _FakeSlot(project="/original")
+        state = _FakeState()
+        result = await apply_session_directive(
+            state, slot, session_key, "set_project",
+            {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=True,
+        )
+        assert "Project set to" in result
+        assert slot.project == str(tmp_path)
+        # The history-reset flag is load-bearing: it is what cold-starts the
+        # retargeted transcript. With ``linked_session_key`` unset it derives
+        # from the ``_history_key_for(slot.key)`` fallback branch of
+        # ``effective_session_key`` — the slot's own key (already
+        # ``dashboard:``-prefixed, so the helper is identity here). A
+        # channel-LINKED slot derives its linked channel key instead.
+        assert slot._pending_reset_history_key == slot.key
+        assert [c["outcome"] for c in sel_spy.calls] == ["success"]
+
+    @pytest.mark.asyncio
+    async def test_set_project_rejects_automation_using_user_destination_key(
+        self, tmp_path, monkeypatch, sel_spy
+    ):
+        """A cron/sub-agent turn borrows its destination slot and session key;
+        producer provenance must still prevent it from retargeting that slot."""
+        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
+        slot = _FakeSlot(project="/original")
+        result = await apply_session_directive(
+            _FakeState(),
+            slot,
+            "slack:C123.456",
+            "set_project",
+            {"project": str(tmp_path), "clear": False},
+            producer_is_user_facing=False,
+        )
+        assert "Error" in result and "user-facing" in result
+        assert slot.project == "/original"
+        assert [call["outcome"] for call in sel_spy.calls] == ["denied"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "session_key",
+        [
+            "cron:job-abc",
+            "cron_legacy",
+            "subagent:agent-1",
+            "taskrunner:t1",
+            "hook:h1",
+            "secretary:s1",
+            "_bg",
+            "_hb",
+            "",
+        ],
+    )
+    async def test_set_project_rejected_for_headless_callers(
+        self, session_key, tmp_path, monkeypatch, sel_spy
+    ):
+        """Callers without a user-facing surface (cron, sub-agent, task-runner,
+        hook, background, empty key — and any FUTURE key shape, since the gate
+        is a positive predicate that fails closed) must NOT retarget a slot's
+        project: a cron turn can run on a user's dashboard slot
+        (session="origin" injection) and a sub-agent shares its parent's slot,
+        so allowing them would silently repoint the user's own session."""
+        monkeypatch.setattr("kiro_crew.security.is_sensitive_path", lambda *a, **k: False)
+        slot = _FakeSlot(project="/original")
+        state = _FakeState()
+        result = await apply_session_directive(
+            state, slot, session_key, "set_project",
+            {"project": str(tmp_path), "clear": False},
+        )
+        assert "Error" in result and "user-facing" in result
+        assert slot.project == "/original"
+        assert [c["outcome"] for c in sel_spy.calls] == ["denied"]
 
     @pytest.mark.asyncio
     async def test_returned_failure_is_audited_as_error_not_success(
@@ -463,6 +563,7 @@ class TestApplierAuditAndFailSoft:
         result = await apply_session_directive(
             state, slot, "dashboard:chat-1", "set_project",
             {"project": missing, "clear": False},
+            producer_is_user_facing=True,
         )
         assert result.startswith("Error: not a directory")
         assert [c["outcome"] for c in sel_spy.calls] == ["error"]

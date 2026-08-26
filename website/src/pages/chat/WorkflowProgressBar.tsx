@@ -1,7 +1,7 @@
 import { useEffect, useMemo, memo, useState } from 'react'
 import { Workflow, Loader2, CheckCircle2, AlertCircle, ChevronDown } from 'lucide-react'
 import { useAppSelector, useAppDispatch } from '../../store'
-import { clearWorkflowRun } from '../../store/chatSlice'
+import { clearWorkflowRun, isTerminalWorkflowStatus, reconcileWorkflowRuns } from '../../store/chatSlice'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import type { WorkflowRunProgress } from '../../store/chatSlice'
 import WorkflowRunTree from '../../apps/workflows/WorkflowRunTree'
@@ -10,6 +10,7 @@ import { useRunSnapshot } from '../../apps/workflows/useRunSnapshot'
 import { runBelongsToSlot } from '../../apps/workflows/runModel'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 const EMPTY_RUNS: Record<string, WorkflowRunProgress> = {}
 // How long a finished/failed/cancelled run lingers before being dropped.
 const TERMINAL_LINGER_MS = 4000
@@ -24,6 +25,7 @@ const TERMINAL_LINGER_MS = 4000
  *  The full run snapshot (with events + source) is fetched on expand and
  *  refreshed every ~2s while the run is still running. */
 const WorkflowProgressBar = memo(function WorkflowProgressBar({ slot }: { slot: string | null }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const dispatch = useAppDispatch()
   const runs = useAppSelector(s => s.chat.workflowRuns ?? EMPTY_RUNS)
   // Only show runs launched FROM this chat session — a run sticks to the chat
@@ -73,9 +75,25 @@ const WorkflowProgressBar = memo(function WorkflowProgressBar({ slot }: { slot: 
 
   if (visible.length === 0) return null
 
+  // This band sits BETWEEN the virtualized transcript and the composer, and is
+  // not a shrinkable flex item — so an unbounded expanded body (phase tree +
+  // result + View source, easily taller than the viewport) grows the band until
+  // the composer is clipped out of view entirely. Cap it and scroll internally,
+  // the same way the sibling TaskProgressBar caps its expanded list.
+  // Applied only while something is expanded so the collapsed one-liner keeps
+  // its exact previous rendering and never shows a stray scrollbar.
+  // overscroll-contain stops a scroll that bottoms out here from chaining into
+  // the transcript behind it.
+  const anyExpanded = visible.some(r => expanded[r.run_id])
+
   return (
-    <div className="px-5 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
-      <div className="mb-1 rounded-md bg-accent/10 border border-accent/20 animate-slide-up overflow-hidden">
+    <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+      <div
+        data-testid="workflow-progress-bar"
+        className={`mb-1 rounded-md bg-accent/10 border border-accent/20 animate-slide-up ${
+          anyExpanded ? 'max-h-[45vh] overflow-y-auto overflow-x-hidden overscroll-contain' : 'overflow-hidden'
+        }`}
+      >
         {visible.map(r => (
           <ExpandableRunRow
             key={r.run_id}
@@ -110,6 +128,23 @@ function ExpandableRunRow({
   const { snapshot, error: snapshotError } = useRunSnapshot(run.run_id, {
     enabled: expanded,
   })
+
+  // The snapshot IS the authority, so a row still stored as running while its own
+  // snapshot reports a terminal status is a missed terminal frame — the header
+  // would otherwise keep spinning next to a tree that already says "finished".
+  // Routed through the same monotonic merge as the connect-time reconcile, so it
+  // can only ever advance a running row, never rewind one.
+  const dispatch = useAppDispatch()
+  const snapStatus = snapshot?.status
+  useEffect(() => {
+    if (run.status !== 'running') return
+    if (!isTerminalWorkflowStatus(snapStatus)) return
+    dispatch(reconcileWorkflowRuns([{
+      run_id: run.run_id,
+      status: snapStatus,
+      error: snapshot?.error ?? undefined,
+    }]))
+  }, [dispatch, run.run_id, run.status, snapStatus, snapshot?.error])
 
   return (
     <div className="border-b border-accent/10 last:border-b-0">

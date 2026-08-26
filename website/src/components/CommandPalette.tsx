@@ -25,6 +25,7 @@ import { useAppsProvider } from './commandPalette/providers/appsProvider'
 import { Highlighted } from './commandPalette/Highlighted'
 
 import { i18nT } from '../i18n/t'
+import { useVisualViewport } from '../hooks/useVisualViewport'
 /**
  * Search Everywhere command palette.
  *
@@ -60,7 +61,9 @@ import { i18nT } from '../i18n/t'
  * shared hook, this component registers a *window*-phase capture listener:
  * window-capture fires before document-capture, so it can
  * `stopImmediatePropagation()` those two keys before the hook's document-level
- * listener sees them.
+ * listener sees them. Because that ordering also bypasses the hook's IME
+ * guard, both intercepted branches consult the hook's shared latch (its
+ * returned `claimKey`) before acting, declining keys the IME owns.
  *
  * Highlighting renders matched indices as React `<strong>` nodes split out of
  * the title — never `dangerouslySetInnerHTML` (`frontend-security` lint rule).
@@ -109,6 +112,7 @@ export default function CommandPalette({
   openShortcuts,
   openInSplit,
 }: CommandPaletteProps) {
+  const vv = useVisualViewport()
   // P0 providers. Each is memoized inside its hook, so identities are stable.
   const all = useAllAggregator()
   const sessions = useSessionsProvider({ openInSplit })
@@ -396,7 +400,7 @@ export default function CommandPalette({
     [dispatchEnter],
   )
 
-  const { selected, setSelected, selectedRef, itemRefs } = useListKeyboardNav({
+  const { selected, setSelected, selectedRef, itemRefs, claimKey } = useListKeyboardNav({
     open,
     count: results.length,
     wrap: true,
@@ -421,10 +425,21 @@ export default function CommandPalette({
   // way the palette needs: Tab (cycle category) and ⌥/Alt+Enter (preview).
   // window-capture runs before the hook's document-capture listener, so
   // stopImmediatePropagation here keeps the hook from also acting on them.
+  // Outranking the hook also outranks its IME guard, so each choose-class
+  // branch consults the hook's own latch first via `claimKey`: a Tab the IME
+  // owns (candidate-list navigation, or the committing keydown inside the
+  // post-composition window) must not adopt the scope hint and wipe the
+  // half-composed query. A declined key is already consumed per `claimKey`'s
+  // contract — stopPropagation keeps it from the hook's document listener,
+  // and preventDefault fires only where the browser would otherwise act.
+  // Backspace is not a choose-class key (the IME consumes its own Backspace
+  // mid-composition, and the composing text keeps `queryRef` non-empty, so
+  // the branch stays inert), and needs no guard.
   useEffect(() => {
     if (!open) return
     const onWinKey = (e: KeyboardEvent) => {
       if (e.key === 'Tab') {
+        if (!claimKey(e)) return
         e.preventDefault()
         e.stopImmediatePropagation()
         // Prefix + Tab adopts the hinted scope (clearing the query); Shift+Tab
@@ -441,6 +456,7 @@ export default function CommandPalette({
         e.stopImmediatePropagation()
         setScope(null)
       } else if (e.key === 'Enter' && e.altKey && !e.metaKey && !e.ctrlKey) {
+        if (!claimKey(e)) return
         e.preventDefault()
         e.stopImmediatePropagation()
         const r = resultsRef.current
@@ -451,7 +467,7 @@ export default function CommandPalette({
     }
     window.addEventListener('keydown', onWinKey, true)
     return () => window.removeEventListener('keydown', onWinKey, true)
-  }, [open, selectedRef])
+  }, [open, selectedRef, claimKey])
 
   if (!open) return null
 
@@ -511,14 +527,28 @@ export default function CommandPalette({
 
   return createPortal(
     <div
-      className="fixed inset-0 z-[9999] flex items-start justify-center bg-bg/60 backdrop-blur-sm animate-rise"
+      // Pinned to the VISUAL viewport, not `inset-0`. A keyboard shrinks the visual
+      // viewport on every browser; only Chromium also shrinks the layout one (via
+      // `interactive-widget`), so on iOS Safari an `inset-0` overlay keeps its full
+      // height and its lower half sits behind the keyboard, unreachable. iOS also
+      // scrolls the focused input into view, which moves the visual viewport's
+      // origin -- hence the top offset as well as the height.
+      className="fixed left-0 right-0 z-[9999] flex items-start justify-center bg-bg/60 backdrop-blur-sm animate-rise"
+      style={{ top: vv.offsetTop, height: vv.height }}
       role="dialog"
       aria-modal="true"
       aria-label={i18nT('components.commandPalette.search_everywhere')}
       onMouseDown={onClose}
     >
       <div
-        className="mt-[12vh] w-full max-w-xl mx-4 bg-card border border-border rounded-xl shadow-xl overflow-hidden flex flex-col max-h-[70vh]"
+        className="w-full max-w-xl mx-4 bg-card border border-border rounded-xl shadow-xl overflow-hidden flex flex-col"
+        // Both numbers come from the VISUAL viewport in px, not a percentage
+        // and not a `vh`. A percentage MARGIN resolves against the containing
+        // block's WIDTH -- `mt-[8%]` measured 31px, not the 68px it reads like
+        // -- and `vh` measures the layout viewport, which a keyboard does not
+        // shrink on iOS. At rest these equal the previous 12vh / 70vh exactly,
+        // so the at-rest panel is unchanged.
+        style={{ marginTop: Math.round(vv.height * 0.12), maxHeight: Math.round(vv.height * 0.70) }}
         onMouseDown={(e) => e.stopPropagation()}
       >
         {/* Search input */}

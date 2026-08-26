@@ -11,13 +11,13 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import platform_compat
+from kiro_crew import aws_consent, dep_sync, platform_compat
+from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES
 
 # Transcribe-path deps are an OPTIONAL 'aws' extra (amazon-transcribe + boto3).
 # The module MUST stay importable when they're absent (default install, partial
@@ -121,12 +121,16 @@ def _python3_bin_dir() -> str:
         py = platform_compat.find_python_interpreter()
         if not py:
             return ""
-        out = subprocess.check_output(
-            [py, "-c", "import sysconfig; print(sysconfig.get_path('scripts'))"],
-            timeout=5,
-            text=True,
-        ).strip()
-        return out
+        # Through dep_sync._probe_interpreter (-I -X utf8, neutral cwd): the
+        # probe imports sysconfig by name, so a decoy module on the caller's
+        # PYTHONPATH or CWD would otherwise shadow the stdlib and answer with
+        # whatever path it likes — steering the Whisper script search there.
+        proc = dep_sync._probe_interpreter(
+            Path(py), "import sysconfig; print(sysconfig.get_path('scripts'))", timeout=5
+        )
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout.strip()
     except Exception:
         return ""
 
@@ -194,6 +198,12 @@ _MLX_WHISPER_SEARCH_PATHS = [
     os.path.expanduser("~/.local/bin/mlx_whisper"),
     "/opt/homebrew/bin/mlx_whisper",
     "/usr/local/bin/mlx_whisper",
+]
+
+_PARAKEET_MLX_SEARCH_PATHS = [
+    os.path.expanduser("~/.local/bin/parakeet-mlx"),
+    "/opt/homebrew/bin/parakeet-mlx",
+    "/usr/local/bin/parakeet-mlx",
 ]
 
 # Homebrew installs its ``brew`` shim at a fixed prefix per platform, and none of
@@ -271,6 +281,42 @@ def _find_mlx_whisper() -> str | None:
     return None
 
 
+def _find_parakeet_mlx() -> str | None:
+    """Return the parakeet-mlx binary path or None if not found.
+
+    parakeet-mlx runs NVIDIA's Parakeet ASR models on Apple Silicon via MLX. Like
+    mlx_whisper it is installed out-of-band (``pipx install parakeet-mlx`` or
+    ``uv tool install parakeet-mlx``) rather than as a package dependency, because
+    the ``mlx`` wheel only exists for arm64 and would break installs on every
+    other architecture. We therefore locate and invoke the CLI as a subprocess,
+    largely mirroring ``_find_mlx_whisper`` — but see the note below on why it
+    deliberately skips that finder's system-Python scripts-dir fallback.
+    """
+    found = shutil.which("parakeet-mlx")
+    if found:
+        return found
+    # Same venv gap as `_find_whisper` — see `_own_scripts_dir`.
+    own_bin = _own_scripts_dir()
+    if own_bin:
+        found_own = _find_script_in_dir(own_bin, "parakeet-mlx")
+        if found_own:
+            return found_own
+    # No system-Python scripts-dir probe here (unlike `_find_whisper`/
+    # `_find_mlx_whisper`): that fallback exists for `pip install --user`,
+    # which is how `openai-whisper` lands outside PATH. `parakeet-mlx` is
+    # installed via `pipx` (see `_build_stt_install_script`), which always
+    # puts its shim on PATH or in one of `_PARAKEET_MLX_SEARCH_PATHS` below —
+    # so the probe would never find anything here, while still paying its
+    # cost: it shells out to a system Python synchronously
+    # (`dep_sync._probe_interpreter`, 5s timeout) on the event loop this
+    # function runs on (dashboard GET/PUT /api/config/stt), which can stall
+    # the gateway.
+    for p in _PARAKEET_MLX_SEARCH_PATHS:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
 def is_available(stt_config=None) -> bool:  # type: ignore[no-untyped-def]
     """Check if STT is enabled in config and a provider is usable."""
     if stt_config is None:
@@ -296,6 +342,9 @@ def is_available(stt_config=None) -> bool:  # type: ignore[no-untyped-def]
     if provider == "mlx":
         ensure_ffmpeg_in_path()
         return _find_mlx_whisper() is not None
+    if provider == "parakeet":
+        ensure_ffmpeg_in_path()
+        return _find_parakeet_mlx() is not None
     if provider == "apple":
         from kiro_crew import apple_speech
 
@@ -350,6 +399,9 @@ async def transcribe_audio(audio_path: str, stt_config=None) -> str | None:  # t
     elif provider == "mlx":
         await asyncio.to_thread(ensure_ffmpeg_in_path)
         result = await _transcribe_mlx(audio_path, stt_config)
+    elif provider == "parakeet":
+        await asyncio.to_thread(ensure_ffmpeg_in_path)
+        result = await _transcribe_parakeet(audio_path, stt_config)
     elif provider == "apple":
         result = await _transcribe_apple(audio_path, stt_config)
     else:
@@ -447,6 +499,18 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
         logger.error("Unsupported format '%s' for Transcribe (expected .ogg or .webm)", ext)
         return None
 
+    # Transcribe is a PAID AWS service, so no audio leaves the host without a
+    # recorded operator consent for this exact profile+region. Checked before
+    # the optional-dependency probe and before any remux work, so a refusal
+    # costs nothing and no temp file is created. Returning None is this
+    # function's established failure contract.
+    if not await aws_consent.refuse_and_log(
+        aws_consent.SERVICE_TRANSCRIBE,
+        profile=stt_config.transcribe_profile,
+        region=stt_config.transcribe_region,
+    ):
+        return None
+
     # amazon-transcribe + boto3 are an optional 'aws' extra. Absent on a vanilla
     # install → report not available rather than raising an uncaught ImportError.
     if boto3 is None:
@@ -469,6 +533,7 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
             logger.error("ffmpeg required to remux webm to ogg for Transcribe")
             return None
         tmp_ogg = await asyncio.to_thread(_make_temp_ogg)
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 ffmpeg_bin,
@@ -485,7 +550,7 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
                 await asyncio.wait_for(proc.communicate(), timeout=10)
             except asyncio.TimeoutError:
                 proc.kill()
-                await proc.wait()
+                await proc.communicate()
                 raise
             if proc.returncode != 0:
                 raise RuntimeError(f"ffmpeg exited with {proc.returncode}")
@@ -494,6 +559,42 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
             if tmp_ogg:
                 await asyncio.to_thread(_unlink_if_exists, tmp_ogg)
             return None
+        except BaseException:
+            # ``CancelledError`` derives from ``BaseException``, so the
+            # ``Exception`` guard above never sees it: a cancellation landing
+            # mid-``communicate`` used to leave the ffmpeg child running and the
+            # owned temp on disk (#5780). Mirror ``_to_native_audio``'s cleanup
+            # (#5777): stop AND reap the child BEFORE the unlink — Windows keeps
+            # the output file locked until the child fully exits, and on POSIX a
+            # live child can race the removal. Every step is best-effort, and
+            # the unlink stays synchronous (one-file unlink, matching #5777): a
+            # repeat cancellation could eat an off-loop hop before it runs. The
+            # exception in flight is the one that must surface.
+            if proc is not None:
+                try:
+                    proc.kill()
+                except (OSError, ProcessLookupError):
+                    logger.debug(
+                        "ffmpeg kill during cancellation cleanup failed",
+                        exc_info=True,
+                    )
+                else:
+                    try:
+                        await proc.communicate()
+                    except BaseException:
+                        # A repeat cancellation can land on this await; swallow
+                        # it so the unlink below still runs and the ORIGINAL
+                        # exception is the one that propagates.
+                        pass
+            if tmp_ogg:
+                try:
+                    _unlink_if_exists(tmp_ogg)
+                except OSError:
+                    # A not-yet-exited child can still hold the file (Windows
+                    # lock); letting that escape would REPLACE the in-flight
+                    # cancellation with a PermissionError.
+                    pass
+            raise
         actual_path = tmp_ogg
 
     transcript_parts: list[str] = []
@@ -545,13 +646,31 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
         logger.exception("AWS Transcribe streaming STT failed")
         return None
     finally:
-        if stream is not None:
-            try:
-                await stream.input_stream.end_stream()
-            except Exception:
-                pass
-        if tmp_ogg:
-            await asyncio.to_thread(_unlink_if_exists, tmp_ogg)
+        # Nested ``finally`` so the unlink is unconditional: the ``end_stream``
+        # await can itself raise on a REPEAT cancellation (``CancelledError`` is
+        # a ``BaseException``, so its ``Exception`` guard misses it), and that
+        # escape used to skip the temp removal below (#5780).
+        try:
+            if stream is not None:
+                try:
+                    await stream.input_stream.end_stream()
+                except Exception:
+                    pass
+        finally:
+            if tmp_ogg:
+                try:
+                    await asyncio.to_thread(_unlink_if_exists, tmp_ogg)
+                except BaseException:
+                    # A repeat cancellation can land on this await before the
+                    # off-loop hop runs; unlink synchronously (one file,
+                    # matching #5777) and let the cancellation propagate. The
+                    # OSError guard keeps a locked/contended file from
+                    # REPLACING the exception already in flight.
+                    try:
+                        _unlink_if_exists(tmp_ogg)
+                    except OSError:
+                        pass
+                    raise
 
 
 def _collect_whisper_output(
@@ -640,9 +759,12 @@ def _whisper_thread_count() -> int:
 def _thread_capped_env() -> dict[str, str]:
     """Return the subprocess environment with intra-op threads bounded.
 
-    Also strips ``PYTHONPATH``/``PYTHONHOME``: the Whisper CLIs are installed
+    Also strips every var matching a prefix in
+    :data:`sandbox._PYTHON_ENV_PREFIXES` (``PYTHONPATH``/``PYTHONHOME``/…): the Whisper CLIs are installed
     out-of-band and run under their own interpreter, so Kiro Crew's bundled
-    packages (numpy, torch) must not leak into their runtime.
+    packages (numpy, torch) must not leak into their runtime. Reusing the
+    shared list instead of hand-listing keys keeps this scrub site from
+    drifting when the interpreter-env set grows.
 
     An operator who has set ANY of :data:`_THREAD_ENV_VARS` is left completely
     alone — all of them, not just the one they set. Someone who pins
@@ -653,8 +775,12 @@ def _thread_capped_env() -> dict[str, str]:
     setting.
     """
     env = os.environ.copy()
-    env.pop("PYTHONPATH", None)
-    env.pop("PYTHONHOME", None)
+    # Prefix match, not exact-name match: sandbox consumes _PYTHON_ENV_PREFIXES
+    # via startswith (scrub_env), so this site must too or a genuine prefix
+    # entry added to the list would be scrubbed there and missed here.
+    python_env_prefixes = tuple(_PYTHON_ENV_PREFIXES)
+    for key in [k for k in env if k.startswith(python_env_prefixes)]:
+        del env[key]
     if any(env.get(var) for var in _THREAD_ENV_VARS):
         return env
     threads = str(_whisper_thread_count())
@@ -679,7 +805,6 @@ async def _run_whisper_cli(
     two CLIs use hyphenated vs underscored option names).
     """
     out_dir = await asyncio.to_thread(tempfile.mkdtemp)
-    proc = None
     try:
         clean_env = _thread_capped_env()
         proc = await asyncio.create_subprocess_exec(
@@ -689,7 +814,47 @@ async def _run_whisper_cli(
             stderr=asyncio.subprocess.PIPE,
             env=clean_env,
         )
-        _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
+        try:
+            _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            else:
+                # Reap via communicate(), not wait(): it drains the PIPEs, so a
+                # child that died with a full pipe buffer cannot deadlock the
+                # reap. Deliberately ``except Exception`` (narrower than the
+                # cancellation arm's ``BaseException`` swallow below): a
+                # cancellation arriving during THIS reap should win over the
+                # ``return None``, and the ``finally`` still removes the
+                # directory either way.
+                try:
+                    await proc.communicate()
+                except Exception:
+                    logger.debug("%s wait after kill failed", label, exc_info=True)
+            logger.error("%s transcription timed out after %ds", label, timeout_secs)
+            return None
+        except BaseException:
+            # A cancellation mid-``communicate`` is a ``BaseException``, which
+            # the ``except asyncio.TimeoutError`` arm above never sees — the
+            # whisper child kept running as an orphan (#5821). Kill AND reap it
+            # before re-raising: Windows keeps the output files locked until
+            # the child fully exits, and on POSIX a live child can race the
+            # directory removal in the ``finally`` below.
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            else:
+                try:
+                    await proc.communicate()
+                except BaseException:
+                    # A repeat cancellation can land on the reap await; swallow
+                    # it so the directory removal still runs and the ORIGINAL
+                    # exception is the one that propagates.
+                    pass
+            raise
         return await asyncio.to_thread(
             _collect_whisper_output,
             proc.returncode,
@@ -697,17 +862,18 @@ async def _run_whisper_cli(
             out_dir,
             label,
         )
-    except asyncio.TimeoutError:
-        if proc is not None:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            await proc.wait()
-        logger.error("%s transcription timed out after %ds", label, timeout_secs)
-        return None
     finally:
-        await asyncio.to_thread(shutil.rmtree, out_dir, ignore_errors=True)
+        # The removal stays OFF the event loop, and scheduling it as its own
+        # task BEFORE awaiting is what closes the #5821 leak: a repeat
+        # cancellation (or KeyboardInterrupt) landing on this await abandons
+        # only the wait — the already-scheduled task still runs the removal to
+        # completion in its worker thread. ``shield`` keeps that cancellation
+        # from propagating INTO the removal task, while the exception itself
+        # still reaches the awaiter.
+        rm = asyncio.ensure_future(
+            asyncio.to_thread(shutil.rmtree, out_dir, ignore_errors=True)
+        )
+        await asyncio.shield(rm)
 
 
 # Defense in depth: ``mlx_model`` is read from config.json. The dashboard PUT
@@ -752,6 +918,51 @@ async def _transcribe_mlx(audio_path: str, stt_config) -> str | None:  # type: i
         ],
         stt_config.timeout_secs,
         label="mlx_whisper",
+    )
+
+
+async def _transcribe_parakeet(audio_path: str, stt_config) -> str | None:  # type: ignore[no-untyped-def]
+    """Transcribe using the parakeet-mlx CLI (NVIDIA Parakeet, Apple Silicon).
+
+    parakeet-mlx is installed out-of-band (the ``mlx`` wheel is arm64-only), and
+    shares mlx_whisper's hyphenated flags (``--output-dir``/``--output-format``)
+    plus its ``<filename>.txt`` output convention, so it reuses the same
+    ``_run_whisper_cli`` runner and ``.txt`` collection. ``parakeet_model`` is
+    validated against the shared HuggingFace ``owner/repo`` regex for the same
+    defense-in-depth reason as ``mlx_model`` (a hand-edited config could inject
+    an arbitrary value passed straight to the subprocess).
+    """
+    parakeet_bin = await asyncio.to_thread(_find_parakeet_mlx)
+    if not parakeet_bin:
+        logger.error("parakeet-mlx not found — install: pipx install parakeet-mlx")
+        return None
+
+    model = stt_config.parakeet_model
+    # `model or ""` only substitutes on a falsy value (None, ""); a non-string
+    # truthy value (e.g. an int from a hand-edited config.json) would reach
+    # `_MLX_MODEL_RE.match()` as-is and raise TypeError there instead of
+    # producing the clean "invalid parakeet_model" refusal below.
+    if not isinstance(model, str) or not _MLX_MODEL_RE.match(model or ""):
+        logger.error(
+            "Refusing to run parakeet-mlx: invalid parakeet_model %r "
+            "(expected a HuggingFace 'owner/repo' id)",
+            model,
+        )
+        return None
+
+    return await _run_whisper_cli(
+        parakeet_bin,
+        lambda out_dir: [
+            audio_path,
+            "--model",
+            model,
+            "--output-dir",
+            out_dir,
+            "--output-format",
+            "txt",
+        ],
+        stt_config.timeout_secs,
+        label="parakeet-mlx",
     )
 
 

@@ -107,9 +107,11 @@ than fixed; if it only fails on your branch, it's yours. Never label a failure
 
 **A confirmed flake is a bug with a root cause, not noise to retry.** Do NOT add a
 rerun, lengthen a `sleep`, or relax an assertion. Read
-`docs/system-specs/common/testing-conventions.md` § Determinism for the four classes
+`docs/system-specs/common/testing-conventions.md` § Determinism for the five classes
 and the one correct fix for each: seed nondeterministic input, poll instead of
-sleeping, `MagicMock` for sync methods, `await` after `cancel()`. To find what is
+sleeping, `MagicMock` for sync methods, `await` after `cancel()`, and assert a
+complexity property structurally (identical invocation trace at `n` and `2n`) rather
+than by a timed duration or a tight timed ratio. To find what is
 actually flaky rather than guessing, mine CI instead of the local suite (a real flake
 often will not reproduce on macOS at all):
 
@@ -126,7 +128,7 @@ a ratchet/contract test failing on feature branches is a TRUE POSITIVE, not a fl
 The Windows shards fail far more than Linux, so expect timer-granularity and
 process-semantics causes there.
 
-**Suite speed: profile, don't guess.** At ~26.5k tests, per-test setup cost dominates
+**Suite speed: profile, don't guess.** At ~56.5k tests, per-test setup cost dominates
 any single slow test. Time one file with `pytest test/test_x.py -n0 -q --no-cov
 --durations=10` and compare a candidate fix **back to back** on the same machine
 (`git stash`, run, pop, run), because a loaded host makes an absolute number
@@ -159,6 +161,38 @@ python3 -m venv ~/.kiro/crew/venvs/mypy-ci
 
 **Order matters:** if you changed frontend code, rebuild the dist (Rule 3)
 before running backend tests that import static assets.
+
+### Two tiers: a diff-scoped fast inner loop, one full floor at push
+
+The full gate above is the **push gate** and never moves. But running all six
+gates on every fix→re-verify round is what produces the 45-minute timeouts — the
+cost lands during *iteration*, not at the push. So split verification into two
+tiers with different jobs:
+
+- **Iteration model (fast tier).** During the fix→re-verify loop, run
+  `scripts/local-gate.py` instead of the six gates by hand. It classifies the
+  diff into the same buckets `ci.yml`'s `changes` job uses and runs only the
+  surfaces the diff can affect, so an iteration costs what the diff costs rather
+  than what the repo costs. `--dry-run` prints the plan without running,
+  `--base REF` sets the base, `--full` forces both surfaces. Its narrowing is
+  deliberately **fail-open** — a meta path, both surfaces touched, or an
+  unreadable diff all fall back to the full gate — so a classification miss
+  costs local time, never a skipped test. Do NOT re-derive that bucket list as
+  your own prose or scope selection: `test/test_local_gate.py` pins the script's
+  rules to `ci.yml`, and a hand-maintained copy silently drifts out of that
+  ratchet.
+- **Gate model (full floor).** The full blocking floor — `pytest` + `isort` +
+  `flake8` + `mypy` + `tsc -b` + `vitest`, all green — **still runs once before
+  you push**, exactly as specified above. It is never skipped, never replaced,
+  and never satisfied by a fast-tier run. The fast tier is a strict *subset* of
+  the floor chosen for iteration speed only; it earns you quick rounds, it does
+  not earn you the push.
+
+This is what mitigates the documented full-suite timeout *during iteration*
+without loosening anything: the pre-push full floor plus the `ci.yml` ratchet
+(the profile test that fails when CI gains a gate the floor lacks) keep the
+determinism guarantee fully intact. Fast tier = how you iterate; full floor =
+the gate that lets you push.
 
 ## Rule 3 — The served frontend is a built `dist`, not a dev server
 
@@ -277,10 +311,13 @@ gh pr create --base main --title "feat: <description>" --body "<details>"
 ```
 
 - PRs target `main`.
-- **One commit per PR.** CI enforces single-commit hygiene. Squash before
-  opening (`git rebase -i origin/main` or `git reset --soft origin/main` +
-  one commit), and fold review-round fixes in with `git commit --amend` +
-  `git push --force-with-lease origin feat/<name>` rather than stacking commits.
+- **At most two commits per PR.** CI blocks a third; one commit is the norm.
+  Squash before opening (`git rebase -i origin/main` or `git reset --soft
+  origin/main` + one commit), and fold review-round fixes in with
+  `git commit --amend` + `git push --force-with-lease origin feat/<name>`
+  rather than stacking commits. Spend the second commit only when a mechanical
+  follow-up (a regenerated artifact, a formatting sweep) is worth keeping
+  separable from the change it accompanies.
 - **Push as a standalone command.** Prefer running `git push` (including
   `--force-with-lease`) on its own line with explicit remote and branch —
   some agent security policies fail closed on pushes embedded in compound
@@ -390,7 +427,7 @@ the system does, not a changelog of how it got there.
   `xdist_group`-serialized tests (Rule 2).
 - A faiss-equipped or version-drifted mypy venv → local results that contradict
   CI in both directions (Rule 2: CI-parity venv).
-- Multi-commit branches → PR Hygiene check fails; squash first (Rule 7).
+- Branches with three or more commits → PR Hygiene check fails; squash first (Rule 7).
 - Committing or pushing without an explicit user request → violates the repo's
   agent safety convention (Rule 7).
 - Pushing directly to `main` → breaks CI for everyone; always use a feature

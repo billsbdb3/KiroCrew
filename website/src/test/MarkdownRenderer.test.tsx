@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, fireEvent, act, waitFor } from '@testing-library/react'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import MarkdownRenderer, { Lightbox, dispatchLightbox, isPathCandidate, splitLineRef } from '../components/MarkdownRenderer'
 import { __resetPathKindCache } from '../hooks/usePathKind'
 import { api } from '../api/client'
@@ -329,13 +330,90 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     })
   })
 
+  it('opens a confirmed Markdown file link in the file viewer instead of navigating to the chat route', async () => {
+    globalThis.fetch = vi.fn((url: unknown) => {
+      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
+      const hit = asked === '/home/user/a.md'
+      return Promise.resolve({
+        ok: hit,
+        status: hit ? 200 : 404,
+        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
+      } as Response)
+    }) as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md:12)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2))
+
+    const anchor = container.querySelector('a[href="/home/user/a.md:12"]')
+    expect(anchor).not.toBeNull()
+    fireEvent.click(anchor!)
+    expect(onFileOpen).toHaveBeenCalledWith('/home/user/a.md', { line: 12 })
+  })
+
+  it('swallows a plain Markdown file-link click while its path probe is pending', async () => {
+    let resolveProbe: ((response: Response) => void) | undefined
+    globalThis.fetch = vi.fn(() => new Promise<Response>((resolve) => { resolveProbe = resolve })) as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[open file](/home/user/a.md)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1))
+
+    const anchor = container.querySelector('a[href="/home/user/a.md"]')
+    expect(anchor).not.toBeNull()
+    expect(fireEvent.click(anchor!)).toBe(false)
+    expect(onFileOpen).not.toHaveBeenCalled()
+
+    resolveProbe?.({ ok: true, status: 200, headers: new Headers({ 'X-Path-Kind': 'file' }) } as Response)
+  })
+
+  it('does not probe a decoded root-relative UNC path', async () => {
+    globalThis.fetch = vi.fn() as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    render(<MarkdownRenderer content={'[open](/%2Fserver/share/report.md)'} onFileOpen={onFileOpen} />)
+    await Promise.resolve()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+    expect(onFileOpen).not.toHaveBeenCalled()
+  })
+
+  it('prefers a literal Markdown link filename over its line-reference sibling', async () => {
+    globalThis.fetch = vi.fn((url: unknown) => {
+      const asked = decodeURIComponent(new URL(String(url), 'http://x').searchParams.get('path') || '')
+      const hit = asked === '/tmp/report.md' || asked === '/tmp/report.md:12'
+      return Promise.resolve({
+        ok: hit,
+        status: hit ? 200 : 404,
+        headers: new Headers(hit ? { 'X-Path-Kind': 'file' } : {}),
+      } as Response)
+    }) as unknown as typeof fetch
+    const onFileOpen = vi.fn()
+    const { getByRole } = render(
+      <MarkdownRenderer content={'[open](/tmp/report.md%3A12)'} onFileOpen={onFileOpen} />,
+    )
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(2))
+
+    fireEvent.click(getByRole('link', { name: 'open' }))
+    expect(onFileOpen).toHaveBeenCalledWith('/tmp/report.md:12')
+  })
+
+  it('leaves an unconfirmed root-relative application link to navigate normally', async () => {
+    stubKind(null, false)
+    const onFileOpen = vi.fn()
+    const { container } = render(<MarkdownRenderer content={'[docs](/docs/page)'} onFileOpen={onFileOpen} />)
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
+
+    const anchor = container.querySelector('a[href="/docs/page"]')
+    expect(anchor).not.toBeNull()
+    expect(fireEvent.click(anchor!)).toBe(true)
+    expect(onFileOpen).not.toHaveBeenCalled()
+  })
+
   it('leaves an inert chip glyph-free, so the affordance stays meaningful', async () => {
     stubKind(null, false)
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
     const code = container.querySelector('code')!
     expect(code.querySelector('svg')).toBeNull()
-    expect(code.className).not.toContain('cursor-pointer')
+    // Non-path chips now have cursor-pointer for click-to-copy, but no file glyph.
+    expect(code.className).toContain('cursor-pointer')
   })
 
   it('renders a confirmed directory as a folder chip, not a broken file link', async () => {
@@ -355,7 +433,8 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     const { container } = render(<MarkdownRenderer content={'`/home/user/ghost.md`'} />)
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled())
     const code = container.querySelector('code')!
-    expect(code.className).not.toContain('cursor-pointer')
+    // Non-path chips now have cursor-pointer for click-to-copy.
+    expect(code.className).toContain('cursor-pointer')
     expect(code.dataset.pathKind).toBeUndefined()
   })
 
@@ -373,6 +452,52 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     })
   })
 
+  /**
+   * The instruction half of that tooltip names an application, and the shift+click
+   * it describes calls `api.revealPath` — which shells out on the GATEWAY. So the
+   * sentence follows the gateway's platform, never the browser's, and a directory
+   * carries different wording from a file because clicking one browses rather than
+   * opens.
+   */
+  it.each([
+    ['darwin', 'file', 'Click to open / Shift+click to reveal in Finder'],
+    ['win32', 'file', 'Click to open / Shift+click to open in File Explorer'],
+    // The sentinel a non-owner dashboard user (and a failed probe) receives.
+    ['gateway', 'file', 'Click to open / Shift+click to show in file manager'],
+    ['darwin', 'dir', 'Click to browse / Shift+click to reveal in Finder'],
+    ['win32', 'dir', 'Click to browse / Shift+click to open in File Explorer'],
+    ['linux', 'dir', 'Click to browse / Shift+click to show in file manager'],
+  ])('names the reveal target in the hint for %s / %s', async (platform, kind, hint) => {
+    const isDir = kind === 'dir'
+    stubKind(isDir ? 'dir' : 'file', !isDir)
+    const path = isDir ? '/Users/me/workspace' : '/home/user/a.md'
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    qc.setQueryData(['kiro-prerequisite'], { platform })
+    const { container } = render(
+      <QueryClientProvider client={qc}>
+        <MarkdownRenderer content={`\`${path}\``} />
+      </QueryClientProvider>,
+    )
+    await waitFor(() => {
+      const code = container.querySelector('code[data-path-kind]')!
+      expect(code.getAttribute('title')).toBe(`${path}\n${hint}\nCtrl+click to copy`)
+    })
+  })
+
+  it('still renders a chip in a tree that has no QueryClientProvider', async () => {
+    // Popout frames and Mochi's Electron windows mount with a bare `createRoot`,
+    // where `useQuery` throws "No QueryClient set". Reading the platform must not
+    // make a chip unrenderable there — it falls back to the generic wording.
+    stubKind('file')
+    const { container } = render(<MarkdownRenderer content={'`/home/user/a.md`'} />)
+    await waitFor(() => {
+      const code = container.querySelector('code[data-path-kind]')!
+      expect(code.getAttribute('title')).toBe(
+        '/home/user/a.md\nClick to open / Shift+click to show in file manager\nCtrl+click to copy',
+      )
+    })
+  })
+
   it('never probes a non-candidate — the pre-filter saves the request', async () => {
     stubKind('file')
     render(<MarkdownRenderer content={'`refs/heads/fix/investigation-record-403`'} />)
@@ -385,6 +510,13 @@ describe('MarkdownRenderer path chips — stat gate', () => {
     // Mid-stream, '/Users' is itself a valid candidate en route to the real
     // path; probing every chunk would flash the wrong affordance.
     render(<MarkdownRenderer content={'`/Users/me/pro`'} streaming />)
+    await Promise.resolve()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+  })
+
+  it('does not probe a Markdown file link while the message is still streaming', async () => {
+    stubKind('file')
+    render(<MarkdownRenderer content={'[open](/Users/me/pro)'} streaming onFileOpen={vi.fn()} />)
     await Promise.resolve()
     expect(globalThis.fetch).not.toHaveBeenCalled()
   })
@@ -1121,6 +1253,23 @@ describe('MarkdownRenderer softBreaks', () => {
     expect(container.querySelectorAll('br').length).toBe(1)
     expect(container.textContent).toContain('line one')
     expect(container.textContent).toContain('line two')
+  })
+
+  it('drops the redundant <br> between two attached images (blocks already break)', () => {
+    // Each image renders as its own block (span.block.my-2); a <br> between
+    // them adds an empty line box and blocks margin collapse, inflating the
+    // gap between two attached screenshots from ~8px to ~37px.
+    const { container } = render(<MarkdownRenderer
+      content={'shots\n\n![a](https://x.test/a.png)\n![b](https://x.test/b.png)'} softBreaks />)
+    expect(container.querySelectorAll('img').length).toBe(2)
+    expect(container.querySelectorAll('br').length).toBe(0)
+  })
+
+  it('keeps the <br> between an image and following TEXT (only image-adjacent breaks drop)', () => {
+    const { container } = render(<MarkdownRenderer
+      content={'line one\nline two\n\n![a](https://x.test/a.png)'} softBreaks />)
+    // the text-to-text break survives; none render adjacent to the image
+    expect(container.querySelectorAll('br').length).toBe(1)
   })
 
   it('collapses a soft line break by default (no softBreaks, no <br>)', () => {

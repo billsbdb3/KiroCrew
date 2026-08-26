@@ -28,12 +28,15 @@ class TestCountOpenFds:
             # On truly unsupported platforms, -1 is acceptable.
             assert result == -1 or result > 0
 
-    def test_returns_minus_one_when_all_sources_fail(self) -> None:
-        """If /proc/self/fd, /dev/fd, and Win32 all fail, return -1."""
-        with patch("os.listdir", side_effect=OSError("mocked")):
-            with patch.object(sys, "platform", "linux"):
-                result = _count_open_fds()
-        assert result == -1
+    def test_returns_minus_one_when_the_shared_probe_has_no_value(self) -> None:
+        """A None from the shared probe maps to the diagnostic's -1 sentinel."""
+        with patch("kiro_crew.mcp_gateway.gatewayd._shared_count_open_fds", return_value=None):
+            assert _count_open_fds() == -1
+
+    def test_passes_the_shared_probe_count_through_unchanged(self) -> None:
+        """Delegation is thin: the shared reader's count is returned as-is."""
+        with patch("kiro_crew.mcp_gateway.gatewayd._shared_count_open_fds", return_value=7):
+            assert _count_open_fds() == 7
 
     def test_proc_self_fd_preferred_on_linux(self) -> None:
         """On Linux, /proc/self/fd is used and returns a sane count."""
@@ -56,11 +59,9 @@ class TestReadRssKb:
             assert result == -1 or result > 0
 
     def test_returns_minus_one_when_all_sources_fail(self) -> None:
-        """If /proc/self/status and resource both fail, return -1."""
-        with patch("builtins.open", side_effect=OSError("mocked")):
-            with patch.dict("sys.modules", {"resource": None}):
-                with patch.object(sys, "platform", "linux"):
-                    result = _read_rss_kb()
+        """When the shared reader cannot measure, the diagnostic says so."""
+        with patch("kiro_crew.mcp_gateway.gatewayd._proc_rss_bytes", return_value=0):
+            result = _read_rss_kb()
         assert result == -1
 
     def test_rss_is_in_kilobytes(self) -> None:

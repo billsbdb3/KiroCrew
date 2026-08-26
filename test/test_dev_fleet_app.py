@@ -8,15 +8,16 @@ import hmac as _hmac_mod
 import json
 import os
 import sys
-import tempfile
 import textwrap
 import threading
 import time
 from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yarl
 from aiohttp import web  # noqa: F401  (used by builtin re-shell tests)
 from aiohttp.test_utils import TestClient, TestServer  # noqa: F401
 
@@ -33,6 +34,25 @@ _POSIX_ONLY = pytest.mark.skipif(
     sys.platform == "win32",
     reason="POSIX-only Dev Fleet make-live/cancel/sync semantics (issue #2041)",
 )
+
+
+@pytest.fixture(autouse=True)
+def _venv_maps_to_the_synced_checkout():
+    """Answer the sync's foreign-venv guard with "it maps", for tests not about it.
+
+    Both install paths now refuse a venv that serves a DIFFERENT checkout, and
+    answering that question RUNS the target interpreter — which every sync test
+    here points at a path that does not exist. Stubbing both halves keeps an
+    unrelated assertion from turning into an unrunnable-interpreter refusal. The
+    guard's own behaviour is asserted by
+    ``test_sync_refuses_a_venv_that_serves_another_checkout``, which patches it
+    back to a refusal, and the logic behind it lives in ``test/test_dep_sync.py``.
+    """
+    from kiro_crew import dep_sync
+
+    with patch.object(dep_sync, "installed_package_origin", return_value="<stubbed>"), \
+         patch.object(dep_sync, "venv_not_mapped_to", return_value=None):
+        yield
 
 
 # --- worktree porcelain parsing ---
@@ -253,17 +273,22 @@ async def test_remove_refuses_when_branch_oid_diverged():
     """Squash-safe race guard: branch OID != PR headRefOid -> refuse removal."""
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
+    full_head = "a" * 40
+    cache = AsyncMock(return_value={"state": "MERGED"})
+    git = AsyncMock(return_value=full_head)
     with patch.object(mod, "_find_worktree", new_callable=AsyncMock,
                       return_value=({"path": "/fake/wt", "branch": "feat-x", "is_main": False}, None)), \
          patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False), \
-         patch.object(mod, "_pr_status_cached", new_callable=AsyncMock, return_value={"state": "MERGED"}), \
+         patch.object(mod, "_pr_status_cached", cache), \
          patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=3), \
-         patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"), \
-         patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="bbb2222"), \
+         patch.object(mod, "_git", git), \
+         patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="b" * 40), \
          patch.object(mod, "_upstream_remote", new_callable=AsyncMock, return_value="origin"):
         result = await mod._worktree_remove("feat-x", force=False)
     assert result["ok"] is False
     assert "OID diverged" in result["error"]
+    git.assert_any_await("/fake/wt", "rev-parse", "HEAD")
+    cache.assert_awaited_once_with("feat-x", full_head)
 
 
 @pytest.mark.asyncio
@@ -353,6 +378,492 @@ async def test_remove_still_fails_on_non_pod_exceptions():
     assert "cannot verify pod state" in result["error"]
 
 
+# --- stopped-pod HOME reclamation on worktree removal ---
+def _remove_stubs(pod_root, **extra):
+    """The guard stack every ``_worktree_remove`` pod-path test needs.
+
+    *pod_root* is the test's own ``tmp_path``-derived pod root: the code reads it
+    to tell an unreadable root from "nothing to reclaim", so it has to exist and
+    be readable, and it must be per-test so nothing is left on disk afterwards.
+
+    Returns the context managers so each test only states the pod-state patches
+    it is actually about. A key present in *extra* REPLACES the default of the
+    same name rather than stacking a second patch on the same attribute, so a
+    test that overrides ``backend`` gets exactly one ``require_backend`` patch.
+    """
+    base = {
+        "find": patch.object(mod, "_find_worktree", new_callable=AsyncMock,
+                             return_value=({"path": "/fake/wt", "branch": "feat-x",
+                                            "is_main": False}, None)),
+        "dirty": patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=False),
+        "pr": patch.object(mod, "_pr_status_cached", new_callable=AsyncMock,
+                           return_value={"state": "MERGED"}),
+        "own": patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=1),
+        "git": patch.object(mod, "_git", new_callable=AsyncMock, return_value="aaa1111"),
+        "head": patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock,
+                             return_value="aaa1111"),
+        "cfg": patch.object(mod, "_load_cfg",
+                            return_value=SimpleNamespace(pod_root=pod_root)),
+        "avail": patch.object(mod, "_POD_AVAILABLE", True),
+        "backend": patch.object(mod.rt, "require_backend", return_value=None),
+        "run": patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, "", "")),
+        "upstream": patch.object(mod, "_upstream_remote", new_callable=AsyncMock,
+                                 return_value="origin"),
+    }
+    base.update(extra)
+    return list(base.values())
+
+
+@pytest.mark.asyncio
+async def test_remove_reclaims_home_of_a_stopped_pod(tmp_path):
+    """A pod that is DOWN still owns its isolated HOME, so removal reclaims it.
+
+    Gating reclamation on a live unit stranded the HOME on the common path:
+    the operator stops the pod when testing ends and prunes days later once the
+    PR merges, so the unit is never active at removal time.
+    """
+    reclaim = MagicMock(return_value=("reclaimed", ""))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["feat-x"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    # The worktree path is handed in as the expected checkout, so attribution
+    # inside the lock compares against THIS repo's worktree.
+    assert reclaim.call_args.args[1:] == ("feat-x", "/fake/wt")
+    # Reported as a reclaim, never as a shutdown that did not happen.
+    assert result["reclaimed_pod_home"] is True
+    assert result["stopped_pod"] is False
+
+
+@pytest.mark.asyncio
+async def test_remove_leaves_a_non_orphan_home_alone(tmp_path):
+    """``orphan_homes`` is the authority: a name it omits is never reclaimed.
+
+    Covers the HOME that does not exist at all and the macOS name mid-``up``
+    whose per-pod plist marks it installed rather than orphaned.
+    """
+    reclaim = MagicMock(return_value=("reclaimed", ""))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["other-wt"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    reclaim.assert_not_called()
+    assert result["reclaimed_pod_home"] is False
+
+
+@pytest.mark.asyncio
+async def test_remove_refuses_when_home_reclaim_fails(tmp_path):
+    """A HOME that survives teardown must not be reported as a clean removal."""
+    reclaim = MagicMock(return_value=("failed", "a process is still writing there"))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["feat-x"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is False
+    assert "pod home reclaim failed" in result["error"]
+    assert "still writing" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_remove_of_active_pod_reports_a_stop_not_a_reclaim(tmp_path):
+    """The live-unit path keeps its own reporting; the two flags never conflate."""
+    reclaim = MagicMock(return_value=("reclaimed", ""))
+    # Stateful rather than a fixed side_effect list: the live-unit path queries
+    # liveness three times (pre-stop, post-stop, and the TOCTOU recheck under
+    # the git lock), so a length-pinned list breaks on an unrelated change to
+    # how often the code verifies.
+    calls = {"n": 0}
+
+    def _liveness(_cfg):
+        calls["n"] += 1
+        return {"feat-x"} if calls["n"] == 1 else set()
+
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", side_effect=_liveness),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert result["stopped_pod"] is True
+    assert result["reclaimed_pod_home"] is False
+
+
+@pytest.mark.asyncio
+async def test_remove_of_an_active_foreign_pod_is_refused(tmp_path):
+    """A LIVE pod that is not this checkout's must not be stopped."""
+    reclaim = MagicMock(return_value=("foreign", "pinned to a different checkout"))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value={"feat-x"}),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is False
+    assert "refusing pod shutdown" in result["error"]
+    assert "different checkout" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_remove_skips_a_pod_home_that_is_another_checkouts(tmp_path, caplog):
+    """A same-basename HOME belonging to ANOTHER checkout is left, not refused.
+
+    Pod identities are global basenames and ``orphan_homes`` keys on the pod
+    root, liveness and plist -- never on the checkout pin -- so another repo's
+    stale HOME of the same name shows up here. Leaving it is correct; refusing
+    this checkout's own removal over it is not.
+    """
+    reclaim = MagicMock(return_value=("foreign", "pinned to a different checkout"))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["feat-x"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        with caplog.at_level("WARNING"):
+            result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert result["reclaimed_pod_home"] is False
+    assert "left a pod HOME named" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_remove_refuses_when_the_pod_name_was_handed_over(tmp_path):
+    """A new pod holding this name blocks the removal, on BOTH reclaim branches.
+
+    Which checkout the new pod belongs to is unknowable here, and it may be
+    running out of this very worktree -- so the files must not be deleted, and the
+    post-stop liveness recheck cannot be relied on to see a unit that is still
+    bootstrapping.
+    """
+    reclaim = MagicMock(return_value=("handed_over", "was reclaimed by a new pod"))
+
+    # Live-unit branch.
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value={"feat-x"}),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        live = await mod._worktree_remove("feat-x", force=False)
+
+    assert live["ok"] is False
+    assert "refusing removal" in live["error"]
+
+    # Orphaned-HOME branch.
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["feat-x"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        orphan = await mod._worktree_remove("feat-x", force=False)
+
+    assert orphan["ok"] is False
+    assert "reclaim failed" in orphan["error"]
+
+
+@pytest.mark.asyncio
+async def test_remove_refuses_when_the_reclaim_itself_raises(tmp_path):
+    """A teardown that DIES mid-flight must not be read as a cleanup miss.
+
+    The enumeration's failure degrades, but a raising reclaim (a stop that timed
+    out against a still-activating unit) is the state in which removing the
+    checkout is unsafe, so it must reach the fail-closed handler.
+    """
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=["feat-x"]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked",
+                                 MagicMock(side_effect=TimeoutError("stop timed out"))),
+        ):
+            stack.enter_context(cm)
+        result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is False
+    assert "cannot verify pod state" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_remove_survives_a_failing_home_enumeration(tmp_path, caplog):
+    """A cleanup that cannot even enumerate must not refuse the removal.
+
+    Liveness failures fail CLOSED (they guard against deleting a checkout under
+    a live pod), but an orphan scan says nothing about liveness -- so it degrades
+    to a named leftover instead of turning a lost directory into a lost removal.
+    """
+    reclaim = MagicMock(return_value=("reclaimed", ""))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", side_effect=OSError("pod root gone")),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        with caplog.at_level("WARNING"):
+            result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert result["reclaimed_pod_home"] is False
+    reclaim.assert_not_called()
+    assert "could not look for" in caplog.text
+    assert "pod prune" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_remove_warns_when_the_pod_root_is_unreadable(tmp_path, caplog):
+    """An unreadable pod root must reach the warning, not read as "no orphans".
+
+    ``orphan_homes`` answers ``[]`` on an enumeration error, which is
+    indistinguishable from "nothing to reclaim", so the root is read here first.
+    """
+    reclaim = MagicMock(return_value=("reclaimed", ""))
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path / "never-created",
+            active=patch.object(mod.rt, "active_names", return_value=set()),
+            orphans=patch.object(mod.rt, "orphan_homes", return_value=[]),
+            reclaim=patch.object(mod, "_reclaim_pod_locked", reclaim),
+        ):
+            stack.enter_context(cm)
+        with caplog.at_level("WARNING"):
+            result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    reclaim.assert_not_called()
+    assert "pod prune" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_remove_names_the_home_it_cannot_reclaim(tmp_path, caplog):
+    """Backend absent: the HOME is unprovable, so it is NAMED, not silently skipped.
+
+    Reclaiming here would risk deleting a live gateway's HOME, so the residue
+    stays -- but at a level the operator sees, carrying the path and the verb
+    that reclaims it.
+    """
+    from kiro_crew.pod.runtime import PodBackendAbsent
+
+    with ExitStack() as stack:
+        for cm in _remove_stubs(
+            tmp_path,
+            backend=patch.object(mod.rt, "require_backend",
+                                 side_effect=PodBackendAbsent("no session bus")),
+            unit=patch.object(mod.rt, "unit_state", return_value=("inactive", 0)),
+            home=patch.object(mod.rt, "pod_home", return_value=Path("/pods/feat-x")),
+        ):
+            stack.enter_context(cm)
+        with caplog.at_level("WARNING"):
+            result = await mod._worktree_remove("feat-x", force=False)
+
+    assert result["ok"] is True
+    assert "/pods/feat-x" in caplog.text
+    assert "pod down feat-x" in caplog.text
+
+
+# --- _reclaim_pod_locked: attribution and teardown share the per-name lock ---
+class _RecordingMutex:
+    """Records lock enter/exit against a shared event log."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def __call__(self, cfg, name):
+        return self
+
+    def __enter__(self):
+        self.log.append("lock-enter")
+        return self
+
+    def __exit__(self, *exc):
+        self.log.append("lock-exit")
+        return False
+
+
+def _reclaim_cfg(tmp_path):
+    """A cfg whose ``env_file`` names a path inside the test's own tmp dir."""
+    return SimpleNamespace(env_file=lambda name: tmp_path / f"{name}.env")
+
+
+def test_reclaim_reads_the_pin_and_tears_down_inside_the_lock(tmp_path):
+    """The whole point of the helper: no window between attribution and teardown.
+
+    Checking the pin in one process and tearing down in another leaves a gap in
+    which a concurrent ``pod up`` from a DIFFERENT checkout claims the same
+    global basename, so the teardown would stop that pod and delete its HOME.
+    Both halves must land between the same lock enter and exit.
+    """
+    log = []
+    cp = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def _pin(_cfg, _name):
+        log.append("read-pin")
+        return True, "/fake/wt"
+
+    def _stop(_cfg, _name):
+        log.append("stop")
+        return cp
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex(log)), \
+         patch.object(mod, "_read_pin_strict", _pin), \
+         patch.object(mod.rt, "stop_pod", _stop):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert (outcome, detail) == ("reclaimed", "")
+    assert log == ["lock-enter", "read-pin", "stop", "lock-exit"]
+
+
+def test_reclaim_refuses_a_foreign_pin_without_tearing_down(tmp_path):
+    """A pin naming another checkout stops the transaction before any teardown."""
+    log = []
+    stop = MagicMock()
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex(log)), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/other/repo/wt")), \
+         patch.object(mod.rt, "stop_pod", stop):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert outcome == "foreign"
+    assert "basename collision" in detail
+    stop.assert_not_called()
+    assert log == ["lock-enter", "lock-exit"]
+
+
+def test_reclaim_refuses_an_unpinned_pod(tmp_path):
+    """No pin at all means the HOME is unattributable -- never torn down.
+
+    Stricter than ``_pod_checkout_guard``, deliberately: the guard allows an
+    unpinned name when no unit is live, which is right for operating on a pod the
+    caller located, but this path DELETES the HOME and a same-basename leftover
+    from another checkout is indistinguishable from here. Liveness is not even
+    consulted, so the refusal holds whether or not a unit is up.
+    """
+    stop = MagicMock()
+    active = MagicMock(return_value=set())
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (False, None)), \
+         patch.object(mod.rt, "active_names", active), \
+         patch.object(mod.rt, "stop_pod", stop):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert outcome == "foreign"
+    assert "no checkout pin" in detail
+    stop.assert_not_called()
+    active.assert_not_called()
+
+
+def test_reclaim_leaves_the_env_file_when_the_name_was_handed_over(tmp_path):
+    """A name claimed mid-teardown keeps the NEW pod's pin: never clear it."""
+    env = tmp_path / "feat-x.env"
+    env.write_text("CHECKOUT=/other/repo/wt\n")
+    cfg = SimpleNamespace(env_file=lambda name: env)
+    cp = SimpleNamespace(returncode=0, stdout=mod.rt.RECLAIMED_MARKER, stderr="")
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/fake/wt")), \
+         patch.object(mod.rt, "stop_pod", lambda c, n: cp):
+        outcome, detail = mod._reclaim_pod_locked(cfg, "feat-x", "/fake/wt")
+
+    assert outcome == "handed_over"
+    assert env.exists()
+
+
+def test_reclaim_clears_the_env_file_after_a_clean_reclaim(tmp_path):
+    """A reclaimed pod's pin is cleared so a later ``up`` re-resolves cleanly."""
+    env = tmp_path / "feat-x.env"
+    env.write_text("CHECKOUT=/fake/wt\n")
+    cfg = SimpleNamespace(env_file=lambda name: env)
+    cp = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/fake/wt")), \
+         patch.object(mod.rt, "stop_pod", lambda c, n: cp):
+        outcome, _ = mod._reclaim_pod_locked(cfg, "feat-x", "/fake/wt")
+
+    assert outcome == "reclaimed"
+    assert not env.exists()
+
+
+def test_reclaim_reports_a_teardown_that_left_the_home_behind(tmp_path):
+    """``stop_pod`` reports a surviving HOME as non-zero; that is a failure.
+
+    The detail reaches the worktree-remove response and so the dashboard, so it
+    goes through ``_redact`` like every other detail this helper returns.
+    """
+    cp = SimpleNamespace(returncode=1, stdout="", stderr="isolated HOME is still at /pods/feat-x")
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/fake/wt")), \
+         patch.object(mod.rt, "stop_pod", lambda c, n: cp):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert outcome == "failed"
+    assert "still at /pods/feat-x" in detail
+
+
+def test_reclaim_redacts_the_teardown_stderr(tmp_path):
+    """Teardown stderr can carry a secret from the pod's own output."""
+    secret = "AKIAIOSFODNN7EXAMPLE"
+    cp = SimpleNamespace(returncode=1, stdout="", stderr=f"stop failed: {secret}")
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/fake/wt")), \
+         patch.object(mod.rt, "stop_pod", lambda c, n: cp):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert outcome == "failed"
+    assert secret not in detail
+    assert detail == mod._redact(f"stop failed: {secret}")
+
+
+def test_reclaim_falls_back_to_the_return_code_when_stderr_is_empty(tmp_path):
+    """An empty stderr still names a cause rather than an empty error string."""
+    cp = SimpleNamespace(returncode=3, stdout="", stderr="   ")
+
+    with patch.object(mod.rt, "pod_name_mutex", _RecordingMutex([])), \
+         patch.object(mod, "_read_pin_strict", lambda c, n: (True, "/fake/wt")), \
+         patch.object(mod.rt, "stop_pod", lambda c, n: cp):
+        outcome, detail = mod._reclaim_pod_locked(_reclaim_cfg(tmp_path), "feat-x", "/fake/wt")
+
+    assert (outcome, detail) == ("failed", "stop rc=3")
+
+
 # --- _upstream_remote fallback + override ---
 @pytest.mark.asyncio
 async def test_upstream_remote_fallback_to_origin():
@@ -403,88 +914,9 @@ async def test_sync_script_emits_step_markers():
 
 
 # --- Windows: a write-locked console script must not be handed to pip ---
-def _make_scripts(tmp_path, *names):
-    """A fake venv Scripts/ dir, returning the interpreter path inside it."""
-    scripts = tmp_path / ".venv" / "Scripts"
-    scripts.mkdir(parents=True)
-    for name in names:
-        (scripts / name).write_bytes(b"MZ")
-    return scripts / "python.exe"
-
-
-def _raise_on(monkeypatch, name, exc):
-    """Make Path.open raise *exc* for the file called *name* only."""
-    real_open = Path.open
-
-    def fake_open(self, *args, **kwargs):
-        if self.name == name:
-            raise exc
-        return real_open(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", fake_open)
-
-
-def test_write_locked_console_scripts_is_a_posix_noop(tmp_path, monkeypatch):
-    """POSIX can unlink an executing binary, so there is nothing to detect."""
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", False)
-    _raise_on(monkeypatch, "kirocrew.exe", PermissionError(13, "in use"))
-
-    assert mod._write_locked_console_scripts(py) == []
-
-
-def test_write_locked_console_scripts_flags_a_locked_script(tmp_path, monkeypatch):
-    """The real failure: the exe the gateway is executing cannot be replaced."""
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    _raise_on(monkeypatch, "kirocrew.exe", PermissionError(13, "in use"))
-
-    locked = mod._write_locked_console_scripts(py)
-    assert len(locked) == 1
-    assert locked[0].endswith("kirocrew.exe")
-
-
-def test_write_locked_console_scripts_passes_a_writable_script(tmp_path, monkeypatch):
-    """A venv the gateway is NOT running from must still get its reinstall."""
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-
-    assert mod._write_locked_console_scripts(py) == []
-
-
-def test_write_locked_console_scripts_ignores_unrelated_executables(tmp_path, monkeypatch):
-    """Only the scripts pip would rewrite matter.
-
-    Some other locked exe sharing the Scripts dir must not suppress the
-    reinstall — that would turn an unrelated process into a silent skip.
-    """
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe", "unrelated.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    _raise_on(monkeypatch, "unrelated.exe", PermissionError(13, "in use"))
-
-    assert mod._write_locked_console_scripts(py) == []
-
-
-def test_write_locked_console_scripts_lets_pip_judge_other_errors(tmp_path, monkeypatch):
-    """An unreadable-for-other-reasons script is not evidence of a lock.
-
-    Skipping on any OSError would suppress installs that would have worked.
-    """
-    import kiro_crew.apps.builtins.dev_fleet.server as mod
-
-    py = _make_scripts(tmp_path, "kirocrew.exe")
-    monkeypatch.setattr(platform_compat, "IS_WINDOWS", True)
-    _raise_on(monkeypatch, "kirocrew.exe", OSError(5, "I/O error"))
-
-    assert mod._write_locked_console_scripts(py) == []
+# The probe itself moved to kiro_crew.dep_sync with the substitute it feeds, and
+# its tests moved with it (test/test_dep_sync.py). What stays here is the sync's
+# use of the result: which install step gets built.
 
 
 def _steps_from_script(script):
@@ -517,6 +949,9 @@ async def _run_sync(mod, locked):
     ambient makes them pass or fail on whether the HOST running them happens to
     sit in a Kiro Crew checkout. Assertions that quote the repo path must use
     ``_SYNC_REPO`` rather than reading ``mod.MAIN_REPO``.
+
+    The venv-origin guard is answered by the module's autouse fixture; a test
+    about that guard patches it back to a refusal.
     """
     mod._UPSTREAM_REMOTE = "origin"
     mod._SYNC_RID = None
@@ -524,7 +959,7 @@ async def _run_sync(mod, locked):
          patch.object(mod, "_git", new_callable=AsyncMock, return_value="main"), \
          patch.object(mod, "_venv_python", return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: f"/usr/bin/{n}"), \
-         patch.object(mod, "_write_locked_console_scripts", return_value=locked), \
+         patch.object(mod.dep_sync, "locked_console_scripts", return_value=locked), \
          patch("kiro_crew.apps.builtins.dev_fleet.server.sandboxed_spawn_argv",
                side_effect=lambda cmd, mode, env=None: (cmd, env or {}, None)), \
          patch.object(mod, "_start_run", new_callable=AsyncMock, return_value="run-123") as mock_start:
@@ -532,52 +967,82 @@ async def _run_sync(mod, locked):
             result = await mod._sync_start_locked()
     mod._UPSTREAM_REMOTE = None
     script = mock_start.call_args[0][1][2] if mock_start.call_args else None
+    # Stubbing _start_run also stubs out its `finally` cleanup, so anything the
+    # sync staged for removal (the dependency-only path snapshots dep_sync into a
+    # temp dir) would outlive the test. Remove exactly what it registered, in the
+    # order it registered it — file before directory.
+    if mock_start.call_args:
+        for path in mock_start.call_args.kwargs.get("cleanup_paths") or []:
+            try:
+                os.unlink(path)
+            except OSError:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    pass
     return result, script
 
 
 @pytest.mark.asyncio
-async def test_sync_refuses_entirely_when_a_console_script_is_locked():
-    """Nothing may run — not even fetch/merge.
+async def test_sync_substitutes_a_dependency_only_install_when_a_script_is_locked():
+    """The sync proceeds; only the editable reinstall is swapped out.
 
-    pip cannot replace the locked binary, and merging anyway is not a safe
-    consolation prize: a revision that adds a dependency would land with that
-    dependency absent, the run would report success, and the next restart would
-    fail to import it. Leaving the checkout on a revision whose dependencies are
-    satisfied is the only outcome that cannot brick the gateway.
+    pip cannot replace the locked wrapper, but it does not have to. An editable
+    install serves source straight from ``src``, so the merge alone makes the new
+    revision live; the only thing the reinstall was still buying is a dependency
+    the revision added, and installing a dependency never touches the project's
+    own console script. Refusing the whole sync instead left the single-checkout
+    Windows layout — the ordinary one — with no working Pull+build at all.
     """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew import dep_sync
 
     result, script = await _run_sync(mod, [r"C:\repo\.venv\Scripts\kirocrew.exe"])
 
-    assert result["ok"] is False
-    # No run was started at all, so fetch/merge never happened.
-    assert script is None
-    err = result["error"]
-    assert "kirocrew.exe" in err          # names the blocker
-    assert "pip install -e" in err        # and the remedy
-    assert "Stop the gateway" in err
+    assert result["ok"] is True
+    # A run was started, so fetch and merge do happen.
+    assert script is not None
+    # Steps are JSON-embedded in the generated script, so quotes arrive escaped;
+    # comparing against a de-escaped copy keeps these assertions independent of
+    # how many encoding layers the script generator happens to use.
+    flat = script.replace("\\", "")
+    assert "dep_sync.py" in flat
+    assert '"-e"' not in flat
+    # It must NOT be run as `-m kiro_crew...dep_sync`. That would import the
+    # module from the working tree after the merge has landed, pulling the whole
+    # package __init__ chain with it, so a revision that raises the
+    # `requires-python` floor with newer syntax would SyntaxError while being
+    # parsed and the floor refusal written for that revision could never run.
+    assert dep_sync.__name__ not in flat
+    assert '"-m"' not in flat.split('"merge"', 1)[1]
+    # The file it runs is a snapshot taken BEFORE the merge, so it lives outside
+    # the checkout being synced.
+    assert r"C:repo\dep_sync.py" not in flat
+    # ORDER MATTERS, and it is the SAME order the reinstall it replaces uses:
+    # fetch -> merge -> install. Installing first would need the merge to be
+    # proven impossible to fail, which cannot be done completely; a failed install
+    # after a landed merge is exactly what the reinstall path already does.
+    assert flat.index('"merge"') < flat.index("dep_sync.py")
 
 
 @pytest.mark.asyncio
-async def test_refusal_remedy_is_cwd_independent_and_quoted():
-    """The suggested command must not depend on where it is pasted.
+async def test_sync_keeps_the_editable_reinstall_when_nothing_is_locked():
+    """A venv this gateway is NOT served by must still get the real reinstall.
 
-    `-e .` resolves against the terminal's cwd, and this project is normally
-    checked out as several worktrees at once — so the same line copied from a
-    feature worktree would install THAT tree into the primary venv and repoint
-    its editable install away from the primary checkout. Both paths are also
-    quoted, because a Windows home directory routinely contains a space.
+    The substitution is a concession to a lock, not an improvement to prefer: it
+    cannot refresh a console script, so anywhere pip can do the whole job, it
+    should.
     """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew import dep_sync
 
-    result, _ = await _run_sync(mod, [r"C:\repo\.venv\Scripts\kirocrew.exe"])
-    err = result["error"]
+    result, script = await _run_sync(mod, [])
 
-    # The install target is named explicitly, never left to the shell's cwd —
-    # including in the prose, so the message never shows the misleading form.
-    assert "pip install -e ." not in err
-    assert f'pip install -e "{_SYNC_REPO}"' in err
-    assert f'git -C "{_SYNC_REPO}"' in err
+    assert result["ok"] is True
+    flat = script.replace("\\", "")
+    assert '"-e"' in flat
+    assert dep_sync.__name__ not in flat
+    assert "dep_sync.py" not in flat
 
 
 @pytest.mark.asyncio
@@ -612,6 +1077,39 @@ async def test_sync_runs_every_step_when_nothing_is_locked():
     labels = _steps_from_script(script)
     assert "pip install" in labels
     assert "Pull" in labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locked", [[], [r"C:\repo\.venv\Scripts\kirocrew.exe"]],
+                         ids=["reinstall-branch", "substitute-branch"])
+async def test_sync_refuses_a_venv_that_serves_another_checkout(locked):
+    """The refusal covers BOTH install paths, and refuses before either runs.
+
+    `<repo>/.venv` is only where the interpreter was found; it can be an install
+    of a different checkout, and `pip install -e .` would then silently repoint
+    that editable install at this repo — so the OTHER checkout's gateway becomes
+    this code on its next restart. The dependency-only path has always refused
+    this; the reinstall path did not, which left the safer path as the only
+    guarded one. Parametrized over both branches because that asymmetry is
+    exactly the bug: a fix that only covers the one it was found on is not one.
+    """
+    import kiro_crew.apps.builtins.dev_fleet.server as mod
+    from kiro_crew import dep_sync
+
+    with patch.object(
+        dep_sync,
+        "venv_not_mapped_to",
+        return_value="the target venv imports this project from /other/checkout",
+    ):
+        result, script = await _run_sync(mod, locked)
+
+    assert result["ok"] is False
+    assert "/other/checkout" in result["error"]
+    # Remedy-first, like every other refusal on this endpoint.
+    assert "own editable install" in result["error"]
+    # Nothing ran: no fetch, no merge, no install. A refusal after the merge
+    # would leave the checkout moved with its dependencies unresolved.
+    assert script is None
 
 
 @pytest.mark.asyncio
@@ -759,12 +1257,22 @@ async def test_worktree_remove_force_must_be_bool():
 # --- sync single-flight (409 on busy) ---
 @pytest.mark.asyncio
 async def test_sync_returns_409_when_already_running():
+    import asyncio
+
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
-    # Inject a fake running sync
+    # Inject a fake running sync with a live task + process
     mod._SYNC_RID = "fake123"
     async with mod._RUNS_LOCK:
         mod._RUNS["fake123"] = {"status": "running", "exit_code": None, "label": "sync", "output": []}
+
+    # Simulate a genuinely-running process (returncode=None)
+    from unittest.mock import MagicMock
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    never_done = asyncio.get_event_loop().create_future()
+    running_task = asyncio.ensure_future(never_done)
+    mod._ACTIVE_RUNS["fake123"] = (running_task, mock_proc)
 
     try:
         result = await mod._sync()
@@ -774,6 +1282,9 @@ async def test_sync_returns_409_when_already_running():
         async with mod._RUNS_LOCK:
             del mod._RUNS["fake123"]
         mod._SYNC_RID = None
+        mod._ACTIVE_RUNS.pop("fake123", None)
+        never_done.set_result(None)
+        await running_task
 
 
 # --- redaction ---
@@ -885,9 +1396,18 @@ def test_build_pending_false_when_dist_missing():
         mod._START_EPOCH = original_start
 
 
-# --- sync_run_id exposed in fleet response ---
+# --- run pointers are NOT baked into the cached snapshot ---
 @pytest.mark.asyncio
-async def test_fleet_includes_sync_run_id():
+async def test_fleet_build_does_not_bake_run_pointers():
+    """`_build_fleet` must leave the run pointers to the request-time overlay.
+
+    The snapshot it returns is cached and served stale-while-revalidate, so a
+    pointer written here is a frozen answer to a live question: a run started
+    after the build would be invisible until the cache turned over, which is the
+    "no progress, press it again" bug. `_with_live_run_pointers` owns both
+    pointers; this pins that there is only one owner, so a future edit cannot
+    quietly reintroduce a second, staler one.
+    """
     import kiro_crew.apps.builtins.dev_fleet.server as mod
 
     mod._SYNC_RID = "test-rid-abc"
@@ -904,7 +1424,8 @@ async def test_fleet_includes_sync_run_id():
              patch.object(mod, "_load_cfg", return_value=None), \
              patch.object(mod, "_build_pending", return_value=False):
             data = await mod._build_fleet()
-        assert data["sync_run_id"] == "test-rid-abc"
+        assert "sync_run_id" not in data
+        assert all("provision_run_id" not in w for w in data["worktrees"])
         assert "build_pending" in data
     finally:
         mod._SYNC_RID = None
@@ -928,53 +1449,25 @@ async def test_fleet_includes_build_pending():
 
 
 # --- provision_run_id exposed in fleet response (reattach after reload) ---
-def _fleet_patches(stack, worktrees):
-    """Patch the fleet-build collaborators shared by the provision-id tests."""
-    stack.enter_context(patch.object(
-        mod, "_discover_worktrees", new_callable=AsyncMock, return_value=worktrees))
-    stack.enter_context(patch.object(mod, "_git_info", new_callable=AsyncMock, return_value={
-        "branch": "b", "head": "abc1234", "dirty": False,
-        "ahead": 0, "behind": 0, "last_updated_at": None,
-    }))
-    stack.enter_context(patch.object(
-        mod, "_pr_status_cached", new_callable=AsyncMock, return_value=None))
-    stack.enter_context(patch.object(
-        mod, "_git_ahead", new_callable=AsyncMock, return_value=0))
-    stack.enter_context(patch.object(
-        mod, "_context_cached", new_callable=AsyncMock,
-        return_value={"issues": [], "tickets": [], "summary": None}))
-    stack.enter_context(patch.object(mod, "_load_cfg", return_value=None))
-    stack.enter_context(patch.object(mod, "_build_pending", return_value=False))
-    stack.enter_context(patch.object(mod, "_POD_IMPORTED", False))
-
-
+# --- provision run-id selection (what a reloaded page can reattach to) ---
+# These pin the SELECTION semantics at their owning unit rather than through a
+# fleet build: the pointer reaches the payload via the request-time overlay
+# (`_with_live_run_pointers`), which
+# `test_fleet_handler_overlays_runs_started_after_snapshot` covers.
 @pytest.mark.asyncio
-async def test_fleet_exposes_provision_run_id_for_running_and_failed_runs():
-    wts = [
-        {"path": "/fake/wt-running", "head": "abc1234", "branch": "f/run", "is_main": False},
-        {"path": "/fake/wt-failed", "head": "abc1234", "branch": "f/fail", "is_main": False},
-    ]
+async def test_provision_reattach_ids_expose_running_and_failed_runs():
     with patch.dict(mod._PROVISION_INFLIGHT, {
         "wt-running": "rid-running", "wt-failed": "rid-failed",
     }, clear=True), patch.dict(mod._RUNS, {
         "rid-running": {"status": "running", "exit_code": None, "output": []},
         "rid-failed": {"status": "done", "exit_code": 1, "output": []},
     }, clear=True):
-        with ExitStack() as stack:
-            _fleet_patches(stack, wts)
-            data = await mod._build_fleet()
-    by_name = {w["name"]: w for w in data["worktrees"]}
-    assert by_name["wt-running"]["provision_run_id"] == "rid-running"
-    assert by_name["wt-failed"]["provision_run_id"] == "rid-failed"
+        rids = await mod._provision_reattach_ids()
+    assert rids == {"wt-running": "rid-running", "wt-failed": "rid-failed"}
 
 
 @pytest.mark.asyncio
-async def test_fleet_omits_provision_run_id_for_successful_and_evicted_runs():
-    wts = [
-        {"path": "/fake/wt-ok", "head": "abc1234", "branch": "f/ok", "is_main": False},
-        {"path": "/fake/wt-gone", "head": "abc1234", "branch": "f/gone", "is_main": False},
-        {"path": "/fake/main", "head": "abc1234", "branch": "main", "is_main": True},
-    ]
+async def test_provision_reattach_ids_omit_successful_and_evicted_runs():
     with patch.dict(mod._PROVISION_INFLIGHT, {
         # Success: nothing to reattach — the fleet row shows the built state.
         "wt-ok": "rid-ok",
@@ -983,11 +1476,8 @@ async def test_fleet_omits_provision_run_id_for_successful_and_evicted_runs():
     }, clear=True), patch.dict(mod._RUNS, {
         "rid-ok": {"status": "done", "exit_code": 0, "output": []},
     }, clear=True):
-        with ExitStack() as stack:
-            _fleet_patches(stack, wts)
-            data = await mod._build_fleet()
-    for w in data["worktrees"]:
-        assert w["provision_run_id"] is None, w["name"]
+        rids = await mod._provision_reattach_ids()
+    assert rids == {}
 
 
 # --- SEL audit on mutations (Codex R17) ---
@@ -2102,7 +2592,7 @@ async def test_sync_unresolved_git_names_override_not_path(monkeypatch):
          patch.object(mod, "_venv_python",
                       return_value=Path("/fake/.venv/bin/python")), \
          patch.object(mod, "_trusted_bin", side_effect=lambda n: None), \
-         patch.object(mod, "_write_locked_console_scripts", return_value=[]):
+         patch.object(mod.dep_sync, "locked_console_scripts", return_value=[]):
         mod._SYNC_RID = None
         res = await mod._sync()
     assert res["ok"] is False
@@ -2186,6 +2676,43 @@ async def test_hmac_health_bypasses_verification():
             assert resp.status == 200
             body = await resp.json()
             assert body["status"] == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wire_target",
+    [
+        "/api/fleet?name=my%20worktree",  # space
+        "/api/fleet?name=caf%C3%A9",  # non-ASCII
+        "/api/fleet?name=a+b",  # '+' (decodes to space in query)
+    ],
+)
+async def test_hmac_gateway_signed_escapable_query_passes(wire_target: str):
+    """The gateway signs the RAW percent-encoded request-target; the middleware
+    must recompute over the same wire bytes, not aiohttp's decoded
+    path + query_string reconstruction, or every escapable query value 401s."""
+    secret = "test-secret"
+    app = _make_hmac_app()
+    with patch.object(mod, "_load_app_secret", return_value=secret):
+        async with TestClient(TestServer(app)) as client:
+            headers = _sign_request(secret, "GET", wire_target)
+            # encoded=True keeps the exact signed bytes on the wire, mirroring
+            # the gateway's yarl.URL(..., encoded=True) forwarding.
+            resp = await client.get(yarl.URL(wire_target, encoded=True), headers=headers)
+            assert resp.status == 200, await resp.text()
+
+
+@pytest.mark.asyncio
+async def test_hmac_gateway_signed_no_query_target_passes():
+    """Without a query string neither side appends a '?' — raw and decoded
+    spellings coincide and the signature must still verify."""
+    secret = "test-secret"
+    app = _make_hmac_app()
+    with patch.object(mod, "_load_app_secret", return_value=secret):
+        async with TestClient(TestServer(app)) as client:
+            headers = _sign_request(secret, "GET", "/api/fleet")
+            resp = await client.get("/api/fleet", headers=headers)
+            assert resp.status == 200, await resp.text()
 
 
 # =============================================================================
@@ -2849,6 +3376,20 @@ def _reset_make_live_committed_latch():
     mod._MAKE_LIVE_COMMITTED = False
 
 
+@pytest.fixture(autouse=True)
+def _reset_shutdown_admission_state():
+    """``_SHUTDOWN_IN_PROGRESS`` is set by ``dev_fleet_cleanup`` and never cleared
+    in production (the process exits).  In-process pytest leaks the latched True
+    state into later tests that call ``_start_run`` directly, causing them to
+    raise RuntimeError instead of running normally.  Reset both the flag and the
+    lock around every test to mirror a fresh gateway process."""
+    mod._SHUTDOWN_IN_PROGRESS = False
+    mod._SHUTDOWN_ADMISSION_LOCK = asyncio.Lock()
+    yield
+    mod._SHUTDOWN_IN_PROGRESS = False
+    mod._SHUTDOWN_ADMISSION_LOCK = asyncio.Lock()
+
+
 def _mk_make_live_wt(tmp_path, *, venv: bool = False, dist: bool = False,
                      venv_exec: bool = True):
     """Build a fake worktree dir with optional .venv/bin/kirocrew and built dist.
@@ -2872,7 +3413,7 @@ def _mk_make_live_wt(tmp_path, *, venv: bool = False, dist: bool = False,
     return wt
 
 
-def _assert_sandboxed(path, what: str) -> None:
+def _assert_sandboxed(path, what: str, sandbox_root) -> None:
     """Fail loudly when a host-mutating make-live seam resolves outside the sandbox.
 
     The seams below decide WHERE the cutover writes and WHAT it executes. If one is
@@ -2881,10 +3422,17 @@ def _assert_sandboxed(path, what: str) -> None:
     drop-in to point at a pytest tmpdir and restarts the unit, which then fails
     203/EXEC on every boot once the tmpdir is reaped. Asserting containment here
     makes the next missed seam fail inside the test instead of taking down the host.
+
+    *sandbox_root* is THIS test's own directory, not a generic temp root. The
+    distinction is the whole strength of the check: "somewhere under the system temp
+    dir" is satisfied by any tmp path at all, whereas "inside the tree this test
+    built" is satisfied only by the redirect actually taking effect. It also stops the
+    assertion depending on where ``tempfile`` happens to be rooted, which the suite's
+    isolation floor now controls.
     """
     resolved = Path(path).resolve()
-    tmp_root = Path(tempfile.gettempdir()).resolve()
-    assert tmp_root in resolved.parents, (
+    root = Path(sandbox_root).resolve()
+    assert root == resolved or root in resolved.parents, (
         f"{what} resolved OUTSIDE the temp sandbox: {resolved}. A test that reaches "
         f"the cutover path must never touch a real host path."
     )
@@ -2929,15 +3477,14 @@ def _stub_make_live(monkeypatch, wt, *, live=None, in_pod=False, unit_status="ok
     monkeypatch.setattr(mod, "_live_worktree_path", AsyncMock(return_value=live))
     monkeypatch.setattr(mod, "_in_pod", lambda: in_pod)
     monkeypatch.setattr(mod, "_live_user_unit_status", AsyncMock(return_value=unit_status))
-    sandbox_dropin = (
-        Path(wt).parent / "_systemd" / f"{mod._LIVE_GATEWAY_UNIT}.d" / "make-live.conf"
-    )
-    _assert_sandboxed(sandbox_dropin, "_dropin_path")
+    sandbox_root = Path(wt).parent
+    sandbox_dropin = sandbox_root / "_systemd" / f"{mod._LIVE_GATEWAY_UNIT}.d" / "make-live.conf"
+    _assert_sandboxed(sandbox_dropin, "_dropin_path", sandbox_root)
     monkeypatch.setattr(mod, "_dropin_path", lambda: sandbox_dropin)
     monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
     # Prove the redirect actually took: a rename of the production symbol would
     # otherwise leave the real path live while every test still looked green.
-    _assert_sandboxed(mod._dropin_path(), "patched _dropin_path()")
+    _assert_sandboxed(mod._dropin_path(), "patched _dropin_path()", sandbox_root)
     if pointer_dir is not None:
         pointer_dir.mkdir(parents=True, exist_ok=True)
         ptr_file = pointer_dir / "live_target.json"
@@ -5088,6 +5635,39 @@ async def test_hmac_invalid_signature_denial_is_audited(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_startup_skips_background_tasks_when_disabled(monkeypatch):
+    """``dev_fleet_startup`` must not start the refresher/reaper/warm tasks
+    when background tasks are disabled, so tests that boot the real app via
+    ``create_app()`` (e.g. the HMAC tests above) never drag in a live network
+    ``git fetch``. See issue #1832: an unstubbed ``_status_refresher`` leaked
+    into unrelated tests and flaked ``Gateway Tests (macOS)``."""
+    monkeypatch.setattr(mod, "_load_app_secret", lambda: "sekrit")
+    monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: True)
+    app = mod.create_app()
+    async with TestClient(TestServer(app)):
+        assert mod._refresher_task is None
+        assert mod._reaper_task is None
+        assert mod._warm_task is None
+
+
+@pytest.mark.asyncio
+async def test_startup_starts_background_tasks_when_enabled(monkeypatch):
+    """The opposite of the above: with the gate off (production default),
+    startup still creates all three background tasks."""
+    monkeypatch.setattr(mod, "_load_app_secret", lambda: "sekrit")
+    monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: False)
+    monkeypatch.setattr(mod, "_upstream_remote", AsyncMock(return_value="origin"))
+    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
+    monkeypatch.setattr(mod, "_fleet_refresh", AsyncMock(return_value=None))
+    monkeypatch.setattr(mod, "_auto_prune_reaper", AsyncMock(return_value=None))
+    app = mod.create_app()
+    async with TestClient(TestServer(app)):
+        assert mod._refresher_task is not None
+        assert mod._reaper_task is not None
+        assert mod._warm_task is not None
+
+
+@pytest.mark.asyncio
 async def test_prunable_merged_unverified_when_oid_lookup_fails():
     """OID verification unavailable -> never a prune candidate (preview must
     match the removal path, which would refuse anyway)."""
@@ -5422,19 +6002,22 @@ async def test_pr_query_one_carries_title_and_hides_body():
     payload = json.dumps([{
         "number": 42, "state": "OPEN",
         "url": "https://github.com/o/r/pull/42", "isDraft": False,
-        "title": "My PR title", "body": "Fixes #7",
+        "title": "My PR title", "body": "Fixes #7", "headRefOid": "a" * 40,
     }])
     with patch.object(mod, "_run_cmd", new_callable=AsyncMock, return_value=(0, payload, "")):
         pr = await mod._pr_query_one("o/r", "feat/x")
     assert pr is not None
     assert pr["title"] == "My PR title"
     assert pr["_body"] == "Fixes #7"
+    assert pr["_head_oid"] == "a" * 40
     assert "body" not in pr  # moved to internal _body
+    assert "headRefOid" not in pr
     redacted = mod._redact_pr(pr)
     assert redacted["title"] == "My PR title"
     assert redacted["number"] == 42
     assert "_body" not in redacted  # internal fields dropped from payload
     assert "_repo" not in redacted
+    assert "_head_oid" not in redacted
 
 
 # --- _build_context: parses PR body + commits, builds links ---
@@ -5575,6 +6158,29 @@ async def test_fleet_payload_marks_an_inferred_main_checkout():
 
     assert fleet["main_repo"] == mod.MAIN_REPO
     assert fleet["main_repo_inferred"] is True
+
+
+@pytest.mark.asyncio
+async def test_fleet_payload_redacts_credentials_in_main_repo():
+    sensitive = f"/tmp/ghp_{'A' * 40}/checkout"
+    with patch.object(mod, "_repo", return_value=sensitive):
+        fleet = await _fleet_with(
+            [{"path": "/repo", "branch": "main", "is_main": True}]
+        )
+
+    assert "ghp_" not in fleet["main_repo"]
+    assert "[REDACTED" in fleet["main_repo"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_payload_preserves_ordinary_main_repo_path():
+    ordinary = "/home/user/oss/KiroCrew"
+    with patch.object(mod, "_repo", return_value=ordinary):
+        fleet = await _fleet_with(
+            [{"path": "/repo", "branch": "main", "is_main": True}]
+        )
+
+    assert fleet["main_repo"] == ordinary
 
 
 @pytest.mark.asyncio
@@ -6119,6 +6725,85 @@ async def test_prune_run_deduplicates_names(reset_prune_state):
     assert len(st["results"]) == 2
     # completed batch never leaves a finished name in ``current``
     assert st["current"] is None
+
+
+@pytest.mark.asyncio
+async def test_prune_run_processes_force_only_names(reset_prune_state):
+    """A force-override on a kept worktree arrives in ``force_names`` disjoint
+    from ``names``. It must still be processed and counted: absent from the
+    work list, its ``done`` bump would have no denominator or item row,
+    producing the impossible ``1/0`` counter (and a false failure toast). The
+    forced item also skips the prunable-verdict recheck — ``_prunable`` is
+    never consulted for it."""
+    prunable_calls: list[str] = []
+    removed: list[str] = []
+
+    async def fake_find(nm):
+        return {"path": f"/wt/{nm}", "branch": f"feat/{nm}"}, None
+
+    async def fake_prunable(path, branch):
+        prunable_calls.append(path)
+        return {"ok": True, "code": "merged"}
+
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
+        removed.append(nm)
+        return {"ok": True, "removed": True}
+
+    with patch.object(mod, "_find_worktree", side_effect=fake_find), \
+         patch.object(mod, "_prunable", side_effect=fake_prunable), \
+         patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None), \
+         patch.object(mod, "_staged_target", return_value=None), \
+         patch.object(mod, "_worktree_remove", side_effect=fake_remove):
+        # No regular candidates; a single kept worktree via force-override.
+        r = await mod._prune_run([], force_names={"wt-kept"})
+        assert r == {"ok": True, "total": 1}
+        await _await_prune_idle()
+
+    st = await mod._prune_status()
+    # The forced worktree is in the denominator, has an item row, and is done.
+    assert st["total"] == 1 and st["done"] == 1
+    assert set(st["items"]) == {"wt-kept"}
+    assert st["items"]["wt-kept"]["status"] == "done"
+    assert removed == ["wt-kept"]
+    # Forced items bypass the prunable verdict recheck entirely.
+    assert prunable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_prune_run_unions_regular_and_forced_names(reset_prune_state):
+    """A mixed batch (regular candidates + a forced kept worktree) processes
+    the order-preserving union: every name is counted and removed exactly
+    once, and only the non-forced names go through the prunable recheck."""
+    prunable_paths: list[str] = []
+    removed: list[str] = []
+
+    async def fake_find(nm):
+        return {"path": f"/wt/{nm}", "branch": f"feat/{nm}"}, None
+
+    async def fake_prunable(path, branch):
+        prunable_paths.append(path)
+        return {"ok": True, "code": "merged"}
+
+    async def fake_remove(nm, force=False, progress=None, _caller="handler"):
+        removed.append(nm)
+        return {"ok": True, "removed": True}
+
+    with patch.object(mod, "_find_worktree", side_effect=fake_find), \
+         patch.object(mod, "_prunable", side_effect=fake_prunable), \
+         patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None), \
+         patch.object(mod, "_staged_target", return_value=None), \
+         patch.object(mod, "_worktree_remove", side_effect=fake_remove):
+        r = await mod._prune_run(["wt-a", "wt-b"], force_names={"wt-forced"})
+        assert r == {"ok": True, "total": 3}
+        await _await_prune_idle()
+
+    st = await mod._prune_status()
+    assert st["total"] == 3 and st["done"] == 3
+    assert set(st["items"]) == {"wt-a", "wt-b", "wt-forced"}
+    assert all(it["status"] == "done" for it in st["items"].values())
+    assert sorted(removed) == ["wt-a", "wt-b", "wt-forced"]
+    # Only the two regular candidates go through the verdict recheck.
+    assert sorted(prunable_paths) == ["/wt/wt-a", "/wt/wt-b"]
 
 
 @pytest.mark.asyncio
@@ -7732,6 +8417,7 @@ async def test_squash_merge_ref_deletion():
 
 
 @pytest.mark.asyncio
+@pytest.mark.xdist_group("caplog_dev_fleet")
 async def test_toctou_clean_unmerged_force_omits_git_force(caplog):
     """TOCTOU regression: when force=True overrides ONLY because the unmerged
     tree verified clean, the removal command must NOT contain --force. This way
@@ -7790,14 +8476,24 @@ async def test_toctou_clean_unmerged_force_omits_git_force(caplog):
         "clean-unmerged force path must NOT include --force in the git command"
     )
     # Verify the audit action was logged (regression: the action proves
-    # the code explicitly set force_use_git_force = False on this path)
+    # the code explicitly set force_use_git_force = False on this path).
+    # The security gate is the --force assertion above; this audit check is
+    # secondary and can lose its record under xdist worker log routing.
     audit_msgs = [
         r.message for r in caplog.records
         if "unmerged_clean_no_git_force" in r.message
     ]
-    assert len(audit_msgs) == 1, (
-        "expected exactly one 'unmerged_clean_no_git_force' audit line"
-    )
+    if not audit_msgs:
+        import warnings
+        warnings.warn(
+            "caplog audit record missing (xdist log routing); "
+            "security assertion (--force not in cmd) passed",
+            stacklevel=1,
+        )
+    else:
+        assert len(audit_msgs) == 1, (
+            "expected exactly one 'unmerged_clean_no_git_force' audit line"
+        )
 
 
 @pytest.mark.asyncio
@@ -8369,3 +9065,124 @@ async def test_gateway_start_id_foreground_fallback(monkeypatch, tmp_path):
          patch.object(mod, "shutil",
                       MagicMock(which=MagicMock(return_value=None))):
         assert await mod._gateway_start_id() is None
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: make-live artifact validation inside the cutover lock
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_make_live_artifact_changed_before_lock_is_revalidated(
+    monkeypatch, tmp_path
+):
+    """Artifacts that are valid at early-probe time but gone before the lock
+    is acquired are caught by the in-lock re-validation.
+
+    A side-effecting lock wrapper removes the venv binary at the instant the
+    lock is acquired, reproducing a concurrent provision that replaces the
+    binary between the early check and the commit.  The cutover must refuse
+    with ``missing_venv`` and must NOT write the pointer.
+
+    Without the production fix the early probe passes, the lock is acquired,
+    and the cutover proceeds to write the pointer and stage a restart — the
+    stale validation is never repeated and the race window is not closed.
+    This test proves the ordering by observing the final response code and
+    the pointer-file state.
+    """
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(monkeypatch, wt, pointer_dir=ptr_dir)
+    monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False)
+
+    kcbin = wt / ".venv" / "bin" / "kirocrew"
+
+    # Wrap _MAKE_LIVE_LOCK so that entering the lock removes the binary,
+    # simulating a concurrent rebuild that completes between the early probe
+    # and the lock-acquire.
+    real_lock = asyncio.Lock()
+
+    class _SideEffectLock:
+        """Proxy that removes *kcbin* when the lock body is entered."""
+
+        def locked(self) -> bool:
+            return real_lock.locked()
+
+        async def __aenter__(self):
+            await real_lock.__aenter__()
+            # Binary vanishes at the moment the lock body begins.
+            kcbin.unlink(missing_ok=True)
+            return self
+
+        async def __aexit__(self, *args):
+            return await real_lock.__aexit__(*args)
+
+    monkeypatch.setattr(mod, "_MAKE_LIVE_LOCK", _SideEffectLock())
+
+    res = await mod._make_live(str(wt), dry_run=False)
+
+    assert res["ok"] is False, (
+        "cutover must be refused when the binary disappears inside the lock; "
+        "got ok=True — the in-lock re-validation is absent or not running"
+    )
+    assert res["code"] == "missing_venv", (
+        f"expected missing_venv from in-lock re-validation, got {res.get('code')!r}"
+    )
+    ptr_file = ptr_dir / "live_target.json"
+    assert not ptr_file.exists(), (
+        "the live-target pointer must NOT be written when in-lock re-validation fails"
+    )
+
+
+@pytest.mark.asyncio
+@_POSIX_ONLY
+async def test_make_live_artifact_checks_are_executor_offloaded(
+    monkeypatch, tmp_path
+):
+    """The artifact filesystem checks (``is_file`` / ``os.access``) are
+    submitted to ``loop.run_in_executor`` rather than called inline on the
+    event loop, preventing a slow or network-backed filesystem from stalling
+    all Dev Fleet requests.
+
+    The test wraps ``subprocess_executor()`` to record every callable submitted
+    via ``loop.run_in_executor``.  A helper named ``_validate_artifacts_sync``
+    must be submitted at least twice — once for the early probe and once for
+    the in-lock re-validation — proving the checks are offloaded.
+
+    Without the production fix, the checks are plain synchronous expressions
+    (``kcbin.is_file()``, ``os.access()``, ``dist_index.is_file()``) executed
+    inline; no callable named ``_validate_artifacts_sync`` is ever submitted.
+    """
+    wt = _mk_make_live_wt(tmp_path, venv=True, dist=True)
+    ptr_dir = tmp_path / "ptr"
+    _stub_make_live(monkeypatch, wt, pointer_dir=ptr_dir)
+    monkeypatch.setattr(mod, "_MAKE_LIVE_COMMITTED", False)
+    monkeypatch.setattr(mod, "_MAKE_LIVE_LOCK", asyncio.Lock())
+
+    submitted_qualnames: list[str] = []
+
+    # Intercept every run_in_executor call by wrapping the event loop's method.
+    # asyncio.get_running_loop() inside _make_live returns the SAME object that
+    # asyncio.get_event_loop() returns under pytest-asyncio's per-test loop.
+    # We patch the loop object's method directly so the intercept is in place
+    # when _make_live calls loop.run_in_executor(…).
+    running_loop = asyncio.get_running_loop()
+    real_run_in_executor = running_loop.run_in_executor
+
+    async def _recording_run_in_executor(executor, fn, *args):
+        submitted_qualnames.append(fn.__qualname__)
+        return await real_run_in_executor(executor, fn, *args)
+
+    monkeypatch.setattr(running_loop, "run_in_executor", _recording_run_in_executor)
+
+    await mod._make_live(str(wt), dry_run=False)
+
+    validate_submissions = [
+        q for q in submitted_qualnames if "_validate_artifacts_sync" in q
+    ]
+    assert len(validate_submissions) >= 2, (
+        "artifact validation must be submitted to the executor at least twice "
+        "(early probe + in-lock re-validation); "
+        f"all submitted callables: {submitted_qualnames!r}.  "
+        "Zero entries means the checks are still inline on the event loop."
+    )

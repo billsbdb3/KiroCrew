@@ -22,6 +22,7 @@ try:
 except ImportError:  # pragma: no cover — exercised by test_import_error_*
     TranscribeStreamingClient = None  # type: ignore[assignment,misc]
 
+from kiro_crew import aws_consent
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.origin import check_origin
 from kiro_crew.llm_helpers import run_bg_oneliner
@@ -347,7 +348,22 @@ async def _run_apple_session(
         locale=cfg.stt.language_code or "en-US",
         sample_rate=STREAM_SAMPLE_RATE_HZ,
     )
-    problem = await session.start()
+    try:
+        problem = await session.start()
+    except BaseException:
+        # A cancelled start() has no owner on this side yet: the teardown
+        # `finally` below only exists once start() has returned. close() is
+        # idempotent, so running it on top of start()'s own cancellation
+        # cleanup is safe, and the endpointer holds no tasks this early so
+        # its aclose() is a free symmetry with the failure branch below. The
+        # end audit keeps the trail balanced — the stt_stream_start already
+        # emitted would otherwise have no matching end, since the raise
+        # bypasses every later emitter.
+        await session.close()
+        if endpointer is not None:
+            await endpointer.aclose()
+        _emit_end_audit(caller, outcome="error")
+        raise
     if problem:
         try:
             await ws.send_json({"type": "error", "message": problem})
@@ -587,6 +603,22 @@ async def api_ws_stt(request: web.Request) -> web.WebSocketResponse:
             # friendly error here and keep the audit trail balanced.
             await ws.send_json({"type": "error", "message": "amazon-transcribe not installed"})
             await _close_and_end_audit(ws, caller, outcome="error")
+            return ws
+
+        # Streaming Transcribe bills per second of audio, so the socket does not
+        # start without a recorded operator consent for this exact
+        # profile+region. Refused before the client is constructed and before
+        # any audio is read, and reported over the same error channel as the
+        # other setup failures so the audit trail stays balanced.
+        granted, reason = await aws_consent.authorize(
+            aws_consent.SERVICE_TRANSCRIBE,
+            profile=cfg.stt.transcribe_profile,
+            region=cfg.stt.transcribe_region,
+        )
+        if not granted:
+            logger.warning("AWS request refused: %s", reason)
+            await ws.send_json({"type": "error", "message": reason})
+            await _close_and_end_audit(ws, caller, outcome="refused")
             return ws
 
         try:

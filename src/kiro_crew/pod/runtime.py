@@ -36,6 +36,7 @@ from kiro_crew.pod import launchd
 from kiro_crew.pod import provision as prov
 from kiro_crew.pod import unit as unit_mod
 from kiro_crew.pod.config import PodConfig
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # Pod names become systemd instance names and path segments; keep them strict.
 _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,60}$")
@@ -83,24 +84,31 @@ CRONS_TRUE: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
 
 def read_env_file(cfg: PodConfig, name: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    f = cfg.env_file(name)
+    """Parsed ``KEY='value'`` pairs for pod *name*, ``{}`` on any ``OSError``.
+
+    Fail-OPEN by design, which bounds who may use it: a missing pod, an
+    unreadable pods dir and a comments-only file all yield the same empty
+    mapping, so a caller that must tell "absent" from "exists but cannot be
+    positively read" MUST NOT read the pin through here — see
+    ``dev_fleet._read_pin_strict``, which propagates the failure instead.
+    """
     try:
-        if f.exists():
-            for ln in f.read_text().splitlines():
-                ln = ln.strip()
-                if not ln or ln.startswith("#") or "=" not in ln:
-                    continue
-                key, val = ln.split("=", 1)
-                raw = val.strip()
-                # Strip a single matched surrounding quote pair only (the form
-                # write_env_file emits), so a value that legitimately contains a
-                # quote is not mangled.
-                if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
-                    raw = raw[1:-1]
-                out[key.strip()] = raw
+        text = cfg.env_file(name).read_text()
     except OSError:
-        pass
+        return {}
+    out: dict[str, str] = {}
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or "=" not in ln:
+            continue
+        key, val = ln.split("=", 1)
+        raw = val.strip()
+        # Strip a single matched surrounding quote pair only (the form
+        # write_env_file emits), so a value that legitimately contains a quote is
+        # not mangled.
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            raw = raw[1:-1]
+        out[key.strip()] = raw
     return out
 
 
@@ -161,8 +169,8 @@ def _git_worktrees(ref: Path) -> dict[str, Path]:
         cp = subprocess.run(
             ["git", "-C", str(ref), "worktree", "list", "--porcelain"],
             capture_output=True,
-            text=True,
             timeout=10,
+            **UTF8_TEXT,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -223,8 +231,9 @@ def resolve_checkout(
 
 
 # --------------------------------------------------------------------------- #
-# Port derivation. POSIX ``cksum`` is a specific CRC that is NOT zlib.crc32, so
-# we shell the same binary rather than reimplement it and risk drifting the port.
+# Port derivation. POSIX ``cksum`` is a specific CRC that is NOT zlib.crc32.
+# Implementing that standard algorithm here keeps existing pod ports stable while
+# making a fresh Windows install independent of an external POSIX executable.
 # --------------------------------------------------------------------------- #
 def _pinned_port(cfg: PodConfig, name: str) -> int | None:
     """A ``PORT=`` pinned in the pod's env file wins over derivation."""
@@ -234,16 +243,39 @@ def _pinned_port(cfg: PodConfig, name: str) -> int | None:
     return None
 
 
+def _posix_cksum(data: bytes) -> int:
+    """Return the CRC printed by POSIX ``cksum`` for *data*.
+
+    POSIX folds the byte length into the CRC, least-significant byte first, then
+    complements the result.  Keep the bitwise form small and auditable; pod names
+    are at most 64 bytes, so a lookup table would add complexity without useful
+    performance.
+    """
+    crc = 0
+
+    def _fold_byte(current: int, byte: int) -> int:
+        current ^= byte << 24
+        for _ in range(8):
+            current = (
+                ((current << 1) ^ 0x04C11DB7) if current & 0x80000000 else current << 1
+            ) & 0xFFFFFFFF
+        return current
+
+    for byte in data:
+        crc = _fold_byte(crc, byte)
+    length = len(data)
+    while length:
+        crc = _fold_byte(crc, length & 0xFF)
+        length >>= 8
+    return (~crc) & 0xFFFFFFFF
+
+
 def derive_port(cfg: PodConfig, name: str) -> int:
     """Resolve pod *name*'s port: pinned ``PORT=`` else ``base + (cksum % 199) + 1``."""
     pinned = _pinned_port(cfg, name)
     if pinned is not None:
         return pinned
-    try:
-        out = subprocess.run(["cksum"], input=name, capture_output=True, text=True, timeout=5)
-        cks = int(out.stdout.split()[0])
-    except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
-        raise PodError(f"cksum failed for {name!r}: {exc}") from exc
+    cks = _posix_cksum(name.encode("utf-8"))
     return cfg.base_port + (cks % 199) + 1
 
 
@@ -346,9 +378,7 @@ def require_systemd() -> None:
             "Use `./dev-backend.sh` to preview a worktree on this platform."
         )
     if shutil.which("systemctl") is None:
-        raise PodError(
-            "pods require `systemctl --user`, but no `systemctl` was found on PATH."
-        )
+        raise PodError("pods require `systemctl --user`, but no `systemctl` was found on PATH.")
     if not has_session_bus():
         uid = getattr(os, "getuid", lambda: -1)()
         user = os.environ.get("USER") or os.environ.get("LOGNAME") or str(uid)
@@ -536,8 +566,10 @@ def _write_and_load_unit(cfg: PodConfig) -> subprocess.CompletedProcess | None:
     systemd executes is the definition it loaded — so a writer that renders the
     current hookless template and then fails to reload leaves a file that reads
     "current" in front of a cached definition still carrying the destructive
-    ``ExecStopPost``. Every later caller then skips the refresh and the pod's HOME
-    is deleted from a stop hook. Unlinking on failure keeps the on-disk state
+    ``ExecStopPost``. :func:`start_pod` then skips its refresh and boots the pod
+    under that cached definition, whose hook deletes the pod's HOME on any
+    systemd-initiated stop — including the stop half of a ``Restart=``, which no
+    ``down`` gate is in the path of. Unlinking on failure keeps the on-disk state
     honest, so the next call re-renders and retries.
 
     Returns ``None`` on success, or the failing ``daemon-reload`` result.
@@ -867,11 +899,11 @@ def install_backend(cfg: PodConfig) -> tuple[str, subprocess.CompletedProcess | 
     dispatch layer — two different documented behaviours.
 
     Routed through :func:`_write_and_load_unit` so this path upholds the same
-    invariant the lifecycle paths do: a unit file left on disk has been loaded. A
-    reload that fails here used to leave a hookless file behind, which made
-    ``unit_is_current`` report "current" while systemd still ran the old
-    ``ExecStopPost`` — so a later ``down`` skipped its refresh and deleted the
-    pod's HOME from that hook.
+    invariant the lifecycle paths do: a unit file left on disk has been loaded.
+    A hookless file left behind by a failed reload would make
+    ``unit_is_current`` report "current" while systemd still runs the old
+    ``ExecStopPost`` — so :func:`start_pod` would skip its refresh and boot the
+    pod under a definition that deletes its HOME from a stop hook.
     """
     require_backend()
     if IS_MACOS:
@@ -941,15 +973,50 @@ def mint_token(cfg: PodConfig, name: str, ttl: str = "2h") -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Seed sanitization — deny-by-default. A seeded pod must NEVER be able to grab the
-# real Slack identity, so we only ever return a config with tunnel DISABLED.
-# Anything that prevents us from positively guaranteeing that (missing file, bad
-# JSON) returns None → the caller skips the seed and the pod boots blank.
+# Seed sanitization — deny-by-default. A seeded pod must NEVER be able to grab a
+# live messaging identity, so we only ever return a config with the tunnel and
+# every self-activating channel DISABLED. Anything that prevents us from positively
+# guaranteeing that (missing file, bad JSON) returns None → the caller skips the
+# seed and the pod boots blank.
 # --------------------------------------------------------------------------- #
+
+# Config sections a sanitized seed boots with ``enabled=False``. Deny-by-default:
+# every channel carrying a config-level ``enabled`` is listed, because that flag is
+# the only thing between a seed cloned from the real config (the intended
+# ``--seed ~/.kiro/crew`` workflow) and a pod that answers real people as the
+# operator's bot. The channel's credential is not a second gate — Telegram,
+# Discord, Webex and Weixin read their token straight out of the seeded
+# config.json; iMessage needs no credential at all, since its transport is the
+# operator's own signed-in Messages.app; and Teams keeps its App ID in config.json
+# while ``MICROSOFT_APP_PASSWORD`` reaches the pod through the inherited env.
+# Slack is deliberately absent: it has no config-level enable, being gated purely
+# on credentials that ``build_pod_env`` scrubs.
+#
+# ``test_pod.py`` pins this tuple against ``channels.builtin_channel_descriptors()``
+# so a channel added to the roster cannot reach a pod ungated.
+SEED_DISABLED_SECTIONS: tuple[str, ...] = (
+    "tunnel",
+    "wecom",
+    "telegram",
+    "discord",
+    "webex",
+    "teams",
+    "weixin",
+    "imessage",
+    # WhatsApp is the sharpest case on this list: its transport is the operator's
+    # OWN account, paired as a linked device, so a seeded pod booting it live would
+    # send from the operator's real number using a credential that is not an env
+    # var this env can scrub (the session store lives under the data home).
+    "whatsapp",
+    "feishu",
+)
+
+
 def sanitized_seed_config(seed_dir: Path) -> dict | None:
-    """Read ``<seed_dir>/config.json`` and return it with ``tunnel.enabled``
-    forced to False, or None if it can't be safely sanitized (no file / bad JSON
-    / sensitive path). Never copies any other state (DB / sessions / crons)."""
+    """Read ``<seed_dir>/config.json`` and return it with ``enabled`` forced to
+    False on every ``SEED_DISABLED_SECTIONS`` section, or None if it can't be
+    safely sanitized (no file / bad JSON / sensitive path). Never copies any other
+    state (DB / sessions / crons)."""
     # ``--seed`` is a user-supplied path: refuse to read from a sensitive /
     # credential location before touching the file. Resolve first so a symlink or
     # ".." can't smuggle past the guard.
@@ -968,14 +1035,10 @@ def sanitized_seed_config(seed_dir: Path) -> dict | None:
         return None
     if not isinstance(data, dict):
         return None
-    # Deny-by-default: force OFF every messaging channel that can self-activate
-    # from config.json — not just the tunnel. A seed cloned from a real config
-    # (the intended ``--seed ~/.kiro/crew`` workflow) would otherwise boot live
-    # Telegram / WeCom bots answering real users. Overwrite any non-dict section
-    # value too, so the enabled=False guarantee can't be skipped by a falsy value.
-    # (Slack has no config-level enable — it is credential-gated, and those creds
-    # are scrubbed from the pod env by build_pod_env.)
-    for section in ("tunnel", "telegram", "wecom"):
+    # Force OFF every self-activating section (SEED_DISABLED_SECTIONS carries the
+    # roster and the reasoning). Overwrite a non-dict section value too, so the
+    # enabled=False guarantee can't be skipped by a falsy value.
+    for section in SEED_DISABLED_SECTIONS:
         if not isinstance(data.get(section), dict):
             data[section] = {}
         data[section]["enabled"] = False
@@ -986,13 +1049,19 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
     """Construct the isolated gateway environment for a pod.
 
     Scrubs messaging-identity creds so the pod can't inherit and re-use the live
-    plane's Slack / WeCom / Telegram identity via the systemd --user manager env:
-    ``SLACK_*``, ``WECOM_*`` (WECOM_BOT_ID / WECOM_SECRET), and non-AWS ``*_TOKEN``
-    (covers ``TELEGRAM_BOT_TOKEN``). ``AWS_*`` is kept on purpose (pods run agent
-    turns), and the ``_TOKEN`` scrub deliberately EXCLUDES ``AWS_`` so
-    ``AWS_SESSION_TOKEN`` (temp creds) survives intact — scrubbing it would leave
-    half a credential and break every AWS call. Config-level channel enables are
-    additionally forced off by ``sanitized_seed_config`` (defense-in-depth).
+    plane's Slack / WeCom / Telegram / Teams / Feishu identity via the systemd
+    --user manager env: ``SLACK_*``, ``WECOM_*`` (WECOM_BOT_ID / WECOM_SECRET),
+    ``MICROSOFT_APP_*``, ``FEISHU_*`` and non-AWS ``*_TOKEN`` (covers
+    ``TELEGRAM_BOT_TOKEN``). Teams and Feishu each need their own prefix because
+    none of ``MICROSOFT_APP_ID`` / ``MICROSOFT_APP_PASSWORD`` /
+    ``MICROSOFT_APP_TENANT_ID`` / ``FEISHU_APP_ID`` / ``FEISHU_APP_SECRET`` ends
+    in ``_TOKEN``, so the generic suffix rule that catches every other channel's
+    bot credential passes the Azure Bot secret and the Feishu app secret straight
+    through. ``AWS_*`` is kept on purpose (pods run agent turns), and the
+    ``_TOKEN`` scrub deliberately EXCLUDES ``AWS_`` so ``AWS_SESSION_TOKEN`` (temp
+    creds) survives intact — scrubbing it would leave half a credential and break
+    every AWS call. Config-level channel enables are additionally forced off by
+    ``sanitized_seed_config`` (defense-in-depth).
     """
     env = {
         **os.environ,
@@ -1041,6 +1110,8 @@ def build_pod_env(cfg: PodConfig, home_dir: Path, port: int, checkout: Path) -> 
         for k in env
         if k.startswith("SLACK_")
         or k.startswith("WECOM_")
+        or k.startswith("MICROSOFT_APP_")
+        or k.startswith("FEISHU_")
         or (k.endswith("_TOKEN") and not k.startswith("AWS_"))
     ]:
         env.pop(key, None)
@@ -1072,8 +1143,16 @@ def write_pod_config(home_dir: Path, seed: str) -> None:
         return
     sanitized = sanitized_seed_config(Path(seed)) if seed else None
     cfg_data = sanitized if sanitized is not None else {"tunnel": {"enabled": False}}
-    dst_cfg.write_text(json.dumps(cfg_data, indent=2))
-    os.chmod(dst_cfg, stat.S_IRUSR | stat.S_IWUSR)  # 0o600 owner read/write only
+    # Create-only (the exists() guard above): lock the temp down before any
+    # token-bearing payload reaches the published name. write_text then chmod
+    # left the file at its inherited DACL until the chmod returned, and the
+    # chmod itself was a no-op on Windows. atomic_write encodes UTF-8; the
+    # previous write_text call did not pass encoding=.
+    atomic_write(
+        dst_cfg,
+        json.dumps(cfg_data, indent=2),
+        restrict_to_owner=True,
+    )
 
 
 def cleanup_home(cfg: PodConfig, name: str) -> int:
@@ -1313,7 +1392,6 @@ def require_pod_safe_verb(argv: list[str], name: str) -> None:
     verb = argv[0] if argv else ""
     if verb in _POD_SAFE_VERBS:
         return
-    hint = ""
     if verb in _POD_EQUIVALENT:
         hint = f" Use `{_POD_EQUIVALENT[verb].format(name=name)}` instead."
     elif verb.startswith("-"):

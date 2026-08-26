@@ -16,12 +16,13 @@ interface MockChatMessageListProps {
   messages: unknown[]
   running: boolean
   onApprove?: (approvalId: string, decision: string) => void
+  canTrust?: boolean
 }
 
 vi.mock('./ChatMessageList', () => ({
-  default: ({ messages, running, onApprove }: MockChatMessageListProps) => (
+  default: ({ messages, running, onApprove, canTrust }: MockChatMessageListProps) => (
     <div data-testid="chat-message-list" data-count={messages.length} data-running={String(running)}
-      data-can-approve={String(!!onApprove)}>
+      data-can-approve={String(!!onApprove)} data-can-trust={String(!!canTrust)}>
       {onApprove && (
         <>
           <button data-testid="mock-approve" onClick={() => onApprove('appr-1', 'approved')}>approve</button>
@@ -34,9 +35,9 @@ vi.mock('./ChatMessageList', () => ({
 
 // Mock ChatMessageList from the correct path (ChatEmbed imports from ./ChatMessageList)
 vi.mock('../app-sdk/ChatMessageList', () => ({
-  default: ({ messages, running, onApprove }: MockChatMessageListProps) => (
+  default: ({ messages, running, onApprove, canTrust }: MockChatMessageListProps) => (
     <div data-testid="chat-message-list" data-count={messages.length} data-running={String(running)}
-      data-can-approve={String(!!onApprove)}>
+      data-can-approve={String(!!onApprove)} data-can-trust={String(!!canTrust)}>
       {onApprove && (
         <>
           <button data-testid="mock-approve" onClick={() => onApprove('appr-1', 'approved')}>approve</button>
@@ -451,6 +452,130 @@ describe('ChatEmbed', () => {
   })
 })
 
+describe('ChatEmbed follow-up options', () => {
+  // Regression for #3304: ChatMessageList strips `[OPTIONS: a | b]` markers out of
+  // the rendered prose, but ChatEmbed never offered those choices anywhere else --
+  // an agent's follow-up question left the embedding app's user with nothing to
+  // click, unlike the main chat and side panel which render a row of pills.
+  it('renders a follow-up pill for each option in the last assistant turn', async () => {
+    mockGet.mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Next step? [OPTIONS: Run tests | Skip]' }],
+      running: false,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.getByText('Run tests')).toBeInTheDocument()
+    expect(screen.getByText('Skip')).toBeInTheDocument()
+  })
+
+  it('renders no follow-up bar when the last turn carries no options', async () => {
+    mockGet.mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Just a plain reply.' }],
+      running: false,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.queryByText('Run tests')).toBeNull()
+  })
+
+  it('suppresses the follow-up bar while the turn is still streaming', async () => {
+    mockGet.mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Next step? [OPTIONS: Run tests | Skip]' }],
+      running: true,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.queryByText('Run tests')).toBeNull()
+  })
+
+  it('a later user message clears the previous turn\'s options', async () => {
+    mockGet.mockResolvedValue({
+      messages: [
+        { role: 'assistant', content: 'Next step? [OPTIONS: Run tests | Skip]' },
+        { role: 'user', content: 'Run tests' },
+      ],
+      running: false,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    expect(screen.queryByText('Run tests')).toBeNull()
+  })
+
+  it('picking an option edits the draft instead of sending immediately', async () => {
+    mockGet.mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Next step? [OPTIONS: Run tests | Skip]' }],
+      running: false,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    const input = screen.getByLabelText('Chat message') as HTMLInputElement
+
+    // Chip clicks are debounced 220ms (so a double-click can still fire the
+    // distinct "send now" gesture) whenever onSend is supplied, as it is here.
+    await act(async () => {
+      fireEvent.click(screen.getByText('Run tests'))
+      vi.advanceTimersByTime(250)
+    })
+
+    expect(input.value).toBe('Run tests')
+    expect(mockPost).not.toHaveBeenCalledWith('/api/chat', expect.anything())
+  })
+
+  it('picking an option twice removes it from the draft again', async () => {
+    mockGet.mockResolvedValue({
+      messages: [{ role: 'assistant', content: 'Next step? [OPTIONS: Run tests | Skip]' }],
+      running: false,
+      title: '',
+    })
+    await act(async () => {
+      renderWithProviders(<ChatEmbed slotKey="slot-1" />)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(100)
+    })
+    const input = screen.getByLabelText('Chat message') as HTMLInputElement
+
+    // Chip clicks are debounced 220ms (so a double-click can still fire the
+    // distinct "send now" gesture) whenever onSend is supplied, as it is here.
+    await act(async () => {
+      fireEvent.click(screen.getByText('Run tests'))
+      vi.advanceTimersByTime(250)
+    })
+    expect(input.value).toBe('Run tests')
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Run tests'))
+      vi.advanceTimersByTime(250)
+    })
+    expect(input.value).toBe('')
+  })
+})
+
 describe('ChatEmbed approvals', () => {
   // An embedded agent that hits a permission prompt must be actionable. The
   // group header only renders Approve/Reject when an onApprove handler is
@@ -488,6 +613,10 @@ describe('ChatEmbed approvals', () => {
       renderWithProviders(<ChatEmbed slotKey="slot-1" />)
       await vi.advanceTimersByTimeAsync(0)
     })
+    // The embed must DECLARE the trust tier: CollapsibleToolGroup is fail-closed
+    // and only renders the Trust button on a canTrust mount (#5434). Dropping
+    // the flag would silently remove Trust from every embedded approval row.
+    expect(screen.getByTestId('chat-message-list').dataset.canTrust).toBe('true')
     await act(async () => {
       screen.getByTestId('mock-trust').click()
       await vi.advanceTimersByTimeAsync(0)

@@ -22,6 +22,7 @@ import {
   type WatchStatus,
 } from '../api'
 import { approvalRoute } from './approvalActions'
+import { noteStaleOwnerResponse } from '../../../api/staleOwnerSignal'
 import { purposeFromToolArgs } from '../../../utils/toolPurpose'
 import type { NotificationPayload, PetMood, PetState } from '../src/shared/types'
 import type { PackManifest, PackMeta } from '../src/shared/appearanceTypes'
@@ -1273,7 +1274,7 @@ export async function respondApproval(
   id: string,
   action: string,
   pattern?: string,
-): Promise<{ ok: boolean; error?: string }> {
+): Promise<{ ok: boolean; error?: string; staleOwnerSession?: boolean }> {
   const route = approvalRoute(action)
   try {
     const res =
@@ -1294,7 +1295,34 @@ export async function respondApproval(
               ...(pattern ? { pattern } : {}),
             }),
           })
-    if (!res.ok) return { ok: false, error: `approval failed (${res.status})` }
+    if (!res.ok) {
+      // A stale pre-owner session (signed in before KIROCREW_OWNER_ID was set)
+      // is the one denial a retry can never clear — surface the backend's own
+      // explanation instead of the opaque status so the panel user learns the
+      // remedy (sign in again). Other failures keep the terse status form.
+      // try/catch rather than promise .catch: a Response-shaped stub without a
+      // text() method throws synchronously, which .catch cannot intercept.
+      let text = ''
+      try {
+        text = await res.text()
+      } catch {
+        /* body unreadable — fall through to the status form */
+      }
+      if (noteStaleOwnerResponse(res.status, text)) {
+        let reason = ''
+        try {
+          reason = String((JSON.parse(text) as { error?: unknown }).error ?? '')
+        } catch { /* body unreadable — fall through to the status form */ }
+        // The flag lets the panel render its LOCALIZED remedy; `error` keeps
+        // the backend prose for logs and any consumer without a catalog.
+        return {
+          ok: false,
+          staleOwnerSession: true,
+          error: reason || `approval failed (${res.status})`,
+        }
+      }
+      return { ok: false, error: `approval failed (${res.status})` }
+    }
     return { ok: true }
   } catch (err) {
     return { ok: false, error: String(err) }
@@ -1354,10 +1382,26 @@ export async function getSlotModel(): Promise<string> {
 }
 
 /**
+ * Result of a slot-model switch. `ok: false` alone is a generic failure;
+ * `code` carries the gateway's machine-readable refusal when the body names
+ * one (`turn_in_flight`: a turn is running mid-switch, retry after it ends).
+ *
+ * This deliberately widens the original preload's bare-boolean signature: the
+ * gateway refuses a mid-turn switch with a 409 whose only useful content is
+ * the structured code, and a bare `false` collapsed that into "failed for no
+ * stated reason". Truthiness call sites keep working (`{ ok: true }` vs
+ * `{ ok: false }` is what the one caller reads).
+ */
+export interface SetModelResult {
+  ok: boolean
+  code?: string
+}
+
+/**
  * Switch the pet slot's model. Slot-scoped, so it cannot disturb the dashboard's
  * own conversations. An empty string hands the slot back to the gateway default.
  */
-export async function setModel(model: string): Promise<boolean> {
+export async function setModel(model: string): Promise<SetModelResult> {
   try {
     const res = await fetch(`/api/chat/slots/${MOCHI_SLOT}/model`, {
       method: 'POST',
@@ -1365,9 +1409,20 @@ export async function setModel(model: string): Promise<boolean> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model }),
     })
-    return res.ok
+    if (res.ok) return { ok: true }
+    // Refusals carry {"error": ..., "code": ...}; surface the code so the
+    // caller can tell "a turn is in flight — retry later" apart from a hard
+    // failure. A non-JSON or code-less body stays a generic failure.
+    try {
+      const body = await res.json()
+      const code = (body as { code?: unknown } | null)?.code
+      if (typeof code === 'string' && code) return { ok: false, code }
+    } catch {
+      // fall through — body was not JSON
+    }
+    return { ok: false }
   } catch {
-    return false
+    return { ok: false }
   }
 }
 

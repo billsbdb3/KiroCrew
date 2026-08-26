@@ -807,7 +807,9 @@ describe('Papyrus co-author refresh', () => {
   })
 
   it('discards the buffer and loads the agent version when the user confirms', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    // The discard guard is the in-app dialog, never window.confirm — the
+    // native confirm freezes the renderer's event loop.
+    const confirmSpy = vi.spyOn(window, 'confirm')
     localStorage.setItem(SLOT_KEY_PREFIX + PROJECT, SLOT)
     const store = createTestStore()
     store.dispatch(sseSlots([slot({ orchestrating: true })]))
@@ -818,17 +820,21 @@ describe('Papyrus co-author refresh', () => {
     await screen.findByText('Co-author changed this file')
     api.readFile.mockResolvedValue({ path: MAIN, content: `${BODY}\n% the agent version` })
 
-    await user.click(screen.getByRole('button', { name: /Discard my edits and reload/ }))
+    await user.click(screen.getByRole('button', { name: /Discard my changes and reload/ }))
+    const dialog = await screen.findByRole('dialog')
+    expect(within(dialog).getByText(new RegExp(MAIN))).toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: 'Discard changes' }))
 
     await waitFor(() =>
       expect(screen.getByLabelText('editor')).toHaveValue(`${BODY}\n% the agent version`))
     await waitFor(() =>
       expect(screen.queryByText('Co-author changed this file')).not.toBeInTheDocument())
+    expect(confirmSpy).not.toHaveBeenCalled()
   })
 
   it('keeps the buffer when the discard confirmation is declined', async () => {
     // This is the one action in the app that destroys typing with no undo.
-    vi.spyOn(window, 'confirm').mockReturnValue(false)
+    const confirmSpy = vi.spyOn(window, 'confirm')
     localStorage.setItem(SLOT_KEY_PREFIX + PROJECT, SLOT)
     const store = createTestStore()
     store.dispatch(sseSlots([slot({ orchestrating: true })]))
@@ -839,17 +845,19 @@ describe('Papyrus co-author refresh', () => {
     await screen.findByText('Co-author changed this file')
     api.readFile.mockClear()
 
-    await user.click(screen.getByRole('button', { name: /Discard my edits and reload/ }))
+    await user.click(screen.getByRole('button', { name: /Discard my changes and reload/ }))
+    const dialog = await screen.findByRole('dialog')
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }))
 
     expect(screen.getByLabelText('editor')).toHaveValue(`${BODY}\n% mine, unsaved`)
     expect(screen.getByText('Co-author changed this file')).toBeInTheDocument()
     expect(api.readFile).not.toHaveBeenCalled()
+    expect(confirmSpy).not.toHaveBeenCalled()
   })
 
   it('restores the conflict guard when the reload fails', async () => {
     // Leaving the guard down after a failed recovery reaches the exact overwrite
     // the guard exists to stop.
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
     localStorage.setItem(SLOT_KEY_PREFIX + PROJECT, SLOT)
     const store = createTestStore()
     store.dispatch(sseSlots([slot({ orchestrating: true })]))
@@ -860,7 +868,8 @@ describe('Papyrus co-author refresh', () => {
     await screen.findByText('Co-author changed this file')
     api.readFile.mockRejectedValue(new Error('still unreachable'))
 
-    await user.click(screen.getByRole('button', { name: /Discard my edits and reload/ }))
+    await user.click(screen.getByRole('button', { name: /Discard my changes and reload/ }))
+    await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Discard changes' }))
 
     await waitFor(() => expect(api.readFile).toHaveBeenCalled())
     expect(screen.getByText('Co-author changed this file')).toBeInTheDocument()

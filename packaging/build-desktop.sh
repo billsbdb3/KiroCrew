@@ -12,7 +12,7 @@
 # The result is a double-clickable app that embeds the whole Python backend +
 # dashboard — no system Python, pip, npm, or node required by the end user.
 #
-# This REPLACES the old PyInstaller approach. PBS interpreters are self-contained
+# PBS interpreters are self-contained
 # and use @executable_path-relative dylib references, so the bundle is genuinely
 # portable across machines without needing the exact same system Python version.
 #
@@ -46,8 +46,8 @@ HOST_ARCH="$(uname -m)"
 
 # Beacon provenance for the artifact this run produces, derived from the
 # electron-builder target rather than the host: mac.target is dmg, linux.target
-# is AppImage (website/electron/package.json). Reading the host OS instead would
-# be wrong on Linux, where the same machine also builds wheels.
+# is AppImage + deb + rpm (website/electron/package.json). Reading the host OS instead
+# would be wrong on Linux, where the same machine also builds wheels.
 # Windows ships an NSIS installer, which has no KNOWN_DISTRIBUTIONS value yet;
 # "source" is the honest answer until "nsis" is added on both sides.
 case "$OS" in
@@ -55,6 +55,14 @@ case "$OS" in
   windows) KC_DISTRIBUTION="source" ;;
   *)       KC_DISTRIBUTION="appimage" ;;
 esac
+
+# Linux packages ONE backend tree into several artifact formats, and the beacon
+# `dist` value is baked INTO that tree — so each format needs its own stamp or
+# one artifact reports itself as the other, which is exactly the mislabel
+# scripts/stamp-distribution.sh exists to prevent. Pair each target with its
+# dist label here; the packaging step re-stamps between invocations. The
+# expensive work (PBS interpreter + pip closure) still happens once.
+LINUX_TARGET_DISTS=( "AppImage:appimage" "deb:deb" "rpm:rpm" )
 
 # Universal is the macOS default; Linux has no universal concept (AppImage is
 # per-arch). UNIVERSAL=0 opts a macOS build out.
@@ -112,6 +120,25 @@ case "$KC_VERSION" in
 esac
 
 log() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
+
+# Re-stamp every staged backend tree with <dist>, for the Linux multi-format
+# path (see LINUX_TARGET_DISTS). Rewrites one generated module per tree, so it
+# is cheap enough to run between electron-builder invocations. Finding the trees
+# by their site-packages layout keeps this working for both the single-tree
+# Linux build and macOS's two-arch layout.
+restamp_backends() {
+  local dist="$1" sp found=0
+  while IFS= read -r sp; do
+    [ -n "$sp" ] || continue
+    bash "$ROOT/scripts/stamp-distribution.sh" "$dist" "$sp" >/dev/null
+    found=$((found + 1))
+  done < <(find "$ELECTRON_DIR/backend-dist" -type d -path "*/site-packages/kiro_crew" 2>/dev/null)
+  if [ "$found" -eq 0 ]; then
+    echo "ERROR: no staged backend tree found to stamp as '$dist'" >&2
+    exit 1
+  fi
+  echo "    stamped $found backend tree(s) as dist=$dist"
+}
 
 # Recursively remove a directory tree, defeating the macOS .DS_Store/ENOTEMPTY
 # race. macOS Desktop Services (Finder/Spotlight) can drop a fresh .DS_Store
@@ -286,6 +313,9 @@ LAUNCH
     rm -rf lib/python3.12/test lib/python3.12/idlelib lib/python3.12/tkinter \
            lib/python3.12/turtledemo lib/python3.12/ensurepip lib/python3.12/lib2to3 2>/dev/null || true )
 
+  # After pruning, so it validates what actually ships.
+  stdlib_probe_gate "$out"
+
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
 }
 
@@ -337,7 +367,42 @@ build_backend_windows() {
     find Lib/site-packages -type d \( -name tests -o -name test \) -prune -exec rm -rf {} + 2>/dev/null || true
     rm -rf Lib/test Lib/idlelib Lib/tkinter Lib/turtledemo Lib/ensurepip Lib/lib2to3 2>/dev/null || true )
 
+  # After pruning, so it validates what actually ships.
+  stdlib_probe_gate "$out"
+
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
+}
+
+# Stdlib-probe agreement gate: every package bundle-integrity.js probes must be
+# present, as an importable package, in the tree we just built. That module
+# refuses to spawn a backend whose stdlib looks incomplete, so a name it probes
+# that this bundle does not ship (a Python bump turning a package back into a
+# module, a rename, or a new prune above) would refuse EVERY launch of a healthy
+# app — a permanent failure strictly worse than the transient one it prevents.
+# Failing the build here converts that into a build error the developer sees.
+#   $1 = built backend tree
+stdlib_probe_gate() {
+  local out="$1"
+  if ! command -v node >/dev/null 2>&1; then
+    log "node unavailable — SKIPPING stdlib-probe gate for $(basename "$out")"
+    return 0
+  fi
+  log "Verifying bundle-integrity.js stdlib probes resolve ($(basename "$out"))…"
+  node -e '
+    const fs=require("fs"), path=require("path");
+    const { findMissingBundleParts, REQUIRED_STDLIB_PARTS } =
+      require(path.join(process.argv[1], "bundle-integrity"));
+    const out = process.argv[2];
+    const missing = findMissingBundleParts(fs, path, out);
+    if (missing.length) {
+      console.error(`ERROR: bundle-integrity.js probes ${REQUIRED_STDLIB_PARTS.length} stdlib `
+        + `packages; this bundle is missing: ${missing.join(", ")}`);
+      console.error("       The launcher would refuse to start this bundle on every launch.");
+      console.error("       Fix the prune step, or update REQUIRED_STDLIB_PARTS in");
+      console.error("       website/electron/bundle-integrity.js to match the shipped stdlib.");
+      process.exit(1);
+    }
+  ' "$ELECTRON_DIR" "$out" || exit 1
 }
 
 # Resolver-agreement gate: the Electron launcher (find-bin.js) must locate the
@@ -438,7 +503,7 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
     # scheme could not disambiguate the two apps (none is registered today).
     EB_ARGS+=(
       "-c.productName=KiroCrew Nightly"
-      "-c.mac.icon=icon-nightly.png"
+      "-c.mac.icon=icon-nightly.icns"
       "-c.linux.icon=icon-nightly.png"
       "-c.win.icon=icon-nightly.png"
       # Finder/Dock title (CFBundleDisplayName) mirrors the spaced display
@@ -447,6 +512,35 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
       # space-free makes the packaged app abort with "Unable to find helper
       # app". Nightly re-overrides the static display name to keep its suffix.
       "-c.mac.extendInfo.CFBundleDisplayName=Kiro Crew Nightly"
+      # Linux packages key their INSTALL identity off the package name, so
+      # nightly needs its own or dpkg/rpm treat a nightly install as an UPGRADE
+      # of stable and remove it -- the same hazard as the nsis.guid below, from
+      # the Linux side. Three names move together because all three are
+      # per-install-unique paths a second channel must not claim:
+      #
+      #   packageName    -> the dpkg/rpm package identity
+      #   executableName -> /usr/bin/<name> and /opt/<Product>/<name>
+      #   desktopName    -> /usr/share/applications/<name>, and (via
+      #                     linux.syncDesktopName) Electron's app_id and the
+      #                     entry's StartupWMClass, which must keep matching
+      #
+      # productName already differs, so the /opt directory does not collide.
+      "-c.deb.packageName=kirocrew-nightly"
+      "-c.rpm.packageName=kirocrew-nightly"
+      "-c.linux.executableName=kirocrew-desktop-nightly"
+      "-c.extraMetadata.desktopName=kirocrew-desktop-nightly.desktop"
+      # The npm package `name` is per-channel for the same reason the Linux
+      # package name is. It is not build metadata: appInfo derives
+      # updaterCacheDirName from it (`sanitizedName.toLowerCase() +
+      # "-updater"`), Electron derives the userData directory from it, and NSIS
+      # receives it as ${APP_PACKAGE_NAME}. Shared, that makes nightly and
+      # stable write ONE %LOCALAPPDATA%\<name>-updater and ONE
+      # %APPDATA%\<name> -- so uninstalling either channel would delete the
+      # other's pending update download, its differential baseline, and its
+      # window state. productName and nsis.guid already separate the install
+      # directory and the registry key; this separates the per-user state they
+      # do not cover.
+      "-c.extraMetadata.name=kirocrew-desktop-nightly"
       # Squirrel.Windows keyed the INSTALL identity off squirrelWindows.name;
       # NSIS keys it off two separate things, and nightly needs both:
       #
@@ -468,26 +562,43 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
       # changing it later orphans installed updaters, so it is pinned from the
       # first shipped build.
       "-c.nsis.guid=0f417bf9-2759-51d6-acfb-f864805d1f41"
+      # WINDOWS-ONLY appId split. The shared appId above is required on macOS
+      # (Squirrel.Mac validates against the host's designated requirement, which
+      # pins the bundle id), but on Windows it reaches ${APP_ID}, which the NSIS
+      # template uses for two registrations that are global per-id rather than
+      # per-install: WinShell::SetLnkAUMI stamps the AppUserModelID onto the
+      # desktop and Start Menu shortcuts, and WinShell::UninstAppUserModelId
+      # removes that registration outright.
+      #
+      # The update path is safe on its own: nsis.allowToChangeInstallationDirectory
+      # is false, so that define is never emitted, setIsTryToKeepShortcuts always
+      # yields "true", and the old uninstaller runs with --keep-shortcuts, which
+      # skips the deregistration. A real UNINSTALL does not. Uninstall one
+      # channel and WinShell::UninstAppUserModelId runs against the id BOTH
+      # channels share, deregistering the AppUserModelID the surviving channel's
+      # shortcuts still carry -- its desktop shortcut then resolves to a dead
+      # registration and the shell reports that app as relocated or missing even
+      # though its .exe is untouched.
+      #
+      # Scoped to `win` deliberately: appInfo.id prefers the platform-specific
+      # value, so a top-level -c.appId would also move the macOS bundle id and
+      # strand every installed mac app's updates. This is the same identity
+      # main.js already claims at runtime via app.setAppUserModelId, so the
+      # packaged shortcuts and the running process finally agree.
+      "-c.win.appId=com.amazon.kiro.crew.nightly"
     )
   fi
-  if [ "$OS" = "darwin" ]; then
-    EB_ARGS+=( --mac )
-    [ "$UNIVERSAL" = "1" ] && EB_ARGS+=( --universal )
-  elif [ "$OS" = "windows" ]; then
-    EB_ARGS+=( --win )
-  else
-    EB_ARGS+=( --linux )
-  fi
-
   # Start from a pristine output dir. A prior interrupted universal build can
   # leave dist/mac-universal-<arch>-temp dirs behind (with a .DS_Store inside);
   # those linger and re-trip the ENOTEMPTY cleanup below on every later run.
   # This pre-clean is itself exposed to the .DS_Store race (Finder re-drops one
   # mid-removal), so it MUST go through the resilient helper — a plain rm here
   # aborts the build before the retry loop below is ever reached.
+  # Runs ONCE, before any invocation: the Linux path invokes electron-builder
+  # per target, and clearing between them would delete the previous artifact.
   rm_rf_resilient dist
 
-  # macOS universal .DS_Store/ENOTEMPTY race:
+  # One electron-builder invocation, with the macOS .DS_Store/ENOTEMPTY retry:
   # electron-builder's universal step stages each arch into
   # dist/mac-universal-<arch>-temp, lipo-merges them, then removes the temp
   # dirs with a recursive fs.rm. If macOS Desktop Services (Finder/Spotlight)
@@ -495,22 +606,45 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
   # which performs no retries -- fails the final rmdir with ENOTEMPTY and the
   # whole build aborts (electron-userland/electron-builder#6890). It is a
   # transient race, so retry from a swept, clean dir a bounded number of times.
-  attempt=1; max_attempts=3
-  while : ; do
-    eb_log="$(mktemp "${TMPDIR:-/tmp}/kc-eb.XXXXXX")"
-    if CSC_IDENTITY_AUTO_DISCOVERY=false ./node_modules/.bin/electron-builder "${EB_ARGS[@]}" 2>&1 | tee "$eb_log"; then
-      rm -f "$eb_log"; break
-    fi
-    if grep -q "ENOTEMPTY" "$eb_log" && [ "$attempt" -lt "$max_attempts" ]; then
-      echo "  ⚠ macOS .DS_Store/ENOTEMPTY temp-dir race (attempt $attempt/$max_attempts); sweeping .DS_Store and retrying…" >&2
-      find dist -name .DS_Store -delete 2>/dev/null || true
-      rm -rf dist/*-temp 2>/dev/null || true
-      rm -f "$eb_log"; attempt=$((attempt + 1)); sleep 2; continue
-    fi
-    rm -f "$eb_log"
-    echo "❌ electron-builder failed (not the .DS_Store race, or retries exhausted)." >&2
-    exit 1
-  done
+  eb_run() {
+    local attempt=1 max_attempts=3 eb_log
+    while : ; do
+      eb_log="$(mktemp "${TMPDIR:-/tmp}/kc-eb.XXXXXX")"
+      if CSC_IDENTITY_AUTO_DISCOVERY=false ./node_modules/.bin/electron-builder "$@" 2>&1 | tee "$eb_log"; then
+        rm -f "$eb_log"; return 0
+      fi
+      if grep -q "ENOTEMPTY" "$eb_log" && [ "$attempt" -lt "$max_attempts" ]; then
+        echo "  ⚠ macOS .DS_Store/ENOTEMPTY temp-dir race (attempt $attempt/$max_attempts); sweeping .DS_Store and retrying…" >&2
+        find dist -name .DS_Store -delete 2>/dev/null || true
+        rm -rf dist/*-temp 2>/dev/null || true
+        rm -f "$eb_log"; attempt=$((attempt + 1)); sleep 2; continue
+      fi
+      rm -f "$eb_log"
+      echo "❌ electron-builder failed (not the .DS_Store race, or retries exhausted)." >&2
+      exit 1
+    done
+  }
+
+  if [ "$OS" = "darwin" ]; then
+    EB_ARGS+=( --mac )
+    [ "$UNIVERSAL" = "1" ] && EB_ARGS+=( --universal )
+    eb_run "${EB_ARGS[@]}"
+  elif [ "$OS" = "windows" ]; then
+    EB_ARGS+=( --win )
+    eb_run "${EB_ARGS[@]}"
+  else
+    # One invocation PER FORMAT, each preceded by its own beacon stamp, so the
+    # AppImage and the deb do not both claim the label of whichever was built
+    # last. Targets are named explicitly rather than letting package.json's
+    # target array drive a single invocation, because a single invocation shares
+    # one stamped backend tree between both artifacts.
+    for pair in "${LINUX_TARGET_DISTS[@]}"; do
+      target="${pair%%:*}"; dist="${pair##*:}"
+      log "Packaging Linux ${target} (dist=${dist})…"
+      restamp_backends "$dist"
+      eb_run "${EB_ARGS[@]}" --linux "$target"
+    done
+  fi
 )
 
 # Universal post-gate: the staged shell binary must carry BOTH arch slices.
@@ -533,6 +667,6 @@ if [ "$UNIVERSAL" = "1" ]; then
 fi
 
 log "Done. Installer(s) are in $ELECTRON_DIR/dist/"
-ls -1 "$ELECTRON_DIR/dist/"*.{dmg,AppImage,zip,exe} 2>/dev/null | sed 's/^/   /' || true
+ls -1 "$ELECTRON_DIR/dist/"*.{dmg,AppImage,deb,rpm,zip,exe} 2>/dev/null | sed 's/^/   /' || true
 echo ""
 echo "    The .app embeds the backend, so it runs with no PATH kirocrew needed."

@@ -9,6 +9,7 @@ Design Review.
 """
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -80,6 +81,42 @@ class TestScreenshotEvidence:
             "::warning::'<!-- no-visual-delta -->' marker present" in wf
         ), "waiver must emit a warning annotation naming the marker"
 
+    def test_body_reaches_grep_via_here_strings_not_pipes(self):
+        # Under `set -uo pipefail` a `printf '%s' "$body" | grep -q` pipeline
+        # can report 141: grep -q exits on the first match, the printf writer
+        # dies of SIGPIPE, and the `if` reads false even though the pattern
+        # matched -- real evidence misreported as missing. A here-string has
+        # no writer process to kill, so the status is grep's alone.
+        wf = yaml.safe_load(_read("screenshot-evidence.yml"))
+        steps = wf["jobs"]["screenshot-evidence"]["steps"]
+        step = next(
+            (s for s in steps if s.get("name") == "Require visual evidence in the PR body"),
+            None,
+        )
+        assert step is not None, "step 'Require visual evidence in the PR body' not found"
+        # The rationale comments legitimately name the forbidden form, so only
+        # code lines are scanned. The invariant is positive: every grep in the
+        # step reads from a here-string and none sits behind a pipe, which a
+        # substring test for "| grep" cannot pin (`|grep`, `| /bin/grep`, and
+        # `| LC_ALL=C grep` would all slip past it).
+        code = [ln for ln in step["run"].splitlines() if not ln.lstrip().startswith("#")]
+        grep_lines = [ln for ln in code if re.search(r"\bgrep\b", ln)]
+        assert len(grep_lines) == 3, (
+            "expected exactly three body checks (evidence, marker, justification), got: "
+            f"{grep_lines}"
+        )
+        # A grep pattern may legitimately contain literal `|` alternation, so
+        # the pipe test targets "a pipe feeding grep" (with or without spacing,
+        # a path prefix, or interposed env assignments), not any `|` at all.
+        piped_grep = re.compile(r"\|\s*(?:[\w./=-]+\s+)*(?:[\w./-]+/)?grep\b")
+        for ln in grep_lines:
+            assert not piped_grep.search(
+                ln
+            ), f"the PR body must never reach grep through a pipe: {ln!r}"
+            assert re.search(
+                r'<<<\s*"\$\{?body\}?"', ln
+            ), f"each body check must read from a here-string: {ln!r}"
+
 
 @pytest.mark.skipif(
     os.name == "nt" or shutil.which("bash") is None,
@@ -115,20 +152,40 @@ class TestScreenshotEvidenceBodyLogic:
         gh.chmod(0o755)
         summary = tmp_path / "summary.md"
         summary.touch()
+        # HERMETIC env, not `**os.environ`. The step's outcome is decided entirely
+        # by environment variables, and inheriting the ambient one made that
+        # outcome depend on whatever else the process had been doing: `BASH_ENV`
+        # would make `bash -c` source a file before the script runs, and a stray
+        # `PATH`, `EXEMPT`, `LC_*` or `GH_*` value reaches the same branches the
+        # assertions read. Enumerating what the script needs is also self-documenting
+        # -- anything absent here is something the step must not depend on.
         env = {
-            **os.environ,
-            "PATH": f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}",
+            # tmp_path first so the `gh` stub wins; the system dirs follow because
+            # the script needs printf/grep/cat and the stub's shell.
+            "PATH": f"{tmp_path}{os.pathsep}/usr/local/bin{os.pathsep}/usr/bin{os.pathsep}/bin",
             # Starve any real gh of credentials so a stub-resolution failure
             # can never turn into a live API call.
             "GH_TOKEN": "",
             "GITHUB_TOKEN": "",
+            # The patterns are ASCII and every fixture body is ASCII, so pin the
+            # collation rather than inheriting a locale that changes what `grep -i`
+            # and the `[[:space:]]` class match.
+            "LC_ALL": "C",
             "EXEMPT": exempt,
             "REPO": "example/repo",
             "PR": "1",
             "GITHUB_STEP_SUMMARY": str(summary),
+            # A here-string larger than the pipe buffer is backed by a temp
+            # file; keep that file under the test's own directory instead of
+            # the shared /tmp.
+            "TMPDIR": str(tmp_path),
         }
         result = subprocess.run(
             ["bash", "-c", step["run"]],
+            # Every write the script performs is at an absolute path, but the
+            # child must still not inherit pytest's CWD (the repo root): any
+            # future relative write belongs under the test's own directory.
+            cwd=tmp_path,
             env=env,
             capture_output=True,
             text=True,
@@ -187,6 +244,17 @@ class TestScreenshotEvidenceBodyLogic:
         result = self._run_step(tmp_path, "![shot](https://example.test/x.png)\n")
         assert result.returncode == 0, result.stdout + result.stderr
 
+    def test_oversized_body_with_early_evidence_passes(self, tmp_path):
+        # Regression pin for the SIGPIPE misreport: with `printf | grep -q`
+        # under pipefail, a body larger than the pipe buffer whose evidence
+        # sits in the first chunk makes grep exit before the writer finishes,
+        # the writer dies of SIGPIPE, and the pipeline reports 141 -- real
+        # evidence read as absent. The here-string form must pass this.
+        body = "![shot](https://example.test/x.png)\n" + "x" * (1 << 20) + "\n"
+        result = self._run_step(tmp_path, body)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Visual evidence found" in result.stdout
+
     def test_label_waiver_unchanged(self, tmp_path):
         # The marker is an additional path; the label path must keep working.
         result = self._run_step(tmp_path, "no evidence at all", exempt="true")
@@ -217,10 +285,7 @@ class TestCrossPlatform:
         wf = _read("cross-platform.yml")
         assert "deliberately NO" in wf, "the absence must stay documented"
         # No rule may actually grep for the encoding kwarg.
-        rule_lines = [
-            ln for ln in wf.splitlines()
-            if ln.lstrip().startswith("hits=")
-        ]
+        rule_lines = [ln for ln in wf.splitlines() if ln.lstrip().startswith("hits=")]
         assert rule_lines, "expected at least one scan rule"
         for ln in rule_lines:
             assert "encoding" not in ln, f"encoding rule reintroduced: {ln.strip()[:80]}"
@@ -246,7 +311,7 @@ class TestPrScope:
         # combination reviews badly.
         wf = _read("pr-scope.yml")
         assert '-gt "$MAX_AREAS" ] && [' in wf
-        assert 'MAX_LINES' in wf
+        assert "MAX_LINES" in wf
 
     def test_excludes_vendor_and_screenshots(self):
         wf = _read("pr-scope.yml")
@@ -255,23 +320,33 @@ class TestPrScope:
 
 
 class TestDesignReviewBlocks:
-    """A BLOCK verdict must reach the required `PR Readiness` status."""
+    """A BLOCK verdict must reach the required `PR Readiness` status.
 
-    def test_readiness_no_longer_force_passes_design_review(self):
-        # This is the whole point of the change: previously BOTH lanes did
-        # `passed+=("$label (advisory)")` for Design Review, so a red Design
-        # Review check still produced a green PR Readiness.
+    Design, UX and First Principles all gate now: a real BLOCK on any of the
+    three fails its own check, which `pr-readiness.yml` folds into the required
+    `PR Readiness` status. None may be force-passed into the advisory bucket.
+    """
+
+    def test_readiness_blocks_every_opinion_lane(self):
+        # The whole point of the promotion: the advisory bucket that used to
+        # force-pass UX and First Principles (and once Design too) is gone, so
+        # a red opinion lane now produces a red PR Readiness.
         wf = _read("pr-readiness.yml")
-        assert '"$label" = "Design Review" ] || [ "$label" = "UX Review"' not in wf, (
-            "Design Review must no longer share the UX advisory branch"
-        )
+        assert (
+            'passed+=("$label (advisory)")' not in wf
+        ), "no opinion lane may be force-passed; a BLOCK must reach readiness"
         assert 'failed+=("$label (BLOCK)")' in wf
 
-    def test_ux_review_stays_advisory(self):
-        # Only Design Review was promoted; UX keeps its advisory contract.
+    def test_all_three_lanes_share_the_one_blocking_branch(self):
+        # Both readers -- the fork check-run reader and the same-repo
+        # workflow-run reader -- must route all three lanes through the
+        # BLOCK-only failing branch, so the wiring cannot drift for one lane.
         wf = _read("pr-readiness.yml")
-        assert 'passed+=("$label (advisory)")' in wf
-        assert '[ "$label" = "UX Review" ]' in wf
+        branch = (
+            '[ "$label" = "Design Review" ] || [ "$label" = "UX Review" ] '
+            '|| [ "$label" = "First Principles Review" ]'
+        )
+        assert wf.count(branch) == 2, "both readiness readers must block all three lanes"
 
     @pytest.mark.parametrize("name", ["design-review.yml", "fork-design-review.yml"])
     def test_prompt_no_longer_claims_block_is_advisory(self, name):
@@ -299,3 +374,114 @@ class TestDesignReviewBlocks:
         # The wildcard (errored / no verdict) branch must not fail.
         tail = gate.split("BLOCK)")[1]
         assert "exit 0" in tail, "an incomplete review must never block"
+
+
+REVIEW_PROMPTS = Path(__file__).resolve().parents[1] / ".github" / "review-prompts"
+
+UX_LANES = ["ux-review.yml", "fork-ux-review.yml"]
+DESIGN_LANES = ["design-review.yml", "fork-design-review.yml"]
+FP_CONTRACT = "first-principles.md"
+
+
+def _read_prompt(name: str) -> str:
+    return (REVIEW_PROMPTS / name).read_text(encoding="utf-8")
+
+
+def _flat(text: str) -> str:
+    """Collapse whitespace so an assertion survives prompt re-wrapping."""
+    return " ".join(text.split())
+
+
+class TestAdvisoryLanesStateTheirRealAuthority:
+    """A lane told its verdict is inert calibrates every borderline case down.
+
+    Each of these prompts once opened by disclaiming authority the workflow
+    does in fact grant. A reviewer that believes a BLOCK changes nothing has no
+    reason to spend one, so decidable defects settle on CONCERNS -- the tier
+    nothing gates on. Design, UX and First Principles now ALL fail `PR
+    Readiness` on a BLOCK, so every one of these prompts must state that
+    authority plainly rather than disclaim it.
+    """
+
+    @pytest.mark.parametrize("name", UX_LANES + DESIGN_LANES)
+    def test_workflow_prompt_does_not_disclaim_its_own_authority(self, name):
+        wf = _flat(_read(name))
+        assert "Nothing you emit blocks the merge" not in wf
+        assert "do not gate" not in wf
+        assert "does NOT block the merge" not in wf
+
+    def test_first_principles_contract_does_not_disclaim_its_authority(self):
+        contract = _flat(_read_prompt(FP_CONTRACT))
+        assert "Nothing you emit blocks the merge" not in contract
+        assert "do not gate" not in contract
+        assert "does NOT block the merge" not in contract
+
+    @pytest.mark.parametrize("name", DESIGN_LANES)
+    def test_design_prompt_says_a_block_reaches_readiness(self, name):
+        assert "blocks PR readiness" in _flat(_read(name))
+
+    @pytest.mark.parametrize("name", UX_LANES)
+    def test_ux_prompt_says_a_block_reaches_readiness(self, name):
+        # UX was promoted: the prompt must state the real authority a BLOCK now
+        # carries, and must not keep the old "does not gate" disclaimer that
+        # calibrated borderline calls down to CONCERNS.
+        wf = _flat(_read(name))
+        assert "blocks PR readiness" in wf
+        assert "does not by itself gate PR readiness" not in wf
+
+    def test_first_principles_says_a_block_reaches_readiness(self):
+        contract = _flat(_read_prompt(FP_CONTRACT))
+        assert "blocks PR readiness" in contract
+        assert "does not by itself gate PR readiness" not in contract
+
+    def test_first_principles_routes_a_block_grade_subtraction_to_blockers(self):
+        # The observed failure: a conclusion meeting this lane's own strongest
+        # BLOCK criterion ("an item's zero option costs nobody anything") was
+        # written into `### Subtractions`, which carries no verdict, so the
+        # verdict stayed CONCERNS and nothing was required to act on it.
+        contract = _flat(_read_prompt(FP_CONTRACT))
+        assert "belongs under Blockers" in contract
+
+
+class TestDecidableFindingsExitTheTieBreaker:
+    """`prefer CONCERNS` is a one-way ratchet until something exits it.
+
+    Preferring the lower tier is right for a matter of taste and wrong for a
+    fact read off the diff. With no exception, a mechanically decidable defect
+    lands on the advisory tier exactly like a preference does, and the two
+    become indistinguishable to whoever reads the verdict.
+    """
+
+    @pytest.mark.parametrize("name", UX_LANES)
+    def test_ux_tie_breaker_carries_a_closed_exception_list(self, name):
+        wf = _flat(_read(name))
+        assert "Tie-breaker: when torn between BLOCK and CONCERNS" in wf
+        assert "The tie-breaker does NOT apply to the two below" in wf
+        assert "hedges about state the code already holds" in wf
+        assert "assert what happened" in wf
+
+    @pytest.mark.parametrize("name", UX_LANES + DESIGN_LANES)
+    def test_every_mandated_block_carries_a_falsification_step(self, name):
+        # The design lanes established the precedent that raising the stakes of
+        # BLOCK requires a matching precision bar. An exception list that
+        # MANDATES a BLOCK raises them for that path, so it owes the same step:
+        # a rule admitted for being readable off the diff has to be read off the
+        # diff, or it becomes a licence to spend the verdict on a resemblance.
+        assert "FALSIFY BEFORE YOU BLOCK" in _flat(_read(name))
+
+    def test_first_principles_exception_carries_a_falsification_step(self):
+        assert "FALSIFY BEFORE YOU BLOCK" in _flat(_read_prompt(FP_CONTRACT))
+
+    def test_first_principles_tie_breaker_exempts_the_rider_combination(self):
+        contract = _flat(_read_prompt(FP_CONTRACT))
+        assert "Tie-breaker: when torn between BLOCK and CONCERNS" in contract
+        assert "The tie-breaker does NOT apply to one combination" in contract
+        assert "an item is riding along" in contract
+        assert "When all four hold at once" in contract
+
+    def test_first_principles_lower_the_concern_names_the_exception(self):
+        # `When unsure, LOWER the concern` sits far from the tie-breaker and
+        # would otherwise re-impose the ratchet the exception just lifted.
+        contract = _flat(_read_prompt(FP_CONTRACT))
+        assert "When unsure, LOWER the concern" in contract
+        assert "The single exception is the combination" in contract

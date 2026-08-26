@@ -97,6 +97,106 @@ def test_last_activity_ts_from_tool_call():
     assert d["last_activity_ts"] == "t4"
 
 
+# ── last_turn_ts ──
+# The instant the session list is ORDERED by: the last prompt or turn
+# completion, never a mid-turn row. `last_ts` (newest row of any role) advances
+# on every streamed tool call, so ranking by it reshuffles the sidebar
+# continuously while several sessions work.
+
+
+def test_last_turn_ts_is_last_row_when_idle():
+    # Turn over: the newest row IS the completion.
+    s = _slot(
+        {"role": "user", "content": "do it", "ts": "t1"},
+        {"role": "tool_call", "content": "grep ...", "ts": "t2"},
+        {"role": "assistant", "content": "done", "ts": "t3"},
+    )
+    d = s.to_dict()
+    assert d["last_turn_ts"] == "t3"
+    assert d["last_ts"] == "t3"
+
+
+def test_last_turn_ts_holds_the_prompt_while_running():
+    # The whole point: rows keep arriving (t3, t4) and the ordering key does not
+    # move off the prompt that asked for the work.
+    s = _slot(
+        {"role": "assistant", "content": "earlier answer", "ts": "t1"},
+        {"role": "user", "content": "do it", "ts": "t2"},
+        {"role": "tool_call", "content": "grep ...", "ts": "t3"},
+        {"role": "tool_result", "content": "found", "ts": "t4"},
+    )
+    s.task = SimpleNamespace(done=lambda: False)
+    d = s.to_dict()
+    assert d["last_turn_ts"] == "t2"
+    assert d["last_ts"] == "t4"
+
+
+def test_last_turn_ts_counts_an_injected_prompt():
+    # A cron notification / subagent completion event asks for work just as a
+    # human send does, so it settles the rank of the turn it starts.
+    s = _slot(
+        {"role": "user", "content": "earlier", "ts": "t1"},
+        {"role": "assistant", "content": "done", "ts": "t2"},
+        {"role": "inject", "content": "[Cron notification]", "ts": "t3"},
+        {"role": "tool_call", "content": "gh pr view", "ts": "t4"},
+    )
+    s.task = SimpleNamespace(done=lambda: False)
+    d = s.to_dict()
+    assert d["last_turn_ts"] == "t3"
+
+
+def test_last_turn_ts_empty_when_running_with_no_prompt_row():
+    # Nothing to rank by — the frontend falls back down its own ladder rather
+    # than receiving a bogus instant.
+    s = _slot({"role": "assistant", "content": "streaming…", "ts": "t1"})
+    s.task = SimpleNamespace(done=lambda: False)
+    d = s.to_dict()
+    assert d["last_turn_ts"] == ""
+
+
+def test_last_turn_ts_counts_a_send_queued_behind_a_running_turn():
+    # A send that lands mid-turn is QUEUED, not appended, so a message-only scan
+    # would rank the session by the older prompt — and this snapshot is
+    # authoritative, so it would drop a row the user just typed into back down
+    # the list even after the client bumped it.
+    s = _slot(
+        {"role": "user", "content": "do it", "ts": "2026-08-17T01:00:00+00:00"},
+        {"role": "tool_call", "content": "grep ...", "ts": "2026-08-17T01:00:05+00:00"},
+    )
+    s.task = SimpleNamespace(done=lambda: False)
+    s.queue_append("and also this")
+    d = s.to_dict()
+    assert d["last_turn_ts"] > "2026-08-17T01:00:00+00:00"
+    assert d["last_turn_ts"] != d["last_ts"]
+
+
+def test_queue_entries_keep_their_exact_shape():
+    # The enqueue instant lives beside the queue, not on the entry: entry dicts
+    # are compared wholesale across the suite, so widening them would make those
+    # comparisons depend on a clock.
+    s = _slot()
+    qid = s.queue_append("later")
+    assert s._queue == [{"id": qid, "content": "later", "kind": ""}]
+
+
+def test_last_turn_ts_ignores_the_queue_once_idle():
+    # Queue drains only while a turn runs; an idle slot's newest row is the
+    # completion, and a leftover queued entry must not outrank it.
+    s = _slot(
+        {"role": "user", "content": "do it", "ts": "2026-08-17T01:00:00+00:00"},
+        {"role": "assistant", "content": "done", "ts": "2026-08-17T01:00:09+00:00"},
+    )
+    s.queue_append("held")
+    d = s.to_dict()
+    assert d["last_turn_ts"] == "2026-08-17T01:00:09+00:00"
+
+
+def test_last_turn_ts_empty_for_empty_slot():
+    d = _slot().to_dict()
+    assert d["last_turn_ts"] == ""
+    assert d["last_ts"] == ""
+
+
 def test_prompt_preview_truncation():
     long_text = "x" * 300 + "\n[OPTIONS: A | B]"
     s = _slot({"role": "assistant", "content": long_text, "ts": "t1"})

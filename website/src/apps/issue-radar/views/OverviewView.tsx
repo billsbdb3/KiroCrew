@@ -1,6 +1,7 @@
 import { useMemo, type ReactNode } from 'react'
 import { RefreshCw, MessageSquare, ThumbsUp } from 'lucide-react'
 import { relativeDate, readableText } from '../lib/format'
+import { providerTerms } from '../lib/links'
 import { useIssueRadar } from '../context'
 import type { Issue } from '../api'
 
@@ -35,8 +36,10 @@ export default function OverviewView() {
     issues, sortedRepoLabels, countByLabel,
     me, openIssues, setSelectedIssue, toggleLabel, toggleAssignedToMe,
     assignedToMe, refresh, refreshing, issuesLoading,
-    needsTriage, isGoodFirstIssue,
+    needsTriage, isGoodFirstIssue, active,
   } = useIssueRadar()
+  // The refresh tooltip names the source, which is not always GitHub.
+  const terms = providerTerms(active)
 
   // ── headline signals + backlog-age histogram, one pass over the issues ──
   const stats = useMemo(() => {
@@ -116,8 +119,14 @@ export default function OverviewView() {
     { label: i18nT('apps.issueRadar.views.overviewView.6_months'), n: stats.ageBuckets[3] },
   ]
 
+  // Narrow-first gutter: bare `px-2` is the phone value and `md:px-6` adds the
+  // desktop one, flipping at the same 768px `useIsMobile` uses to turn the rail
+  // into a top bar. 24px at every width is what this was, and it stacks on the
+  // 16px inset of every card below it, so body text started 40px in on a 390px
+  // screen. It also made this page the outlier inside its own app: the issue
+  // and PR list columns have run an 8px gutter at every width all along.
   return (
-    <div className="px-6 pt-4 pb-6 flex flex-col gap-4">
+    <div className="px-4 md:px-6 pt-4 pb-6 flex flex-col gap-4">
       {/* First row: your personal queue + a compact refresh, flush to the top. */}
       <div className="flex items-start gap-3">
         {me ? (
@@ -138,7 +147,7 @@ export default function OverviewView() {
           onClick={refresh}
           disabled={refreshing}
           aria-label={i18nT('apps.issueRadar.views.overviewView.refresh_issues')}
-          title={i18nT('apps.issueRadar.views.overviewView.re_fetch_issues_labels_from_github')}
+          title={i18nT('apps.issueRadar.views.overviewView.re_fetch_issues_and_labels_from', { provider: terms.providerName })}
           className="flex-shrink-0 inline-flex items-center justify-center h-9 w-9 rounded-lg border border-border text-muted hover:text-text hover:border-border-strong disabled:opacity-40 cursor-pointer"
         >
           <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />

@@ -101,7 +101,7 @@ and never drive the verdict, or one flaky optional job would nudge forever.
 | Audit-or-deny approval | `spine/agent_runner.py:_approve` | the unattended auto-approve is logged to the SEL with `critical=True` **before** it is granted; an unwritable audit REJECTS the tool |
 | Audited MCP dispatch | `backend/mcp_server.py:_audit` | every `tools/call` is logged, rejected ones included; the pre-dispatch `invoked` event is `critical=True` (audit-or-DENY — an unauditable call is refused), outcome events stay fail-soft since the handler has already run |
 | Redacted evidence | `backend/routes.py:_redact_for_display` / `_redact_tree` | EVERY agent-authored field served to the browser is scanned — diff, PR body, and the candidate's signature/hypothesis/evidence/severity/blast-radius, plus the gate tree recursively; **fail-closed** |
-| Sandboxed fallback agent (NOT SELECTED) | `spine/agent_runner.py:_spawn_sandboxed_agent` | nothing selects this path any more — both selection sites go offline/refuse instead (see "Why the subprocess fallback is sandboxed rather than deleted"). Retained hardening, for any future caller: it runs through `sandboxed_spawn_argv(mode="strict")` + `resource_limit_preexec()`: worktree visible, credential dirs bind-mounted empty, env scrubbed, `PYTHONPATH` stripped. Hides credentials; does NOT confine writes — see "Known limitation" below |
+| Sandboxed fallback agent (NOT SELECTED) | `spine/agent_runner.py:_spawn_sandboxed_agent` | nothing selects this path any more — both selection sites go offline/refuse instead (see "Why the subprocess fallback is sandboxed rather than deleted"). Retained hardening, for any future caller: it runs through `sandboxed_spawn_argv(mode="strict")` + `popen_limited` (post-exec resource ceiling): worktree visible, credential dirs bind-mounted empty, env scrubbed, `PYTHONPATH` stripped. Hides credentials; does NOT confine writes — see "Known limitation" below |
 | Pre-push content scan | `spine/push_policy.py:scan_content_for_secrets` | ONE scanner behind all three exits — draft-PR push, F10 direct push, one-click commit. The full pushed range is scanned; a hit **refuses** the push and the change stays in the local queue; **fail-closed** |
 | Audited subprocess agent (NOT SELECTED) | `spine/agent_runner.py:_audit_unattended_agent` | same — retained for a future caller. The `claude -p` path passes `--dangerously-skip-permissions`, so the launch is one blanket approval — logged `critical=True` before the spawn, and an unwritable audit REFUSES to launch |
 | Redacted PR prose | same, `_redact_prose` | title and description are redacted (prose survives rewriting; a diff does not) |
@@ -979,7 +979,7 @@ pull request) and four upstream paths map onto differently-named equivalents:
 
 ### Audited gap state
 
-An audit against ``MeshClawApp-AutoImprovement/mainline`` diffed the engine
+An audit against the upstream engine diffed the engine
 module-by-module. The ``spine/`` port is faithful — six modules byte-identical modulo
 whitespace, ``driver.py`` structurally line-for-line, and all six safety invariants
 (push-disabled clone, draft-only, protected-branch denylist, edit-allowlist reward-hack

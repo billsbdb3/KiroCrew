@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import platform
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -196,6 +198,102 @@ class TestScriptHookStore:
         assert retrieved.name == "persist-test"
 
 
+class TestCappedScriptHookOutput:
+    @pytest.mark.asyncio
+    async def test_reader_keeps_only_the_cap_but_drains_to_eof(self):
+        from kiro_crew.hooks import _read_capped_stream
+
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"abcdefgh")
+        reader.feed_eof()
+
+        retained, truncated = await _read_capped_stream(reader, 5)
+
+        assert retained == b"abcde"
+        assert truncated is True
+        assert await reader.read() == b""
+
+    def test_decode_marks_a_multibyte_boundary(self):
+        from kiro_crew.hooks import _HOOK_TRUNCATION_MARKER, _decode_capped
+
+        raw = ("€" * 2).encode("utf-8")[:4]
+        decoded = _decode_capped(raw, truncated=True)
+
+        assert decoded.startswith("€")
+        assert "\ufffd" in decoded
+        assert decoded.endswith(_HOOK_TRUNCATION_MARKER)
+
+    @pytest.mark.asyncio
+    async def test_cancellation_observes_both_reader_tasks(self):
+        from kiro_crew.hooks import _communicate_capped
+
+        class BlockingReader:
+            def __init__(self):
+                self.entered = asyncio.Event()
+                self.cancelled = asyncio.Event()
+
+            async def read(self, _size):
+                self.entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    raise
+
+        stdout = BlockingReader()
+        stderr = BlockingReader()
+        proc = SimpleNamespace(
+            stdin=None,
+            stdout=stdout,
+            stderr=stderr,
+            wait=AsyncMock(),
+        )
+        task = asyncio.create_task(_communicate_capped(proc, b"", 32))
+        await asyncio.gather(stdout.entered.wait(), stderr.entered.wait())
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert stdout.cancelled.is_set()
+        assert stderr.cancelled.is_set()
+        proc.wait.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_real_hook_caps_and_marks_both_streams(self, tmp_path, monkeypatch):
+        from kiro_crew.hooks import _HOOK_STREAM_CAP_BYTES, _HOOK_TRUNCATION_MARKER
+
+        # This test exercises real pipe draining, not host sandbox discovery.
+        # Keep the subprocess real while making its isolation wrappers stable
+        # across Linux, namespace-sandbox, and Windows CI environments.
+        monkeypatch.setattr("kiro_crew.sandbox.wrap_argv", lambda argv, **k: (list(argv), None))
+        monkeypatch.setattr("kiro_crew.sandbox.cgroup_scope_argv", lambda argv: list(argv))
+
+        command = _script_command(
+            tmp_path / "large_output.py",
+            "import sys\n" "sys.stdout.write('o' * 70000)\n" "sys.stderr.write('e' * 70000)\n",
+        )
+        hook = ScriptHook(
+            id="large-output",
+            name="large-output",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command=command,
+            timeout=30,
+        )
+
+        result = await run_script_hook(hook, "ctx")
+
+        assert result.exit_code == 0
+        assert result.stdout.endswith(_HOOK_TRUNCATION_MARKER)
+        assert result.stderr.endswith(_HOOK_TRUNCATION_MARKER)
+        assert len(result.stdout.encode("utf-8")) <= (
+            _HOOK_STREAM_CAP_BYTES + len(_HOOK_TRUNCATION_MARKER.encode("utf-8"))
+        )
+        assert len(result.stderr.encode("utf-8")) <= (
+            _HOOK_STREAM_CAP_BYTES + len(_HOOK_TRUNCATION_MARKER.encode("utf-8"))
+        )
+
+
 class TestRunScriptHook:
     """Test run_script_hook execution."""
 
@@ -220,7 +318,15 @@ class TestRunScriptHook:
         assert result.exit_code == 0
         assert "success" in result.stdout
         assert result.error == ""
-        assert result.duration_ms > 0
+        # ``>= 0``, not ``> 0``: ``duration_ms`` is ``int((monotonic() - start) *
+        # 1000)``, so a command that finishes in under a millisecond truncates to
+        # 0 legitimately — and ``echo`` on Windows' coarser clock does exactly
+        # that, which made this a platform-dependent flake. The guarantee worth
+        # asserting here is that the field is MEASURED and never negative; that it
+        # tracks real elapsed time is pinned by ``test_timeout`` below, where the
+        # hook runs long enough for the value to be meaningful (>= 1000).
+        assert isinstance(result.duration_ms, int)
+        assert result.duration_ms >= 0
 
     @pytest.mark.asyncio
     async def test_non_zero_exit(self):
@@ -237,12 +343,12 @@ class TestRunScriptHook:
         assert result.error == ""  # exit code is not an error, just non-zero
 
     @pytest.mark.asyncio
-    async def test_timeout(self):
+    async def test_timeout(self, tmp_path: Path):
         hook = ScriptHook(
             id="test-3",
             name="timeout",
             event=HOOK_EVENT_USER_PROMPT_SUBMIT,
-            command="sleep 10",
+            command=_script_command(tmp_path / "timeout.py", "import time\ntime.sleep(10)\n"),
             timeout=1,
             enabled=True,
         )
@@ -594,3 +700,123 @@ class TestRunScriptHookSpawnForm:
 
         assert "shell_cmd" not in seen, "a wrapped argv must not be discarded for a shell spawn"
         assert seen["argv"][0] == "sandbox-exec"
+
+
+class TestLastError:
+    """Test that last_error is populated on failure and cleared on success."""
+
+    @pytest.fixture(autouse=True)
+    def _passthrough_sandbox(self, monkeypatch):
+        monkeypatch.setattr("kiro_crew.sandbox.wrap_argv", lambda argv, **k: (list(argv), None))
+
+    @pytest.mark.asyncio
+    async def test_last_error_cleared_on_success(self):
+        hook = ScriptHook(
+            id="err-1",
+            name="last-error-clear",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command="echo ok",
+            timeout=30,
+            enabled=True,
+            last_error="old error",
+        )
+        await run_script_hook(hook, "ctx")
+        assert hook.last_status == "ok"
+        assert hook.last_error == ""
+
+    @pytest.mark.asyncio
+    async def test_last_error_populated_on_non_zero_exit(self, tmp_path: Path):
+        hook = ScriptHook(
+            id="err-2",
+            name="last-error-exit",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command=_script_command(
+                tmp_path / "exit_one.py",
+                'import sys\nsys.stderr.write("oops\\n")\nsys.exit(1)\n',
+            ),
+            timeout=30,
+            enabled=True,
+        )
+        await run_script_hook(hook, "ctx")
+        assert hook.last_status == "error"
+        assert "oops" in hook.last_error
+
+    @pytest.mark.asyncio
+    async def test_last_error_on_timeout(self, tmp_path: Path):
+        hook = ScriptHook(
+            id="err-3",
+            name="last-error-timeout",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command=_script_command(
+                tmp_path / "last_error_timeout.py", "import time\ntime.sleep(10)\n"
+            ),
+            timeout=1,
+            enabled=True,
+        )
+        await run_script_hook(hook, "ctx")
+        assert hook.last_status == "timeout"
+        assert "Timed out after 1s" in hook.last_error
+
+    @pytest.mark.asyncio
+    async def test_last_error_on_exit_2_blocked(self, tmp_path: Path):
+        hook = ScriptHook(
+            id="err-4",
+            name="last-error-blocked",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            command=_script_command(
+                tmp_path / "exit_two.py",
+                'import sys\nsys.stderr.write("block-reason\\n")\nsys.exit(2)\n',
+            ),
+            timeout=30,
+            enabled=True,
+        )
+        await run_script_hook(hook, "ctx")
+        assert hook.last_status == "blocked"
+        assert "block-reason" in hook.last_error
+
+    @pytest.mark.asyncio
+    async def test_last_error_fallback_when_no_stderr(self):
+        hook = ScriptHook(
+            id="err-5",
+            name="last-error-no-stderr",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command="exit 42",
+            timeout=30,
+            enabled=True,
+        )
+        await run_script_hook(hook, "ctx")
+        assert hook.last_status == "error"
+        assert "42" in hook.last_error
+
+    def test_last_error_serialization_roundtrip(self):
+        hook = ScriptHook(
+            id="err-6",
+            name="serial",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command="echo hi",
+            last_error="something went wrong",
+        )
+        data = hook.to_dict()
+        assert data["last_error"] == "something went wrong"
+        restored = ScriptHook.from_dict(data)
+        assert restored.last_error == "something went wrong"
+
+    def test_last_error_defaults_empty_on_missing_key(self):
+        hook = ScriptHook.from_dict({"id": "old", "name": "legacy"})
+        assert hook.last_error == ""
+
+    def test_last_error_redacted_on_load_from_persisted_data(self):
+        # hooks.json is operator-writable; a persisted last_error can carry a
+        # credential. from_dict() must scrub it before it reaches /api/hooks and
+        # the dashboard InfoTip — not only the runtime write path.
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        hook = ScriptHook.from_dict(
+            {"id": "sek", "name": "leaky", "last_error": f"auth failed: {secret}"}
+        )
+        assert secret not in hook.last_error
+
+    def test_last_error_non_string_persisted_defaults_empty(self):
+        # A non-string last_error in persisted data must not crash the redactor
+        # and must default to "".
+        hook = ScriptHook.from_dict({"id": "bad", "name": "x", "last_error": 12345})
+        assert hook.last_error == ""

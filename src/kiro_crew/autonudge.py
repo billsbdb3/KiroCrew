@@ -35,14 +35,14 @@ import os
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterator
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 from kiro_crew import platform_compat, shutdown_event
 from kiro_crew.atomic_write import replace_with_retry
-from kiro_crew.config.loader import config_dir
+from kiro_crew.config.loader import config_dir, data_home
 from kiro_crew.config.paths import legacy_home
 from kiro_crew.security import is_sensitive_path
 
@@ -74,19 +74,86 @@ STOP_SENTINEL = "STOP"
 # The caller's free-form explanation is intentionally not stored: it is
 # model-authored text and the watchdog only needs the deterministic source.
 AUTONUDGE_STOP_REASON = "autonudge_stop"
-_TERMINAL_BOUND_REASONS = frozenset({"cycle_cap", "runtime_budget"})
+
+# Persisted reason for a loop stopped because one of its cycles could not obtain
+# tool approval. Named separately from the other bounds because its remedy is
+# different in kind: the cap and the budget are raised, this one needs an
+# authorization the loop cannot grant itself.
+APPROVAL_STALL_REASON = "approval_stalled"
+
+
+class NudgeAdmissionRefused(RuntimeError):
+    """The session authorized for an arm disappeared before its commit point."""
+
+
+_TERMINAL_BOUND_REASONS = frozenset({"cycle_cap", "runtime_budget", APPROVAL_STALL_REASON})
 
 # Namespaced session-key prefixes that identify messaging-channel sessions
 # (as opposed to bare dashboard chat-slot keys). Channel-bound loops have no
 # dashboard turn-lifecycle hooks (notify_turn_complete / notify_user_input),
 # so they run on a fixed interval instead of an idle timer: the timer re-arms
 # itself right after every delivered fire.
-_CHANNEL_KEY_PREFIXES = ("slack:", "discord:", "telegram:", "whatsapp:", "unified:")
+#
+# This mirrors ``messaging.link.CHANNEL_SESSION_NAMESPACES``, spelled out here
+# rather than derived from it, for two independent reasons:
+#
+# 1. IMPORT WEIGHT. ``autonudge`` is imported at module scope by ``mcp_core``
+#    (i.e. by every MCP server process) and by the dashboard chat layer, and it
+#    depends only on config/security/platform_compat today. Naming
+#    ``kiro_crew.messaging.link`` runs ``messaging/__init__``, which pulls the
+#    driver/renderer/transport layer and, transitively, the ACP client, agent,
+#    hooks, artifacts, metrics and sqlite — measured at 48 additional
+#    ``kiro_crew`` modules to obtain one tuple of string literals.
+# 2. THIS IS A KEY-SHAPE QUESTION, NOT A LIVE-CAPABILITY ONE. ``is_channel_key``
+#    selects the RE-ARM STRATEGY and the expiry-notification metadata, so it has
+#    to answer identically whether or not the transport happens to be registered
+#    at this instant. Deriving it from a runtime ``supports_proactive_send``
+#    lookup fails toward the WRONG branch: a loop whose transport is momentarily
+#    absent would read as a dashboard slot, so ``_run_fire_cycle`` would stop
+#    self-re-arming it — and nothing else ever will, since
+#    ``notify_turn_complete`` never fires for a channel key — while the expiry
+#    notice would synthesize a ``dashboard:<namespace>:<id>`` jump link pointing
+#    at no slot.
+#
+# Membership therefore does NOT assert deliverability; it asserts "this key names
+# a conversation rather than a chat slot". Whether a nudge can actually be
+# delivered stays with the fail-closed ladder in ``dashboard/chat_runner.py``
+# (``_resolve_channel_target``: governance, then a REGISTERED transport, then
+# ``supports_proactive_send``), which logs its reason and degrades to a no-op.
+# So a namespace is listed even when nothing can currently be delivered to it,
+# and the two clearest cases are both here: ``whatsapp`` has no transport package
+# in this fork at all, and ``feishu`` ships one that declares
+# ``supports_proactive_send=False`` (its renderer only replies to an inbound
+# message id, so a nudge cycle has nowhere to put the answer). Both still classify
+# as channel keys, because the alternative is worse than a refusal: an unlisted key
+# is read as a dashboard slot and silently stops being re-armed, whereas a listed
+# one reaches the ladder and is refused with a logged reason. Being listed is
+# likewise not an arming permission — that is ``binding_key_for``, which is
+# narrower still and gated on an ownership check and a fire route.
+_CHANNEL_KEY_PREFIXES = (
+    "slack:",
+    "discord:",
+    "telegram:",
+    "wecom:",
+    "whatsapp:",
+    "webex:",
+    "teams:",
+    "weixin:",
+    "imessage:",
+    "feishu:",
+    "unified:",
+)
 
 
 def is_channel_key(key: str) -> bool:
     """True when *key* names a messaging-channel session (``slack:<ts>``,
-    ``discord:{agent}:direct:{user}`` ...) rather than a dashboard chat slot."""
+    ``discord:{agent}:direct:{user}`` ...) rather than a dashboard chat slot.
+
+    A CLASSIFICATION, not a permission: see :data:`_CHANNEL_KEY_PREFIXES` for why
+    the set is spelled out, and why membership says nothing about whether a nudge
+    can be delivered. Callers asking "may this session be armed?" want
+    :func:`binding_key_for` instead.
+    """
     return key.startswith(_CHANNEL_KEY_PREFIXES)
 
 
@@ -95,18 +162,30 @@ def binding_key_for(session_key: str) -> str | None:
     session is not nudge-able.
 
     ``dashboard:chat-N-TS`` → bare slot key ``chat-N-TS`` (the autonudge layer
-    keys dashboard loops on the bare slot key); ``slack:``/``discord:`` session
-    keys pass through unchanged (channel-bound loops). Anything else
+    keys dashboard loops on the bare slot key); ``slack:``/``discord:``/``webex:``
+    session keys pass through unchanged (channel-bound loops). Anything else
     (``cron:``, ``hook:``, ``subagent:`` ...) is not a nudge-able session.
 
     Single source of truth shared by the ``monitor_start`` MCP tool and the
     workflow ``ctx.nudge`` port so both agree on what "nudge-able" means.
+
+    NARROWER THAN :data:`_CHANNEL_KEY_PREFIXES` ON PURPOSE, and for a different
+    reason than that tuple's own exclusions. ``is_channel_key`` classifies a key's
+    SHAPE; this function answers whether an arm request can be honoured, which
+    additionally requires an ownership check in ``autonudge_authz`` and a fire
+    route in the gateway's ``_fire`` dispatcher — implemented for ``slack:``,
+    ``discord:`` and ``webex:`` only. Passing a namespace through ahead of those two would
+    arm a loop that is denied at the chokepoint (or removed on its first fire
+    with "unsupported channel key"), which is strictly worse than refusing it
+    here: a clean "not supported from this session type" instead of a loop that
+    appears to exist and then dies. Widen this set only together with the
+    matching ownership check and fire route.
     """
     if not session_key:
         return None
     if session_key.startswith("dashboard:"):
         return session_key.split(":", 1)[1]
-    if session_key.startswith(("slack:", "discord:")):
+    if session_key.startswith(("slack:", "discord:", "webex:")):
         return session_key
     return None
 
@@ -242,10 +321,47 @@ def repair_sentinel_path(raw: str) -> str:
 # service without needing a reference to the gateway. Set by AutoNudgeService
 # on start(); cleared on stop().
 _INSTANCE: "AutoNudgeService | None" = None
+_MAINTENANCE_LOCKS: dict[tuple[asyncio.AbstractEventLoop, str], asyncio.Lock] = {}
+
+
+def _maintenance_lock(base_dir: Path) -> asyncio.Lock:
+    """Per-event-loop lock serializing store maintenance with service startup."""
+    loop = asyncio.get_running_loop()
+    path_key = os.path.normcase(os.path.abspath(str(base_dir)))
+    return _MAINTENANCE_LOCKS.setdefault((loop, path_key), asyncio.Lock())
+
+
+async def _cancel_and_drain_tasks(*tasks: asyncio.Task[Any]) -> bool:
+    """Cancel child tasks without letting repeated cancellation abort cleanup."""
+    for task in tasks:
+        task.cancel()
+    drain = asyncio.ensure_future(asyncio.gather(*tasks, return_exceptions=True))
+    interrupted = False
+    while not drain.done():
+        try:
+            await asyncio.shield(drain)
+        except asyncio.CancelledError:
+            interrupted = True
+    drain.result()
+    return interrupted
 
 
 def get_instance() -> "AutoNudgeService | None":
     return _INSTANCE
+
+
+def _current_task_or_none() -> "asyncio.Task[Any] | None":
+    """:func:`asyncio.current_task`, or ``None`` when no loop is running.
+
+    ``current_task`` raises ``RuntimeError: no running event loop`` outside a loop, and
+    ``stop()`` is reached from SYNCHRONOUS callers — the gateway's shutdown path and test
+    teardown — where nothing is running. There, no task can be "the current" one, which is
+    the answer this returns rather than an exception the caller would have to know about.
+    """
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
 
 
 @dataclass
@@ -277,14 +393,27 @@ class NudgeLoop:
     max_runtime_secs: int = 0
     # WHY the loop was last deactivated: "" (active / never stopped),
     # "manual" (user pause / any caller that didn't say otherwise),
-    # "autonudge_stop" (deliberate directive), "cycle_cap", or
-    # "runtime_budget" (set by _timer's terminal bounds).
+    # "autonudge_stop" (deliberate directive), "cycle_cap",
+    # "runtime_budget", or "approval_stalled" (set by _timer's terminal
+    # bounds).
     # Persisted so revival logic can distinguish a manual pause from a bound
     # expiry — elapsed wall-clock keeps growing after a manual pause, so
     # WITHOUT this record a paused loop whose budget has since elapsed is
     # indistinguishable from a budget-stopped one, and a budget raise would
     # resume unattended execution against the user's explicit pause.
     stopped_reason: str = ""
+    # Evidence that a cycle in this loop's session asked for tool approval and
+    # nobody answered within the window. Set by ``notify_approval_stalled`` and
+    # consumed by ``_timer`` as a terminal condition on the NEXT wake, which is
+    # the whole point: the loop stops on proof that it could not act, never on a
+    # prediction that it might not be able to. A loop whose turns only touch
+    # auto-approved tools never reaches an interactive wait, so it can never be
+    # flagged here — that is what keeps a working read-only loop running instead
+    # of needing a "does this loop need approval?" guess.
+    # Persisted, because the condition that produced it (a lapsed grant) usually
+    # outlives a restart; cleared on every revival so a re-granted loop is not
+    # stopped by stale evidence.
+    approval_stalled: bool = False
     # Absolute wall-clock deadline for the next fire (0 = unset: the next arm
     # starts a fresh full countdown). This is what makes the countdown
     # deadline-preserving — user turns cancel the pending timer TASK but never
@@ -383,6 +512,13 @@ class AutoNudgeService:
         # fire callback runs the unattended turn INLINE, so cancelling it kills
         # the in-flight turn and loses its transcript and cycle bookkeeping.
         self._firing: set[str] = set()
+        # Loop ids owned by an administrative cleanup. Public mutations on the
+        # same firing loop must not wait for the maintenance mutex: the cleanup
+        # is waiting for that timer to finish, so waiting would invert the lock.
+        # They instead observe a missing/no-op mutation while cleanup retains
+        # the durable row until the dependent worker has been archived.
+        self._maintenance_quiescing: set[str] = set()
+        self._maintenance_quiesce_events: dict[str, asyncio.Event] = {}
         # Set by _load() when a persisted loop was repaired in memory (currently
         # a re-homed/dropped stop_sentinel_path) so start() can flush the
         # correction back to disk ONCE instead of re-deriving it every boot.
@@ -461,6 +597,43 @@ class AutoNudgeService:
                 self._store_dirty = True
         logger.info("AutoNudge: loaded %d loops", len(self._loops))
 
+    @classmethod
+    async def load_for_maintenance(cls, base_dir: Path | None = None) -> "AutoNudgeService":
+        """Load the durable store without arming timers or publishing a singleton.
+
+        Administrative cleanup still needs to see old loops when AutoNudge is
+        disabled.  Reusing the service's locked parser keeps that recovery on
+        the same schema and persistence protocol as normal startup, while the
+        absence of ``start()`` guarantees that reading the store cannot fire a
+        loop as a side effect.
+        """
+        service = cls(base_dir=base_dir)
+        await asyncio.get_running_loop().run_in_executor(None, service._load)
+        return service
+
+    @classmethod
+    @asynccontextmanager
+    async def maintenance_service(
+        cls, base_dir: Path | None = None
+    ) -> AsyncIterator["_AutoNudgeMaintenanceView"]:
+        """Yield one authoritative store view, serialized with startup and peers."""
+        selected_dir = base_dir or data_home()
+        async with _maintenance_lock(selected_dir):
+            live = _INSTANCE
+            if live is not None and live._base_dir == selected_dir:
+                view = _AutoNudgeMaintenanceView(live)
+                try:
+                    yield view
+                finally:
+                    view._release()
+                return
+            offline = await cls.load_for_maintenance(base_dir=selected_dir)
+            view = _AutoNudgeMaintenanceView(offline)
+            try:
+                yield view
+            finally:
+                view._release()
+
     def _serialize_state(self) -> dict:
         """Snapshot the store payload ON THE CALLER'S THREAD.
 
@@ -517,44 +690,83 @@ class AutoNudgeService:
         if not enabled():
             logger.info("AutoNudge disabled (KIROCREW_AUTONUDGE not set)")
             return
-        # Load + repair OFF the event loop: the locked read is file I/O and
-        # repair_sentinel_path's sensitivity check resolves realpaths, which can
-        # stall on an unavailable network-mounted sentinel. Freezing the loop
-        # here would take chat, heartbeat and liveness down until the watchdog
-        # restarts the gateway (no-blocking-call-on-event-loop).
-        await asyncio.get_running_loop().run_in_executor(None, self._load)
-        # Persist any repair _load() made (re-homed sentinel paths) before the
-        # timers go live, so the corrected value survives even if this process
-        # never mutates a loop again. Routed through _persist_locked so it obeys
-        # the one write protocol (snapshot under `_lock`, fsync off the loop)
-        # rather than snapshotting unlocked.
-        if self._store_dirty:
-            try:
-                await self._persist_locked()
-                self._store_dirty = False
-            except Exception:  # noqa: BLE001 - the in-memory repair still applies
-                logger.warning("AutoNudge: could not persist sentinel repair", exc_info=True)
-        # Re-arm timers for active loops on startup — toward each loop's
-        # persisted deadline, so a restart never resets the countdown: a loop
-        # that was 25 minutes into a 30-minute interval resumes with ~5 left,
-        # and one whose deadline passed while the gateway was down fires after
-        # the overdue beat. Legacy entries (no next_due_ts) start fresh.
-        for loop in self._loops.values():
-            if loop.active:
-                self._arm_from_deadline(loop)
-        global _INSTANCE
-        _INSTANCE = self
+        # This lock spans load, repair, timer arming and singleton publication.
+        # Disabled-mode maintenance that got here first finishes its whole
+        # read/modify/write transaction before startup loads; maintenance that
+        # arrives later sees this live service rather than a stale private copy.
+        async with _maintenance_lock(self._base_dir):
+            # Load + repair OFF the event loop: the locked read is file I/O and
+            # repair_sentinel_path's sensitivity check resolves realpaths.
+            await asyncio.get_running_loop().run_in_executor(None, self._load)
+            if self._store_dirty:
+                try:
+                    await self._persist_locked()
+                    self._store_dirty = False
+                except Exception:  # noqa: BLE001 - in-memory repair still applies
+                    logger.warning("AutoNudge: could not persist sentinel repair", exc_info=True)
+            for loop in self._loops.values():
+                if loop.active:
+                    self._arm_from_deadline(loop)
+            global _INSTANCE
+            _INSTANCE = self
         logger.info("AutoNudge started")
 
     def stop(self) -> None:
-        for t in self._timers.values():
-            t.cancel()
+        # Through _cancel_timer, not a bare t.cancel() loop: shutdown is the likeliest
+        # moment for a timer's loop to be closing already, and one cancellation policy
+        # means this path inherits both of its guards instead of restating neither.
+        # It pops as it goes, so iterate over a snapshot of the keys.
+        for loop_id in list(self._timers):
+            self._cancel_timer(loop_id)
         self._timers.clear()
+        self._maintenance_quiescing.clear()
+        self._maintenance_quiesce_events.clear()
         global _INSTANCE
         if _INSTANCE is self:
             _INSTANCE = None
 
     # ── Loop CRUD ──
+
+    def _begin_maintenance_quiesce(self, loop_id: str) -> None:
+        self._maintenance_quiescing.add(loop_id)
+        self._maintenance_quiesce_events.setdefault(loop_id, asyncio.Event()).set()
+
+    def _end_maintenance_quiesce(self, loop_id: str) -> None:
+        self._maintenance_quiescing.discard(loop_id)
+        self._maintenance_quiesce_events.pop(loop_id, None)
+
+    async def _acquire_mutation_lock(self, loop_id: str) -> asyncio.Lock | None:
+        """Acquire the store mutex unless cleanup claims this loop first."""
+        if loop_id in self._maintenance_quiescing:
+            return None
+        lock = _maintenance_lock(self._base_dir)
+        event = self._maintenance_quiesce_events.setdefault(loop_id, asyncio.Event())
+        acquire_task = asyncio.create_task(lock.acquire())
+        quiesce_task = asyncio.create_task(event.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {acquire_task, quiesce_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        except BaseException:
+            await _cancel_and_drain_tasks(acquire_task, quiesce_task)
+            if acquire_task.done() and not acquire_task.cancelled():
+                lock.release()
+            raise
+        if acquire_task in done:
+            interrupted = await _cancel_and_drain_tasks(quiesce_task)
+            if interrupted:
+                lock.release()
+                raise asyncio.CancelledError()
+            if loop_id not in self._maintenance_quiescing:
+                return lock
+            lock.release()
+            return None
+        interrupted = await _cancel_and_drain_tasks(acquire_task)
+        if acquire_task.done() and not acquire_task.cancelled():
+            lock.release()
+        if interrupted:
+            raise asyncio.CancelledError()
+        return None
 
     async def add(
         self,
@@ -564,6 +776,7 @@ class AutoNudgeService:
         max_cycles: int = 0,
         stop_sentinel_path: str = "",
         max_runtime_secs: int = 0,
+        admission_check: Callable[[], bool] | None = None,
     ) -> NudgeLoop:
         # CANCELLATION SAFETY: the mutate+persist runs as a SHIELDED task. If
         # the awaiting caller is cancelled mid-write, a bare await would release
@@ -585,6 +798,7 @@ class AutoNudgeService:
                 max_cycles=max_cycles,
                 stop_sentinel_path=stop_sentinel_path,
                 max_runtime_secs=max_runtime_secs,
+                admission_check=admission_check,
             )
         )
         self._inflight_adds.add(inner)
@@ -606,15 +820,40 @@ class AutoNudgeService:
         max_cycles: int,
         stop_sentinel_path: str,
         max_runtime_secs: int = 0,
+        admission_check: Callable[[], bool] | None = None,
+    ) -> NudgeLoop:
+        async with _maintenance_lock(self._base_dir):
+            return await self._add_unserialized(
+                slot_key,
+                message,
+                idle_secs=idle_secs,
+                max_cycles=max_cycles,
+                stop_sentinel_path=stop_sentinel_path,
+                max_runtime_secs=max_runtime_secs,
+                admission_check=admission_check,
+            )
+
+    async def _add_unserialized(
+        self,
+        slot_key: str,
+        message: str,
+        *,
+        idle_secs: int,
+        max_cycles: int,
+        stop_sentinel_path: str,
+        max_runtime_secs: int = 0,
+        admission_check: Callable[[], bool] | None = None,
     ) -> NudgeLoop:
         idle_secs = max(_MIN_IDLE_SECS, min(_MAX_IDLE_SECS, int(idle_secs)))
         async with self._lock:
+            if admission_check is not None and not admission_check():
+                raise NudgeAdmissionRefused("session changed before nudge arm committed")
             # One loop per slot — replace any existing loop on this slot.
             # persist=False: the offloaded write below persists the combined
             # removal+add atomically, avoiding a duplicate blocking save here.
             existing = self._find_by_slot(slot_key)
             if existing:
-                self.remove_sync(existing.id, persist=False)
+                self.remove_sync(existing.id, persist=False, emit=False)
             now = time.time()
             loop = NudgeLoop(
                 id=uuid.uuid4().hex[:8],
@@ -638,10 +877,18 @@ class AutoNudgeService:
             # worker thread, and await it so a persistence failure still
             # propagates to the caller before the loop is reported armed.
             payload = self._serialize_state()
-            await asyncio.get_running_loop().run_in_executor(
-                None, self._write_state, payload
-            )
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
+            except BaseException:
+                self._loops.pop(loop.id, None)
+                if existing is not None:
+                    self._loops[existing.id] = existing
+                    if existing.active:
+                        self._arm_from_deadline(existing)
+                raise
             self._arm_from_deadline(loop)
+            if existing is not None:
+                self._emit("removed", existing)
         self._emit("added", loop)
         logger.info("AutoNudge: added loop %s on slot %s (idle=%ds)", loop.id, slot_key, idle_secs)
         return loop
@@ -702,7 +949,86 @@ class AutoNudgeService:
         inner.add_done_callback(_finish)
         return await asyncio.shield(inner)
 
+    async def deactivate_and_wait(self, loop_id: str) -> bool:
+        """Persistently pause a loop and wait for its current timer to quiesce.
+
+        ``update(active=False)`` deliberately does not cancel a timer already
+        inside its fire callback because channel turns run inline there.  A
+        cleanup caller has a different need: it must know that a dashboard fire
+        can no longer materialize a slot after the caller takes its snapshot.
+        The loop remains durably present and inactive until the caller removes
+        it, so a timeout or process exit leaves a restart-visible recovery
+        marker instead of losing the orphan's only identity.
+        """
+        timer_before = self._timers.get(loop_id)
+        loop = await self.update(loop_id, active=False)
+        if loop is None:
+            return False
+        # A turn-complete notification can replace the timer while update()
+        # waits to acquire and persist the inactive state. Once update returns,
+        # active=False prevents any further replacement, so both tasks close
+        # the final slot-publication window.
+        timer_after = self._timers.get(loop_id)
+        current = asyncio.current_task()
+        for timer in {timer_before, timer_after}:
+            if timer is not None and timer is not current and not timer.done():
+                await asyncio.shield(timer)
+        return True
+
+    async def _deactivate_and_wait_unserialized(self, loop_id: str) -> bool:
+        """Quiesce a loop while the caller owns the maintenance transaction."""
+        self._begin_maintenance_quiesce(loop_id)
+        timer_before = self._timers.get(loop_id)
+        inner = asyncio.create_task(self._update_unserialized(loop_id, active=False))
+        try:
+            loop = await asyncio.shield(inner)
+        except asyncio.CancelledError:
+            # maintenance_service() must not release its transaction while the
+            # executor-backed write can still commit a stale snapshot.
+            while not inner.done():
+                try:
+                    await asyncio.shield(inner)
+                except asyncio.CancelledError:
+                    continue
+            inner.result()
+            raise
+        if loop is None:
+            return False
+        timer_after = self._timers.get(loop_id)
+        current = asyncio.current_task()
+        for timer in {timer_before, timer_after}:
+            if timer is not None and timer is not current and not timer.done():
+                await asyncio.shield(timer)
+        return True
+
     async def _update_locked(
+        self,
+        loop_id: str,
+        *,
+        message: str | None = None,
+        idle_secs: int | None = None,
+        max_cycles: int | None = None,
+        active: bool | None = None,
+        max_runtime_secs: int | None = None,
+        stopped_reason: str | None = None,
+    ) -> NudgeLoop | None:
+        lock = await self._acquire_mutation_lock(loop_id)
+        if lock is None:
+            return None
+        try:
+            return await self._update_unserialized(
+                loop_id,
+                message=message,
+                idle_secs=idle_secs,
+                max_cycles=max_cycles,
+                active=active,
+                max_runtime_secs=max_runtime_secs,
+                stopped_reason=stopped_reason,
+            )
+        finally:
+            lock.release()
+
+    async def _update_unserialized(
         self,
         loop_id: str,
         *,
@@ -717,6 +1043,7 @@ class AutoNudgeService:
             loop = self._loops.get(loop_id)
             if not loop:
                 return None
+            previous = asdict(loop)
             was_active = loop.active
             if message is not None:
                 loop.message = message
@@ -758,11 +1085,7 @@ class AutoNudgeService:
                         "reasonless inactive update",
                         loop.id,
                     )
-                elif (
-                    stopped_reason in _TERMINAL_BOUND_REASONS
-                    and not active
-                    and not loop.active
-                ):
+                elif stopped_reason in _TERMINAL_BOUND_REASONS and not active and not loop.active:
                     logger.info(
                         "AutoNudge: loop %s already deactivated (%s) — %s bound "
                         "not overwriting it",
@@ -780,6 +1103,17 @@ class AutoNudgeService:
                     # "manual", which the revive logic never auto-resumes.
                     if loop.active:
                         loop.stopped_reason = ""
+                        # Spent only by an actual REVIVAL, hence ``not
+                        # was_active``. A still-active loop also receives
+                        # ``active=True`` from an ordinary settings save (the
+                        # goal popover sends it on every edit), and treating
+                        # that as an answer would erase evidence recorded
+                        # moments earlier and let one more doomed cycle fire.
+                        # Keeping it costs at most a resumable stop the operator
+                        # can undo; dropping it costs a wasted cycle and the
+                        # silence this stop exists to end.
+                        if not was_active:
+                            loop.approval_stalled = False
                     else:
                         loop.stopped_reason = stopped_reason or "manual"
             revived = loop.active and not was_active
@@ -806,7 +1140,12 @@ class AutoNudgeService:
             # post-fire write) and await the offloaded write so a persistence
             # failure still reaches the caller. Same contract as _add_locked.
             payload = self._serialize_state()
-            await asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
+            except BaseException:
+                for field_name, value in previous.items():
+                    setattr(loop, field_name, value)
+                raise
             # Re-arm the timer with the new settings — but NEVER while its
             # callback is mid-fire. Cancelling a firing timer cancels the
             # in-flight turn itself (channel loops run the turn inline in
@@ -836,20 +1175,42 @@ class AutoNudgeService:
         self._emit("updated", loop)
         return loop
 
-    def remove_sync(self, loop_id: str, *, persist: bool = True) -> None:
+    def remove_sync(
+        self, loop_id: str, *, persist: bool = True, emit: bool = True
+    ) -> NudgeLoop | None:
         """Remove a loop. ``persist=False`` skips the blocking save — used by
         async callers that snapshot+offload the write themselves right after."""
         loop = self._loops.pop(loop_id, None)
         if loop is None:
-            return
+            return None
         self._cancel_timer(loop_id)
         self._rearm_fail_count.pop(loop_id, None)
         self._rearm_pending.discard(loop_id)
         if persist:
             self._save()
-        self._emit("removed", loop)
+        if emit:
+            self._emit("removed", loop)
+        return loop
 
     async def remove(self, loop_id: str) -> None:
+        lock = await self._acquire_mutation_lock(loop_id)
+        if lock is None:
+            return
+        try:
+            await self._remove_unserialized(loop_id)
+        finally:
+            lock.release()
+
+    async def remove_by_slot(self, slot_key: str) -> NudgeLoop | None:
+        """Remove the current slot generation inside one maintenance transaction."""
+        async with _maintenance_lock(self._base_dir):
+            loop = self._find_by_slot(slot_key)
+            if loop is None:
+                return None
+            await self._remove_unserialized(loop.id)
+            return loop
+
+    async def _remove_unserialized(self, loop_id: str) -> None:
         async with self._lock:
             existed = loop_id in self._loops
             if not existed and loop_id not in self._pending_removals:
@@ -860,11 +1221,21 @@ class AutoNudgeService:
             # the removal INLINE (not a separate task) so _cancel_timer's
             # "never cancel the current task" self-guard still applies when
             # _timer removes its own loop.
+            removed_loop: NudgeLoop | None = None
             if existed:
-                self.remove_sync(loop_id, persist=False)
+                removed_loop = self.remove_sync(loop_id, persist=False, emit=False)
                 self._pending_removals.add(loop_id)
             payload = self._serialize_state()
             fut = asyncio.get_running_loop().run_in_executor(None, self._write_state, payload)
+
+            def _restore_failed_removal() -> None:
+                self._pending_removals.discard(loop_id)
+                if removed_loop is None:
+                    return
+                self._loops[loop_id] = removed_loop
+                if removed_loop.active:
+                    self._arm_from_deadline(removed_loop)
+
             try:
                 await asyncio.shield(fut)
             except asyncio.CancelledError:
@@ -876,11 +1247,30 @@ class AutoNudgeService:
                 # race a second os.replace(), clobbering newer state with this
                 # stale removal snapshot ("lost update after restart"). Then
                 # propagate the cancellation.
-                await asyncio.shield(fut)
+                while not fut.done():
+                    try:
+                        await asyncio.shield(fut)
+                    except asyncio.CancelledError:
+                        continue
+                try:
+                    fut.result()
+                except Exception:
+                    _restore_failed_removal()
+                    raise
                 self._pending_removals.discard(loop_id)
+                if removed_loop is not None:
+                    self._emit("removed", removed_loop)
+                raise
+            except Exception:
+                # Persistence is the commit point. Restore the live row (and
+                # its timer when it was active) so an immediate retry can still
+                # see the same loop the durable store retained.
+                _restore_failed_removal()
                 raise
             else:
                 self._pending_removals.discard(loop_id)
+                if removed_loop is not None:
+                    self._emit("removed", removed_loop)
 
     def get_by_slot(self, slot_key: str) -> NudgeLoop | None:
         return self._find_by_slot(slot_key)
@@ -916,6 +1306,40 @@ class AutoNudgeService:
         return None
 
     # ── Reactive arming ──
+
+    def notify_approval_stalled(self, slot_key: str) -> None:
+        """Record that a tool approval in *slot_key* went unanswered.
+
+        Called from the approval path when a prompt times out with no decision.
+        That is the only evidence available that an unattended loop can no longer
+        act, and it is evidence rather than inference: an auto-approved tool
+        never reaches the interactive wait, so this is unreachable for a loop
+        whose cycles only touch read-only tools.
+
+        Records the fact and returns. The STOP is left to ``_timer``, which
+        already owns every terminal decision and evaluates them serialized before
+        a fire — stopping from here would mean cancelling a timer that may be
+        mid-fire (the one thing the fire-window contracts forbid, since it kills
+        the in-flight turn) and racing the very turn that produced the evidence.
+        Deferring costs the cycle already in flight and saves every later one.
+
+        The evidence is slot-level, not cycle-level: an unanswered prompt in an
+        attended tab counts too. That is the conservative direction — the loop
+        deactivates inspectable and restartable with a notice naming the remedy,
+        and a person who was merely away resumes it — whereas the alternative
+        needs a reliable "is this turn a nudge cycle?" test, which the fire
+        window does not provide for dashboard slots (their turn outlives it).
+        """
+        loop = self._find_by_slot(slot_key)
+        if not loop or not loop.active or loop.approval_stalled:
+            return
+        loop.approval_stalled = True
+        logger.warning(
+            "AutoNudge: a tool approval went unanswered in loop %s's session — "
+            "it will stop instead of firing another cycle",
+            loop.id,
+        )
+        self._persist_soon()
 
     def notify_turn_complete(self, slot_key: str) -> None:
         """Called by gateway after HOOK_EVENT_STOP — resume the countdown for this slot.
@@ -969,12 +1393,45 @@ class AutoNudgeService:
         self._cancel_timer(loop.id)
 
     def _cancel_timer(self, loop_id: str) -> None:
+        """Retire one loop's timer task. The single cancellation policy.
+
+        Two conditions make a cancel wrong rather than merely redundant, and both are
+        stated here so no caller has to remember either:
+
+        * **The currently running timer task** (a self-re-arm from inside ``_timer``) is
+          about to return on its own, and cancelling it would inject a spurious
+          ``CancelledError`` into the finishing task.
+        * **A task whose event loop has already closed.** ``Task.cancel`` schedules the
+          cancellation through ``loop.call_soon``, which raises ``RuntimeError: Event loop
+          is closed`` — so this raises out of ``remove``/``remove_sync`` and the dashboard
+          handler above it answers 500. The service is a process-global singleton, so its
+          ``_timers`` outlive the loop that created them whenever one loop is replaced by
+          another: the gateway's own shutdown, and every test that drives a handler after
+          an earlier test's loop closed. Asked positively (``get_loop().is_closed()``)
+          rather than by catching the ``RuntimeError``, because a closed loop is the one
+          state where cancelling is a NO-OP by definition — the task can never run again —
+          and catching would also swallow a genuine scheduling fault.
+
+        The closed-loop question is asked FIRST because it needs no running loop of its
+        own, and ``stop()`` reaches here from synchronous callers (gateway shutdown, test
+        teardown) where ``asyncio.current_task()`` would raise instead of answering — hence
+        :func:`_current_task_or_none`.
+        """
         t = self._timers.pop(loop_id, None)
-        # Never cancel the currently running timer task (self-re-arm from inside
-        # _timer): it is about to return on its own, and cancelling it would
-        # inject a spurious CancelledError into the finishing task.
-        if t and not t.done() and t is not asyncio.current_task():
-            t.cancel()
+        if t is None or t.done():
+            return
+        # Closed-loop check FIRST: it needs no running loop of its own, so a dead timer is
+        # retired even from a synchronous caller.
+        if t.get_loop().is_closed():
+            logger.debug(
+                "AutoNudge: dropped loop %s's timer without cancelling — its event loop "
+                "has closed, so the task can no longer run",
+                loop_id,
+            )
+            return
+        if t is _current_task_or_none():
+            return
+        t.cancel()
 
     def _arm_timer(self, loop: NudgeLoop, delay: float | None = None) -> None:
         self._cancel_timer(loop.id)
@@ -1072,6 +1529,30 @@ class AutoNudgeService:
                 loop.max_runtime_secs,
             )
             await self.update(loop.id, active=False, stopped_reason="runtime_budget")
+            self._emit("expired", loop)
+            return
+        # Proved unable to act? Checked LAST, so a loop that is also out of
+        # cycles or budget still reports the bound it historically would have. This one is reactive by construction: it fires only on recorded
+        # evidence that a cycle's approval went unanswered (see
+        # ``notify_approval_stalled``), never on a reading of whether a grant
+        # happens to be in force — a loop that only ever calls auto-approved
+        # tools needs no grant, and stopping it would turn a working
+        # configuration into a stopped one.
+        #
+        # Same terminal treatment as the other bounds: deactivate rather than
+        # remove, so the loop stays inspectable and can be resumed once the
+        # operator restores the authorization it cannot obtain for itself, and
+        # emit ``expired`` so the notifier tells them it stopped rather than
+        # finished. Without this the loop keeps waking, dispatching, being
+        # declined and spending its cap on cycles that were never able to work.
+        if loop.approval_stalled:
+            logger.info(
+                "AutoNudge: loop %s cannot obtain tool approval — deactivating "
+                "instead of firing cycle %d",
+                loop.id,
+                loop.cycle_count + 1,
+            )
+            await self.update(loop.id, active=False, stopped_reason=APPROVAL_STALL_REASON)
             self._emit("expired", loop)
             return
         # Fire. Update state only if the callback reports actual delivery —
@@ -1191,7 +1672,7 @@ class AutoNudgeService:
                 loop.id,
                 loop.max_runtime_secs,
             )
-            await self.update(loop.id, active=False, stopped_reason="runtime_budget")
+            await self._update_unserialized(loop.id, active=False, stopped_reason="runtime_budget")
             self._emit("expired", loop)
             return
         # Channel-bound loops (Slack/Discord/...) have no dashboard
@@ -1202,3 +1683,37 @@ class AutoNudgeService:
         # handles any overlap.
         if is_channel_key(loop.slot_key) and loop.active and loop.id in self._loops:
             self._arm_from_deadline(loop)
+
+
+class _AutoNudgeMaintenanceView:
+    """Store operations that are safe inside ``maintenance_service``'s lock."""
+
+    def __init__(self, service: AutoNudgeService) -> None:
+        self._service = service
+        self._quiescing: set[str] = set()
+
+    def _release(self) -> None:
+        for loop_id in self._quiescing:
+            self._service._end_maintenance_quiesce(loop_id)
+        self._quiescing.clear()
+
+    def list_all(self) -> list[NudgeLoop]:
+        return self._service.list_all()
+
+    def get_by_slot(self, slot_key: str) -> NudgeLoop | None:
+        return self._service.get_by_slot(slot_key)
+
+    async def deactivate_and_wait(self, loop_id: str) -> bool:
+        self._quiescing.add(loop_id)
+        quiesced = await self._service._deactivate_and_wait_unserialized(loop_id)
+        if quiesced:
+            return True
+        else:
+            self._service._end_maintenance_quiesce(loop_id)
+            self._quiescing.discard(loop_id)
+            return False
+
+    async def remove(self, loop_id: str) -> None:
+        await self._service._remove_unserialized(loop_id)
+        self._service._end_maintenance_quiesce(loop_id)
+        self._quiescing.discard(loop_id)

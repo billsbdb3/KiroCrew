@@ -37,6 +37,7 @@ by ``test/conftest.py``) happens. Style and patch seams mirror
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -44,7 +45,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from kiro_crew.autonudge import NudgeLoop
+from kiro_crew.autonudge import APPROVAL_STALL_REASON, NudgeLoop
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.slack import gateway as gw
 
@@ -561,6 +562,7 @@ class TestAutoMigrateMemory:
         assert reconcile.call_count == 2
 
     @pytest.mark.asyncio
+    @pytest.mark.xdist_group("caplog_slack_gw")
     async def test_download_error_and_unready_model_defer_the_sweep(self, caplog):
         orch = _make_orchestrator()
         store = MagicMock()
@@ -586,6 +588,7 @@ class TestAutoMigrateMemory:
         assert "deferring" in caplog.text
 
     @pytest.mark.asyncio
+    @pytest.mark.xdist_group("caplog_slack_gw")
     async def test_missing_store_is_a_no_op(self, caplog):
         orch = _make_orchestrator()
         orch.vector_memory = None
@@ -634,6 +637,7 @@ class TestInitCrew:
 class TestInitMcpDiscovery:
     """Configured MCP servers are logged at boot for diagnosability."""
 
+    @pytest.mark.xdist_group("caplog_slack_gw")
     def test_configured_servers_are_listed(self, caplog):
         orch = _make_orchestrator()
         servers = [SimpleNamespace(name="builder-mcp"), SimpleNamespace(name="playwright-mcp")]
@@ -663,8 +667,50 @@ class TestSubagentCoalescer:
         ds.broadcast_ws_subagent_subscribers.assert_called_once_with("subagent_status", {"b": 2})
 
 
+class TestChannelLoopStallWiring:
+    """A channel-bound loop's cycles are approved in the gateway, not the runner.
+
+    Without the key threaded through, an unanswered prompt on that path records
+    no evidence, so a Slack loop with a lapsed grant keeps waking and spending
+    its cap while the expiry notice promises a stop.
+    """
+
+    def test_the_nudge_fire_path_passes_its_binding_key(self) -> None:
+        src = inspect.getsource(gw.GatewayOrchestrator._fire_slack_nudge)
+        assert '_interactive_approval("autonudge", nudge_key=key)' in src, (
+            "the Slack nudge turn does not identify its loop to the approval "
+            "callback, so a stalled channel cycle records no evidence"
+        )
+        # `key` must be the loop's own binding key, which is what the service
+        # resolves loops by -- not a channel id or a derived display name.
+        assert "key = loop.slot_key" in src
+
+    def test_the_approval_timeout_records_the_stall(self) -> None:
+        src = inspect.getsource(gw.GatewayOrchestrator._interactive_approval)
+        assert "notify_approval_stalled(nudge_key)" in src
+        # Guarded, so non-loop consumers of this callback (cron, taskrunner,
+        # subagents) are untouched by it.
+        assert "if nudge_key:" in src
+
+    def test_only_the_timeout_branch_records_a_stall(self) -> None:
+        """A human answering `reject` is not evidence that nobody is there.
+
+        An explicit denial is a decision; treating it as an unanswered prompt
+        would stop a loop whose operator is present and declining one tool.
+        """
+        src = inspect.getsource(gw.GatewayOrchestrator._interactive_approval)
+        lines = src.split("\n")
+        call = next(i for i, ln in enumerate(lines) if "notify_approval_stalled" in ln)
+        excepts = [i for i, ln in enumerate(lines[:call]) if ln.strip().startswith("except ")]
+        assert excepts, "the stall recording is not inside an except branch"
+        assert "asyncio.TimeoutError" in lines[excepts[-1]], (
+            "the stall is recorded outside the approval-timeout branch, so an "
+            "explicit human rejection would also stop the loop"
+        )
+
+
 class TestNotifyNudgeExpired:
-    """Expiry wording distinguishes the runtime budget from the cycle cap."""
+    """Expiry wording names the bound that actually stopped the loop."""
 
     def test_runtime_budget_wording(self):
         orch = _make_orchestrator()
@@ -696,6 +742,53 @@ class TestNotifyNudgeExpired:
             message="keep checking",
             max_cycles=4,
             cycle_count=4,
+        )
+        orch._notify_nudge_expired(loop)
+        assert ds.notify.call_args.args[1] == "Monitoring loop hit its cycle cap"
+
+    def test_approval_stall_names_its_own_remedy(self):
+        """A stalled loop must not be reported as a cap it never reached.
+
+        The remedy differs in kind — restore the authorization, do not raise a
+        bound — so the cap wording would send the operator to change a setting
+        that was never the problem.
+        """
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-3",
+            slot_key="chat-3",
+            message="keep checking",
+            max_cycles=24,
+            cycle_count=3,
+            stopped_reason=APPROVAL_STALL_REASON,
+        )
+        orch._notify_nudge_expired(loop)
+        title = ds.notify.call_args.args[1]
+        body = ds.notify.call_args.args[2]
+        assert title == "Monitoring loop stopped — it could not get tool approval"
+        assert "cycle cap" not in body
+        assert "auto-approve" in body
+        # Both causes get their own remedy. The evidence is slot-level, so this
+        # stop also fires when the operator was merely away from a prompt while
+        # auto-approve was perfectly healthy; telling them to re-enable it would
+        # send them to change a setting that was never off.
+        assert "away" in body
+        assert "restart the loop" in body
+
+    def test_cycle_cap_outranks_a_stall(self):
+        """Ranked below the two bounds, matching _timer's evaluation order."""
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-4",
+            slot_key="chat-4",
+            message="keep checking",
+            max_cycles=4,
+            cycle_count=4,
+            stopped_reason=APPROVAL_STALL_REASON,
         )
         orch._notify_nudge_expired(loop)
         assert ds.notify.call_args.args[1] == "Monitoring loop hit its cycle cap"
@@ -747,6 +840,7 @@ class TestPersistSlotTitle:
 class TestRememberOptions:
     """Recording a posted OPTIONS control is best-effort."""
 
+    @pytest.mark.xdist_group("caplog_slack_gw")
     def test_record_failure_is_swallowed(self, caplog):
         orch = _make_orchestrator()
         orch.dashboard_state = _mock_dashboard_state()
@@ -781,6 +875,7 @@ class TestDeliverCronResponse:
         assert "no channel resolved" in caplog.text
 
     @pytest.mark.asyncio
+    @pytest.mark.xdist_group("caplog_slack_gw")
     async def test_options_post_failure_still_delivers_text(self, caplog):
         orch = _make_orchestrator()
         slack = _mock_slack()

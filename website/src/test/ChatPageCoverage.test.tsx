@@ -53,8 +53,11 @@ interface QueueStackProps {
 }
 let queueProps: QueueStackProps | null = null
 
+/** The pins contract ChatPage hands the side panel, which routes it to the
+ *  Pins tab body. Captured at the SidePanel boundary because that is the seam
+ *  ChatPage owns — the tab body itself is ActivityViewer's to render. */
 interface PinsPanelProps {
-  onJumpToMessage: (messageTs: string, mid?: string) => void
+  onJumpToPin: (messageTs: string, mid?: string) => void
   onUnpin: (id: string) => void
 }
 let pinsProps: PinsPanelProps | null = null
@@ -74,7 +77,13 @@ let chatInputProps: ChatInputProps | null = null
 interface AgentDropdownListProps {
   onSelect: (name: string) => void
 }
+interface DefaultAgentRowProps {
+  agentName: string
+  isDefault: boolean
+  onSetDefault: () => void
+}
 let agentDropdownProps: AgentDropdownListProps | null = null
+let defaultAgentRowProps: DefaultAgentRowProps | null = null
 
 vi.mock('../components/QueueStack', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../components/QueueStack')>()
@@ -83,9 +92,6 @@ vi.mock('../components/QueueStack', async (importOriginal) => {
     default: (props: QueueStackProps) => { queueProps = props; return null },
   }
 })
-vi.mock('../pages/chat/PinnedMessagesPanel', () => ({
-  PinnedMessagesPanel: (props: PinsPanelProps) => { pinsProps = props; return null },
-}))
 
 // --- Child components stubbed to keep the render tree small ------------------
 // (Same set the other ChatPage suites stub; the transcript CARDS are left real
@@ -118,6 +124,7 @@ vi.mock('../components/AgentDropdownList', () => ({
     return <div data-testid="agent-dropdown" />
   },
   ManageAgentsFooter: () => null,
+  DefaultAgentRow: (props: DefaultAgentRowProps) => { defaultAgentRowProps = props; return null },
 }))
 vi.mock('../components/ModelDropdownList', () => ({ default: () => null }))
 vi.mock('../components/InfoTip', () => ({ default: () => null }))
@@ -131,6 +138,10 @@ vi.mock('../components/ChatInput', () => ({
 vi.mock('../components/WelcomeView', () => ({ default: () => null }))
 vi.mock('../pages/ChatSidebar', () => ({ default: () => null, SIDEBAR_MIN: 200, SIDEBAR_MAX: 500 }))
 vi.mock('../pages/chat/ActivityViewer', () => ({ default: () => null }))
+vi.mock('../pages/chat/SidePanel', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../pages/chat/SidePanel')>()
+  return { ...actual, default: (props: PinsPanelProps) => { pinsProps = props; return null } }
+})
 vi.mock('../pages/chat/SessionColorPicker', () => ({ default: () => null }))
 vi.mock('../pages/chat/ChatSettings', () => ({
   loadChatConfig: () => ({ contentWidth: 'compact' }),
@@ -163,7 +174,6 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
       })),
       isAtBottom: false,
       scrollToBottom: vi.fn(),
-      scrollToIndexSmooth: vi.fn(),
       mountIndex: vi.fn(() => false),
       measureRef: () => () => {},
       topSentinelRef: { current: null },
@@ -330,6 +340,7 @@ beforeEach(() => {
   userMsgProps = null
   chatInputProps = null
   agentDropdownProps = null
+  defaultAgentRowProps = null
   sessionStorage.clear()
   setItemSpy.mockClear()
   window.history.replaceState({}, '', '/chat')
@@ -393,6 +404,21 @@ describe('ChatPage agent-switch failure feedback', () => {
     expect(store.getState().chat.agentSwitchNotice).toBeNull()
   })
 })
+describe('ChatPage default-agent footer row', () => {
+  it('points the row at the session\'s own agent and writes that one', async () => {
+    const setDefault = apiSpy('setDefaultAgent')
+    setDefault.mockResolvedValue(undefined)
+    renderChatPage([])
+
+    await waitFor(() => expect(chatInputProps?.onAgentClick).toBeTypeOf('function'))
+    act(() => { chatInputProps!.onAgentClick!({ left: 40, top: 80 } as DOMRect) })
+    await waitFor(() => expect(defaultAgentRowProps).not.toBeNull())
+
+    expect(defaultAgentRowProps!.agentName).toBe('default')
+    act(() => { defaultAgentRowProps!.onSetDefault() })
+    await waitFor(() => expect(setDefault).toHaveBeenCalledWith('default'))
+  })
+})
 
 describe('ChatPage renderMessage — role dispatch', () => {
   it('renders a thinking row as a reasoning block and drops an empty one', async () => {
@@ -402,8 +428,9 @@ describe('ChatPage renderMessage — role dispatch', () => {
     ])
     // The trace is folded behind its own disclosure, so the label is what
     // reaches the transcript — the point being that it is NOT an ordinary
-    // assistant bubble.
-    await waitFor(() => expect(shown()).toContain('Thinking'))
+    // assistant bubble. A block that merely mounts is settled, so it carries
+    // the finished-form label, not the in-progress one.
+    await waitFor(() => expect(shown()).toContain('Thought process'))
     expect(screen.queryByTestId('assistant-msg')).not.toBeInTheDocument()
     // The empty thinking row still occupies a display slot but renders nothing.
     expect(rows()).toHaveLength(2)
@@ -691,11 +718,11 @@ describe('ChatPage queued-message controls', () => {
 })
 
 describe('ChatPage pinned-messages panel', () => {
-  /** Opens the pins panel and returns once its props have been recorded. */
+  /** Opens the side panel (which hosts the Pins tab) and returns once the pins
+   *  contract ChatPage passes it has been recorded. */
   async function openPins(messages: ChatMessage[], opts: RenderOpts = {}) {
     renderChatPage(messages, opts)
-    const toggle = await screen.findByLabelText('Open pinned messages')
-    fireEvent.click(toggle)
+    fireEvent.click(await screen.findByLabelText('Open activity panel'))
     await waitFor(() => expect(pinsProps).not.toBeNull())
   }
 
@@ -709,7 +736,7 @@ describe('ChatPage pinned-messages panel', () => {
       msg('assistant', 'reply', { ts: 'a1' }),
     ])
 
-    act(() => pinsProps!.onJumpToMessage('u1', 'm-1'))
+    act(() => pinsProps!.onJumpToPin('u1', 'm-1'))
     await waitFor(() => expect(highlighted()).not.toBeNull())
 
     // The highlight is time-boxed, not sticky.
@@ -720,14 +747,14 @@ describe('ChatPage pinned-messages panel', () => {
   it('falls back to timestamp matching when the pin carries no message id', async () => {
     await openPins([msg('user', 'legacy pin target', { ts: 'u1' })])
 
-    act(() => pinsProps!.onJumpToMessage('u1'))
+    act(() => pinsProps!.onJumpToPin('u1'))
     await waitFor(() => expect(highlighted()).not.toBeNull())
   })
 
   it('reports an unavailable pin when the message is absent and no history remains', async () => {
     await openPins([msg('user', 'something else', { ts: 'u1' })])
 
-    act(() => pinsProps!.onJumpToMessage('missing-ts', 'm-gone'))
+    act(() => pinsProps!.onJumpToPin('missing-ts', 'm-gone'))
     expect(await screen.findByText(UNAVAILABLE)).toBeInTheDocument()
   })
 
@@ -789,6 +816,48 @@ describe('ChatPage per-message pin toggle', () => {
     await act(async () => { userMsgProps!.onTogglePin!() })
     expect(await screen.findByText('Could not pin the message. Try again.')).toBeInTheDocument()
   })
+  it("a session's FIRST pin opens the panel, so the pin has a visible destination", async () => {
+    // Tab CREATION is no longer asserted here: Pins is a content-managed pinned
+    // view, so SidePanel's reconcile adds it from pin content (SidePanel is
+    // mocked to null in this file, so it cannot run). What ChatPage still owns is
+    // opening the panel once, on the first pin.
+    const { store } = renderChatPage([msg('user', 'pin me', { ts: 'u1', meta: { mid: 'm-1' } })])
+    await waitFor(() => expect(userMsgProps?.onTogglePin).toBeInstanceOf(Function))
+    expect(store.getState().chat.activityOpen).toBe(false)
+
+    await act(async () => { userMsgProps!.onTogglePin!() })
+    await waitFor(() => expect(store.getState().chat.activityOpen).toBe(true))
+  })
+
+  it('a LATER pin does not re-open the panel', async () => {
+    // Only the first pin is a reveal; re-opening a panel the user closed on every
+    // subsequent pin would fight them.
+    pinsListMock.mockResolvedValue({ pins: [PIN] })
+    const { store } = renderChatPage([
+      msg('user', 'already pinned', { ts: 'u1', meta: { mid: 'm-1' } }),
+      msg('user', 'pin me too', { ts: 'u2', meta: { mid: 'm-2' } }),
+    ])
+    await waitFor(() => expect(userMsgProps?.onTogglePin).toBeInstanceOf(Function))
+
+    await act(async () => { userMsgProps!.onTogglePin!() })
+    await waitFor(() => expect(pinsCreateMock).toHaveBeenCalled())
+    expect(store.getState().chat.activityOpen).toBe(false)
+  })
+
+  it('a first pin made from an open search does not open the panel over it', async () => {
+    // Pinning is not a navigation request. Someone who searched the transcript to
+    // FIND the message they are pinning would otherwise lose the find pane and
+    // its results on the very click that acts on a result.
+    const { store } = renderChatPage([msg('user', 'pin me', { ts: 'u1', meta: { mid: 'm-1' } })])
+    await waitFor(() => expect(userMsgProps?.onTogglePin).toBeInstanceOf(Function))
+    // Cmd+F is the real entry point (document-level handler in useMessageSearch).
+    act(() => { fireEvent.keyDown(document, { key: 'f', metaKey: true }) })
+
+    await act(async () => { userMsgProps!.onTogglePin!() })
+    await waitFor(() => expect(pinsCreateMock).toHaveBeenCalled())
+    expect(store.getState().chat.activityOpen).toBe(false)
+  })
+
 })
 
 describe('ChatPage URL prompt hand-off', () => {

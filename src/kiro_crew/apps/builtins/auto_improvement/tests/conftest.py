@@ -49,7 +49,7 @@ from pathlib import Path
 
 import pytest
 
-from ..backend import store
+from ..backend import clone_setup, store
 
 #: Git reads these before falling back to config files or the system account, so they make the
 #: identity explicit and hermetic on every host.
@@ -96,6 +96,13 @@ def _isolated_app_data_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     path it migrates a legacy home, writes a recovery breadcrumb outside ``~/.kiro/``,
     and sweeps archive leftovers. Pointing the variable at a temp directory redirects
     every reader of the home, including the ones no fixture knows about.
+
+    This is STRICTER than the rootdir conftest's own per-test pin, and the difference is what
+    it is here for: the home lands under THIS test's ``tmp_path``, beside the app's own data
+    dir, so the two coincide and a fixture path is coherent across both.
+    ``test_data_home_isolation.py::test_the_config_home_resolver_is_the_tests_temp_dir``
+    fails without it — the rootdir home is under its own isolation root, a tmp dir but not
+    this one.
     """
     data = tmp_path / "app-data-home"
     data.mkdir(parents=True, exist_ok=True)
@@ -105,3 +112,38 @@ def _isolated_app_data_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(store, "data_dir", lambda: data)
     monkeypatch.setenv("AUTO_IMPROVEMENT_SCRATCH", str(tmp_path / "app-scratch"))
     return data
+
+
+@pytest.fixture
+def _public_dns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve every hostname to a fixed public address, and pin ``gh`` to https.
+
+    ``resolve_origin_url`` re-runs ``validate_target_url``, whose ``_host_is_blocked``
+    SSRF check does a LIVE ``socket.getaddrinfo`` resolve and fails CLOSED on any
+    resolver error. On a transient runner DNS hiccup ``github.com`` reads as blocked
+    and a legitimate remote resolves to ``""`` — flaking the legitimate-remote
+    assertions and letting the refusal assertions pass for the WRONG reason (the
+    resolver-error path instead of the allowlist/identity path they exist to pin).
+    Tests that request this fixture are about URL/identity validation, not address
+    screening, so resolution is stubbed — the same shape as the ``public_dns``
+    fixture in ``test/test_meetings_providers.py``. The address decision itself
+    keeps its own live coverage elsewhere; the production fail-closed behaviour is
+    deliberately untouched (it is correct for a real DNS failure — the defect was a
+    unit test exercising the real resolver).
+
+    ``_gh_prefers_ssh`` is pinned on the same seam: ``validate_target_url`` shells
+    out to ``gh config get git_protocol`` / ``git config`` (timeout=15 each) to pick
+    a clone transport, which is a host-configuration dependency a unit test must not
+    read. Pinned to https so the rebuilt clone url has one deterministic shape.
+
+    Deliberately NAMED, never autouse: the patch swaps the shared ``socket``
+    module's ``getaddrinfo`` for the whole process while a test runs
+    (``clone_setup.socket`` IS that module; monkeypatch restores it at teardown).
+    Tests that do other network I/O must not inherit it silently.
+    """
+    monkeypatch.setattr(
+        clone_setup.socket,
+        "getaddrinfo",
+        lambda *_a, **_kw: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+    monkeypatch.setattr(clone_setup, "_gh_prefers_ssh", lambda: False)

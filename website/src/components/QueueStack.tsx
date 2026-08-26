@@ -2,10 +2,12 @@ import { useState, useRef, useEffect, memo } from 'react'
 import { AnimatePresence, motion, useMotionValue, useSpring } from 'framer-motion'
 import { Hourglass, ChevronUp, X, Zap, Pencil, Check, Bot, Loader2, ArrowUp, ArrowDown } from 'lucide-react'
 import type { ChatMessage } from '../types'
+import { useImeGuard } from '../hooks/useImeGuard'
 
 import { i18nT } from '../i18n/t'
 import { parseRecoveryMessage } from '../pages/chat/RecoveryCard'
 import { hasSubagentCompletionPrefix } from '../pages/chat/subagentCompletion'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /** System-injected sub-agent completion deliveries waiting for the busy slot.
  *  These are NOT user messages: they must not be editable/cancellable (either
  *  would silently lose a finished agent's result) and rendering each as a
@@ -64,7 +66,7 @@ export function SubagentDeliveryProgress({ count }: { count: number }) {
   if (count <= 0) return null
   return (
     <div
-      className="mx-auto w-full px-5"
+      className="mx-auto w-full px-4"
       style={{ maxWidth: 'var(--mc-content-width, 900px)' }}
       data-testid="subagent-delivery-progress"
     >
@@ -98,6 +100,7 @@ function EditInput({ initial, onCommit, onCancel }: {
   onCancel: () => void
 }) {
   const ref = useRef<HTMLInputElement>(null)
+  const ime = useImeGuard()
   const [value, setValue] = useState(initial)
   // Guard so blur and an explicit save/Enter don't both fire onCommit.
   const committedRef = useRef(false)
@@ -123,11 +126,13 @@ function EditInput({ initial, onCommit, onCancel }: {
         onClick={e => e.stopPropagation()}
         onKeyDown={e => {
           e.stopPropagation()
-          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commit() }
-          else if (e.key === 'Escape') { e.preventDefault(); cancel() }
+          if (e.key === 'Enter' && !e.shiftKey) {
+            // The commit's own emptiness check stays in commit().
+            if (ime.claimEnter(e)) commit()
+          } else if (e.key === 'Escape') { e.preventDefault(); ime.reset(); cancel() }
         }}
-        onBlur={commit}
-        className="flex-1 min-w-0 bg-[var(--bg)] text-[var(--text)] placeholder:text-[var(--muted)] rounded px-1.5 py-0.5 text-[13px] outline-none border border-[var(--border)] focus:border-[var(--accent)]"
+        {...ime.bindComposition({ onBlur: commit })}
+        className="flex-1 min-w-0 bg-[var(--bg)] text-[var(--text)] placeholder:text-[var(--muted)] rounded px-1.5 py-0.5 text-[13px] outline-none border border-[var(--border)] focus-visible:border-[var(--accent)]"
         aria-label={i18nT('components.queueStack.edit_queued_message')}
       />
       <button className="shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] transition-colors text-[var(--text)]"
@@ -162,6 +167,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
    *  of overlapping it. */
   fuseBelow?: boolean
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [_expanded, setExpanded] = useState(false)
   const expanded = _expanded && messages.length > 1
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -222,7 +228,7 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
   }
 
   return (
-    <div className="px-5 mx-auto w-full relative" style={{ maxWidth: 'var(--mc-content-width, 900px)', zIndex: 0 }}>
+    <div className="px-4 mx-auto w-full relative" style={{ maxWidth: 'var(--mc-content-width, 900px)', zIndex: 0 }}>
       <motion.div
         className="relative cursor-pointer"
         animate={{ height: targetHeight }}

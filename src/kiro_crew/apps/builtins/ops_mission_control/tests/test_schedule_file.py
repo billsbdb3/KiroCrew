@@ -29,8 +29,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from kiro_crew.apps.builtins.ops_mission_control.backend.providers import schedule_file
 from kiro_crew.apps.builtins.ops_mission_control.backend.providers.base import ShiftStatus
+
+_needs_sandbox = pytest.mark.skipif(
+    not __import__('kiro_crew.sandbox', fromlist=['userns_available']).userns_available(),
+    reason="requires unprivileged user namespaces (sandbox backend)",
+)
 
 
 class _Env(unittest.TestCase):
@@ -284,6 +291,7 @@ class TestAdapterContract(_Env):
         self.assertEqual(schedule_file.ScheduleFileRotationSource().secret_fields, ())
 
 
+@_needs_sandbox
 class TestLoginResolution(_Env):
     def test_configured_login_wins_over_shelling_out(self) -> None:
         """An operator who set a login must not pay a `gh` spawn per rotation tick."""
@@ -304,7 +312,7 @@ class TestLoginResolution(_Env):
             with mock.patch.object(
                 schedule_file.policy_store, "get", return_value="configured-user"
             ) as cfg:
-                with mock.patch.object(schedule_file.subprocess, "run", side_effect=_counting_run):
+                with mock.patch.object(schedule_file, "run_limited", side_effect=_counting_run):
                     self.assertEqual(schedule_file._resolve_login_sync(), "configured-user")
             self.assertEqual(gh_calls, [], "a configured login must not shell out")
             self.assertTrue(cfg.called)
@@ -315,17 +323,17 @@ class TestLoginResolution(_Env):
         """The rotation-check cron runs on a schedule; an unbounded re-spawn per tick
         on a machine with no `gh` is pure waste.
 
-        Counts only OUR ``gh`` invocations. A bare ``subprocess.run`` call count is the
-        wrong assertion here: ``sandboxed_spawn_argv`` makes its own probe (``ssh -V``)
-        on the way in, so a broad patch counts the sandbox layer's spawns as if they
-        were ours and reports 2 for a single ``gh`` attempt.
+        Counts only OUR ``gh`` invocations, by patching the module's own
+        ``run_limited`` seam: ``sandboxed_spawn_argv`` makes its own probe
+        (``ssh -V``) on the way in, so a broad ``subprocess.run`` patch counts the
+        sandbox layer's spawns as if they were ours and reports 2 for a single
+        ``gh`` attempt.
         """
         self._login.stop()
         try:
             schedule_file.reset_login_cache()
 
             gh_calls = []
-            real_run = schedule_file.subprocess.run
 
             def _counting_run(argv, *a, **kw):
                 # Match the whole argv, not argv[0]: sandboxed_spawn_argv PREPENDS a
@@ -334,10 +342,10 @@ class TestLoginResolution(_Env):
                 if "api" in argv and "user" in argv:
                     gh_calls.append(argv)
                     raise OSError("no gh")
-                return real_run(argv, *a, **kw)
+                raise AssertionError(f"unexpected spawn through run_limited: {argv!r}")
 
             with mock.patch.object(schedule_file.policy_store, "get", return_value=""):
-                with mock.patch.object(schedule_file.subprocess, "run", side_effect=_counting_run):
+                with mock.patch.object(schedule_file, "run_limited", side_effect=_counting_run):
                     self.assertEqual(schedule_file._resolve_login_sync(), "")
                     self.assertEqual(schedule_file._resolve_login_sync(), "")
             self.assertEqual(len(gh_calls), 1, "the miss is cached too")
@@ -345,10 +353,13 @@ class TestLoginResolution(_Env):
             self._login.start()
 
     def test_login_lookup_is_routed_through_the_spawn_chokepoint(self) -> None:
-        """test/test_spawn_audit.py requires it, and a rotation check is agent-reachable."""
+        """test/test_spawn_audit.py requires it, and a rotation check is agent-reachable.
+
+        Matched as a CALL (trailing paren) so a docstring mention cannot satisfy it.
+        """
         source = Path(schedule_file.__file__).read_text(encoding="utf-8")
-        self.assertIn("sandboxed_spawn_argv", source)
-        self.assertIn("resource_limit_preexec", source)
+        self.assertIn("sandboxed_spawn_argv(", source)
+        self.assertIn("run_limited(", source)
 
 
 if __name__ == "__main__":

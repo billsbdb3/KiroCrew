@@ -136,6 +136,38 @@ async def _wait_for_operation(service: KiroPrerequisiteService) -> None:
 
 
 class TestKiroPrerequisiteHelpers:
+    def test_identity_file_lockdown_precedes_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A staged identity file must never exist with content in it before
+        it is locked down.
+
+        ``_atomic_write_secret_bytes`` routes through
+        ``atomic_write(restrict_to_owner=True)``, which applies the lockdown
+        to the TEMP file before the identity bytes reach it (the previous
+        post-rename lockdown left them readable under the inherited DACL on
+        Windows for the write window, issue #5285). Asserted by measuring the
+        file's SIZE at lockdown time — zero means no payload byte existed yet.
+        """
+        sizes: list[int] = []
+        real_restrict = platform_compat.restrict_to_owner
+
+        def _measuring(target):
+            sizes.append(os.stat(target).st_size)
+            return real_restrict(target)
+
+        monkeypatch.setattr("kiro_crew.platform_compat.restrict_to_owner", _measuring)
+        target = tmp_path / "staged" / "kiro-token.json"
+        prerequisite_module._atomic_write_secret_bytes(target, b"identity-bytes")
+
+        assert target.read_bytes() == b"identity-bytes"
+        if platform_compat.IS_POSIX:
+            assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        assert sizes, "premise: the lockdown ran at all"
+        assert sizes[0] == 0, (
+            f"the file already held {sizes[0]} payload bytes at lockdown time"
+        )
+
     @pytest.mark.parametrize("windows", [True, False], ids=["windows", "posix"])
     def test_identity_env_forwards_proxy_configuration_and_refuses_secrets(
         self,
@@ -216,9 +248,13 @@ class TestKiroPrerequisiteHelpers:
         real_open = os.open
         real_read = os.read
 
-        def windows_open(path: str, flags: int, mode: int = 0o777) -> int:
+        # ``**kwargs`` because this replaces the os module attribute, so it is live for
+        # the whole test INCLUDING teardown, where pytest's own tmp_path cleanup calls
+        # os.open with dir_fd=. A stub narrower than the API it stands in for turns that
+        # cleanup into a TypeError reported as an error at teardown.
+        def windows_open(path: str, flags: int, mode: int = 0o777, **kwargs: object) -> int:
             real_flags = flags if native_binary_flag else flags & ~binary_flag
-            fd = real_open(path, real_flags, mode)
+            fd = real_open(path, real_flags, mode, **kwargs)  # type: ignore[arg-type]
             if flags & binary_flag:
                 binary_fds.add(fd)
             return fd
@@ -476,7 +512,7 @@ class TestKiroPrerequisiteHelpers:
                 environ={},
             )
 
-    def test_windows_candidate_includes_official_msi_directory(self, tmp_path: Path) -> None:
+    def test_windows_candidate_includes_machine_wide_directory(self, tmp_path: Path) -> None:
         program_files = tmp_path / "Program Files"
         executable = program_files / "Kiro-Cli" / "kiro-cli.exe"
         _make_executable(executable)
@@ -488,6 +524,92 @@ class TestKiroPrerequisiteHelpers:
         )
 
         assert str(executable) in candidates
+
+    def test_windows_candidates_include_standard_user_tool_directory(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        home = tmp_path / "Users" / "new-user"
+        managed_bin = home / ".local" / "bin"
+        executable = managed_bin / "kiro-cli.exe"
+        _make_executable(executable)
+
+        candidates = find_kiro_cli_candidates(
+            "win32",
+            home,
+            {
+                "LOCALAPPDATA": str(tmp_path / "AppData" / "Local"),
+                "ProgramFiles": str(tmp_path / "Program Files"),
+                "PATH": "",
+            },
+        )
+
+        assert str(executable) in candidates
+
+    def test_windows_truncated_per_user_candidate_does_not_shadow_machine_wide(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        local_app_data = tmp_path / "AppData" / "Local"
+        truncated = local_app_data / "Kiro-Cli" / "kiro-cli.exe"
+        truncated.parent.mkdir(parents=True)
+        truncated.write_bytes(b"")
+        machine_wide = tmp_path / "Program Files" / "Kiro-Cli" / "kiro-cli.exe"
+        _make_executable(machine_wide)
+
+        candidates = find_kiro_cli_candidates(
+            "win32",
+            tmp_path / "Users" / "new-user",
+            {
+                "LOCALAPPDATA": str(local_app_data),
+                "ProgramFiles": str(tmp_path / "Program Files"),
+                "PATH": "",
+            },
+        )
+
+        assert candidates[0] == str(machine_wide)
+        assert str(truncated) not in candidates
+
+    @pytest.mark.asyncio
+    async def test_windows_refresh_discovers_per_user_install_without_new_path(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        local_app_data = tmp_path / "AppData" / "Local"
+        executable = local_app_data / "Kiro-Cli" / "kiro-cli.exe"
+        calls: list[tuple[str, list[str]]] = []
+
+        async def run(command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            calls.append((command, args))
+            return ProcessResult(ok=True)
+
+        service = KiroPrerequisiteService(
+            platform_name="win32",
+            environ={
+                "LOCALAPPDATA": str(local_app_data),
+                "PATH": "",
+                "ProgramFiles": str(tmp_path / "Program Files"),
+            },
+            home=tmp_path / "Users" / "new-user",
+            data_home=tmp_path / "data-home",
+            process_runner=run,
+            audit_writer=_no_audit,
+        )
+
+        missing = await service.snapshot(force=True)
+        assert missing["installed"] is False
+
+        # The native installer updates the user's PATH, but a running desktop
+        # gateway keeps its old environment. A forced refresh must find the
+        # install at its fixed per-user location without a process restart.
+        _make_executable(executable)
+        refreshed = await service.snapshot(force=True)
+
+        assert refreshed["ready"] is True
+        assert calls == [
+            (str(executable), ["--version"]),
+            (str(executable), ["whoami"]),
+        ]
 
     def test_windows_candidates_include_inherited_path(
         self,
@@ -2636,6 +2758,123 @@ class TestKiroPrerequisiteWorkflow:
         assert (await process_task).ok is True
 
     @pytest.mark.asyncio
+    async def test_cancelled_sandbox_preparation_unlinks_the_launcher(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """First-cancellation semantics: the recovery waits for the worker to
+        settle, removes the launcher it materialized, and re-raises."""
+        preparation_started = threading.Event()
+        release_preparation = threading.Event()
+        cleanup_path = tmp_path / "sandbox-launcher"
+        cleanup_path.write_text("launcher", encoding="utf-8")
+
+        def sandbox(
+            argv: list[str],
+            **_kwargs: Any,
+        ) -> tuple[list[str], dict[str, str], str]:
+            preparation_started.set()
+            assert release_preparation.wait(timeout=5)
+            return argv, {}, str(cleanup_path)
+
+        monkeypatch.setattr(prerequisite_module, "sandboxed_spawn_argv", sandbox)
+
+        outer = asyncio.create_task(
+            prerequisite_module._prepare_sandboxed_spawn(
+                ["/fixed/tool"],
+                mode=prerequisite_module._UNVERIFIED_SANDBOX_MODE,
+                env={},
+                extra_hidden_dirs=(),
+                extra_visible_dirs=(),
+            )
+        )
+        assert await asyncio.to_thread(preparation_started.wait, 5)
+        outer.cancel()
+        await asyncio.sleep(0)
+        release_preparation.set()
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+        assert not cleanup_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_repeat_cancellation_in_sandbox_recovery_still_unlinks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A REPEAT cancellation landing on the recovery await is a
+        ``BaseException``, so it escaped the old ``suppress(Exception)``
+        before ``_unlink_off_loop`` ran, leaking the materialized launcher
+        (#5841). The recovery must absorb repeat cancellations in BOTH of
+        its phases — while the worker settles and while the unlink runs —
+        still remove the launcher, and let the ORIGINAL cancellation (pinned
+        by its message) propagate rather than a repeat."""
+        preparation_started = threading.Event()
+        release_preparation = threading.Event()
+        unlink_started = threading.Event()
+        release_unlink = threading.Event()
+        cleanup_path = tmp_path / "sandbox-launcher"
+        cleanup_path.write_text("launcher", encoding="utf-8")
+        real_unlink = os.unlink
+
+        def sandbox(
+            argv: list[str],
+            **_kwargs: Any,
+        ) -> tuple[list[str], dict[str, str], str]:
+            preparation_started.set()
+            assert release_preparation.wait(timeout=5)
+            return argv, {}, str(cleanup_path)
+
+        def slow_unlink(path: str) -> None:
+            if path == str(cleanup_path):
+                unlink_started.set()
+                assert release_unlink.wait(timeout=5)
+            real_unlink(path)
+
+        monkeypatch.setattr(prerequisite_module, "sandboxed_spawn_argv", sandbox)
+        monkeypatch.setattr(prerequisite_module.os, "unlink", slow_unlink)
+
+        outer = asyncio.create_task(
+            prerequisite_module._prepare_sandboxed_spawn(
+                ["/fixed/tool"],
+                mode=prerequisite_module._UNVERIFIED_SANDBOX_MODE,
+                env={},
+                extra_hidden_dirs=(),
+                extra_visible_dirs=(),
+            )
+        )
+        assert await asyncio.to_thread(preparation_started.wait, 5)
+        # First cancellation: delivered at the shielded hop; the coroutine
+        # enters its recovery block. Its message pins exception identity: if
+        # a repeat cancellation were the one to propagate (or to merge into
+        # the first delivery), the message assertion below goes red.
+        outer.cancel("original-cancellation-5841")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # REPEAT cancellation while the worker is still settling — the
+        # launcher must still exist for the repeat to be able to leak it.
+        assert cleanup_path.exists()
+        outer.cancel()
+        await asyncio.sleep(0)
+        release_preparation.set()
+        # REPEAT cancellation while the unlink itself is in flight.
+        assert await asyncio.to_thread(unlink_started.wait, 5)
+        assert cleanup_path.exists()
+        outer.cancel()
+        await asyncio.sleep(0)
+        release_unlink.set()
+        with pytest.raises(asyncio.CancelledError) as exc_info:
+            await outer
+        if sys.version_info >= (3, 11):
+            # 3.10's Task rebuilds the awaiter-visible CancelledError from the
+            # task's LAST cancel message (message-less repeats blank it), so
+            # the original's args are only observable from 3.11, where the
+            # coroutine's actual exception object propagates.
+            assert exc_info.value.args == ("original-cancellation-5841",)
+        assert not cleanup_path.exists()
+
+    @pytest.mark.asyncio
     async def test_process_timeout_escalates_while_supervisor_anchors_group(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -3738,6 +3977,11 @@ class TestKiroPrerequisiteHandlers:
             # reach the owner and leave this caller's client reading undefined.
             assert body["login_command"] == KIRO_CLI_LOGIN_COMMAND
             assert body["sso_login_command"] == KIRO_CLI_SSO_LOGIN_COMMAND
+            # Redacted-but-present for the same reason as the sandbox keys: whether
+            # the probe timed out describes how slow the HOST is. Asserted here
+            # because the hazard the comment above names is not hypothetical -- this
+            # branch is hand-built, so the key has to be added by hand with it.
+            assert body["probe_timed_out"] is False
             # The pre-upgrade-tab shim is served to every caller, so the payload
             # shape does not vary by who asks.
             assert body["operation"]["status"] == "idle"
@@ -3999,6 +4243,209 @@ class TestSandboxUnavailableIsNotAMissingBinary:
         assert status["sandbox_unavailable"] is False
         assert status["sandbox_failure_kind"] == ""
         assert status["sandbox_detail"] == ""
+        assert status["probe_timed_out"] is False
+
+
+class TestTimedOutProbeIsNotAMissingBinary:
+    """A probe that never ANSWERED must not be reported as "not installed".
+
+    The third condition, and the one issue #4577 was filed on. The sandbox branch
+    keys on a typed ``sandbox_failure``; a timeout raises none, so the timed-out
+    probe fell through to a bare ``PrerequisiteStatus`` whose every field is a
+    default: ``installed=False``, ``sandbox_unavailable=False`` and all
+    ``sandbox_*`` empty. That combination is worse than unhelpful — it rules the
+    true cause OUT, and points the operator at reinstalling or re-signing-in a CLI
+    that is installed, signed in, and serving chat turns the entire time.
+
+    Driven through ``ProcessResult.timed_out`` (the flag ``_run_process`` already
+    sets on the timeout path, and which the SEL audit already records as
+    ``error=timeout``) so no test here depends on real wall-clock timing.
+    """
+
+    @staticmethod
+    def _service(tmp_path: Path, run: Any) -> KiroPrerequisiteService:
+        return KiroPrerequisiteService(
+            platform_name="linux",
+            environ={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+            home=tmp_path,
+            process_runner=run,
+            audit_writer=_no_audit,
+        )
+
+    @staticmethod
+    async def _timed_out(
+        _command: str,
+        _args: list[str],
+        **_kwargs: Any,
+    ) -> ProcessResult:
+        """The runner shape ``_run_process`` produces when the probe never answers."""
+        return ProcessResult(ok=False, error="timeout", timed_out=True)
+
+    @pytest.mark.asyncio
+    async def test_timed_out_probe_does_not_claim_the_cli_is_missing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The load-bearing assertion: present on disk, so NOT ``installed=False``."""
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+
+        status = await self._service(tmp_path, self._timed_out).snapshot(force=True)
+
+        assert status["installed"] is True
+        assert status["probe_timed_out"] is True
+        assert status["ready"] is False
+
+    @pytest.mark.asyncio
+    async def test_timeout_is_not_attributed_to_the_sandbox(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Over-claim guard, and the reason this is a new field not a reused one.
+
+        A caller that keys a userns remedy off ``sandbox_unavailable`` must not be
+        handed a slow filesystem to fix with an AppArmor profile. Nothing about the
+        sandbox failed here: the spawn was accepted and raised no typed failure.
+        """
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+
+        status = await self._service(tmp_path, self._timed_out).snapshot(force=True)
+
+        assert status["sandbox_unavailable"] is False
+        assert status["sandbox_failure_kind"] == ""
+        assert status["sandbox_detail"] == ""
+        assert status["sandbox_remedy"] == ""
+
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_offer_an_action_that_cannot_help(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Neither a reinstall nor a sign-in can speed up a slow probe.
+
+        ``authenticated`` is false as UNKNOWN, not as a verdict: ``whoami`` runs
+        through the same probe path and on this host is never reached at all, which
+        is why the report showed a signed-in account as signed out.
+        """
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+
+        status = await self._service(tmp_path, self._timed_out).snapshot(force=True)
+
+        assert status["repair_required"] is False
+        assert status["authenticated"] is False
+
+    @pytest.mark.asyncio
+    async def test_timeout_without_a_runnable_candidate_is_still_not_installed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No binary on disk means the timeout says nothing about installation.
+
+        Symmetric with the sandbox branch's ``candidate_runnable`` requirement: the
+        claim ``installed=True`` rests on having STAT'd a runnable candidate, never
+        on the failure mode alone. Without that evidence the honest answer is the
+        unchanged default.
+
+        ``HOME`` is patched on the REAL process env, not just in the injected
+        ``environ``: candidate discovery runs the injected PATH through
+        ``env.augmented_path``, which resolves its extra directories from
+        ``os.path.expanduser("~")`` and so reaches the developer's own
+        ``~/.local/bin`` regardless of what this service was constructed with. Not
+        patching it makes the no-candidate premise silently false on any machine
+        that actually has kiro-cli installed — which is every machine a contributor
+        runs this on — and the test then asserts the opposite branch's behaviour.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        status = await self._service(tmp_path, self._timed_out).snapshot(force=True)
+
+        assert status["installed"] is False
+        assert status["probe_timed_out"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_persistent_timeout_warns_once_not_once_per_probe(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A line about a slow host must not evict the evidence about it.
+
+        This branch runs on EVERY probe, and on an affected host that is one probe per
+        ~40s (the readiness gate's 30s staleness window plus this probe's own 10s
+        timeout), i.e. ~90 lines/hour into the dashboard's 1000-entry log ring. The
+        latched status carries the transition, so no timestamp is needed to tell a new
+        outage from an ongoing one.
+        """
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+        service = self._service(tmp_path, self._timed_out)
+
+        with caplog.at_level("DEBUG", logger="kiro_crew.kiro_prerequisite"):
+            for _ in range(6):
+                status = await service.snapshot(force=True)
+
+        assert status["probe_timed_out"] is True
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        debugs = [
+            r
+            for r in caplog.records
+            if r.levelname == "DEBUG" and "already reported" in r.getMessage()
+        ]
+        assert len(warnings) == 1
+        # Accounted for, not dropped: a reader who turns up DEBUG sees the rest.
+        assert len(debugs) == 5
+
+    @pytest.mark.asyncio
+    async def test_a_recovered_probe_re_arms_the_timeout_warning(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One WARNING per OUTAGE, and the latched status re-arms it for free.
+
+        No clear-on-observe step and no floor: every probe rewrites the status, so a
+        recovery resets the transition record whether or not anything watched it
+        happen.
+        """
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+        healthy_calls = {"n": 0}
+
+        async def flapping(_command: str, args: list[str], **_kwargs: Any) -> ProcessResult:
+            if healthy_calls["n"]:
+                healthy_calls["n"] -= 1
+                return ProcessResult(ok=args == ["--version"])
+            return ProcessResult(ok=False, error="timeout", timed_out=True)
+
+        service = self._service(tmp_path, flapping)
+
+        with caplog.at_level("DEBUG", logger="kiro_crew.kiro_prerequisite"):
+            await service.snapshot(force=True)  # outage 1 -> WARNING
+            await service.snapshot(force=True)  # same outage -> DEBUG
+            healthy_calls["n"] = 2
+            await service.snapshot(force=True)  # recovered
+            await service.snapshot(force=True)  # outage 2 -> WARNING again
+
+        timeouts = [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING" and "the probe timed out" in r.getMessage()
+        ]
+        assert len(timeouts) == 2
+
+    @pytest.mark.asyncio
+    async def test_plain_failure_is_not_reported_as_a_timeout(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """The ordinary broken-CLI path must keep its own reporting."""
+        _make_executable(tmp_path / ".local" / "bin" / "kiro-cli")
+
+        async def run(_command: str, _args: list[str], **_kwargs: Any) -> ProcessResult:
+            return ProcessResult(ok=False, error="exited with code 1")
+
+        status = await self._service(tmp_path, run).snapshot(force=True)
+
+        assert status["probe_timed_out"] is False
+        assert status["installed"] is False
 
 
 class TestKiroCrewNeverSetsUpKiroCli:

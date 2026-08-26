@@ -35,6 +35,7 @@ OSS-CLEAN: depends only on ``opentelemetry`` + the stdlib.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -43,9 +44,13 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, NamedTuple
 
-from opentelemetry.sdk.metrics import Counter, Histogram, UpDownCounter
+from opentelemetry.sdk.metrics import (
+    Counter,
+    Histogram,
+    UpDownCounter,
+)
 from opentelemetry.sdk.metrics.export import (
     AggregationTemporality,
     MetricExporter,
@@ -54,6 +59,7 @@ from opentelemetry.sdk.metrics.export import (
 )
 
 from kiro_crew import platform_compat
+from kiro_crew.metrics.schema import RESOURCE_ATTR_PROCESS_START_TIME
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +75,62 @@ _BYTES_PER_MB = 1024 * 1024
 # positive time_ns field. Retention must never treat a merely prefix-matching
 # user file as exporter-owned when telemetry.local_dir points at a shared dir.
 _SHARD_NAME_RE = re.compile(
-    r"metrics-(?P<day>\d{4}-\d{2}-\d{2})-(?P<pid>[1-9]\d*)"
-    r"(?:-(?P<rotation>[1-9]\d*))?\.jsonl"
+    r"metrics-(?P<day>\d{4}-\d{2}-\d{2})-(?P<pid>[1-9]\d*)" r"(?:-(?P<rotation>[1-9]\d*))?\.jsonl"
 )
+
+
+def _stamp_process_identity(line: str) -> str:
+    """Stamp the writing process's start-time identity at resource level.
+
+    One field per exported record: ``RESOURCE_ATTR_PROCESS_START_TIME`` is set
+    on each ``resource_metrics`` entry's resource attributes (in practice one
+    per line — one provider per exporter). The dashboard aggregator keys
+    cumulative-counter streams by (shard PID, this token, attrs), which makes a
+    PID-reuse process boundary deterministic instead of inferable only from a
+    value drop. Resource level deliberately — a per-metric attribute would
+    multiply every instrument's series cardinality (see ``schema.py``).
+
+    Stamped AFTER serialization, into the JSONL line only, never onto the SDK
+    ``Resource``: the provider's one ``Resource`` also feeds the opt-in OTLP
+    reader, so a resource attribute would egress this host-local token to
+    ``telemetry.otlp_endpoint``. The per-cycle re-serialize is the price of
+    keeping the token on-host.
+
+    Fail soft, twice over: when the platform read is unavailable the line is
+    returned untouched, so legacy consumers see exactly the shape they already
+    parse and the aggregator applies its value heuristic; and a line whose
+    payload cannot be parsed and mutated as the exporter's own JSON shape is
+    returned untouched rather than raised on — stamping is auxiliary, and it
+    must never cost the metric payload that was just serialized.
+    """
+    identity = platform_compat.own_process_start_time()
+    if identity is None:
+        return line
+    stamped = False
+    try:
+        payload = json.loads(line)
+        for rm in payload.get("resource_metrics") or []:
+            resource = rm.get("resource")
+            if isinstance(resource, dict):
+                resource.setdefault("attributes", {})[RESOURCE_ATTR_PROCESS_START_TIME] = identity
+                stamped = True
+    except (ValueError, AttributeError, TypeError):
+        return line
+    return json.dumps(payload) if stamped else line
+
+
+class _Shard(NamedTuple):
+    """One exporter-owned shard as retention sees it.
+
+    ``protected`` is resolved once, while stat'ing, and reused by both caps:
+    ``_is_protected_writer`` reads the wall clock, so re-deriving it per cap could
+    answer differently on either side of the recency cutoff within one plan.
+    """
+
+    mtime_ns: int
+    size: int
+    path: Path
+    protected: bool
 
 
 class JsonlMetricExporter(MetricExporter):
@@ -95,6 +154,17 @@ class JsonlMetricExporter(MetricExporter):
         # bucket counts across cycles and PIDs, and stays correct across process
         # restarts and day boundaries (cumulative snapshots would double-count
         # and misattribute a PID's counts to the wrong day).
+        #
+        # OBSERVABLE counters are deliberately ABSENT from this map and keep the
+        # SDK default (CUMULATIVE). DELTA was tried and reverted: the delta
+        # baseline lives in the provider, and the recorder is rebuilt in-process
+        # whenever telemetry consent changes (see provider._maybe_rebuild), so
+        # the first post-rebuild collection would re-emit the entire
+        # process-lifetime total as one giant delta and inflate daily sums. A
+        # cumulative snapshot is idempotent under the aggregator's
+        # keep-newest-per-PID rule (handlers/telemetry.py classifies temporality
+        # from the record itself), so provider rebuilds are harmless. Gauges
+        # carry no temporality and never belong here.
         super().__init__(
             preferred_temporality={
                 Counter: AggregationTemporality.DELTA,
@@ -152,9 +222,7 @@ class JsonlMetricExporter(MetricExporter):
             return
         if current_size <= 0 or current_size + incoming_bytes <= self._max_total_bytes:
             return
-        rotated = target.with_name(
-            f"{target.stem}-{time.time_ns()}{target.suffix}"
-        )
+        rotated = target.with_name(f"{target.stem}-{time.time_ns()}{target.suffix}")
         try:
             target.replace(rotated)
             self._chmod(rotated, 0o600)
@@ -176,9 +244,7 @@ class JsonlMetricExporter(MetricExporter):
                 lock_fd.write(b"\0")
                 lock_fd.flush()
             self._chmod(lock_path, 0o600)
-            acquired = platform_compat.try_acquire_lock(
-                lock_fd.fileno(), exclusive=True
-            )
+            acquired = platform_compat.try_acquire_lock(lock_fd.fileno(), exclusive=True)
             if not acquired:
                 yield False
                 return
@@ -203,10 +269,10 @@ class JsonlMetricExporter(MetricExporter):
     ) -> MetricExportResult:
         """Serialize *metrics_data* to a single JSON line and append it."""
         try:
-            line = metrics_data.to_json(indent=None)
+            line = _stamp_process_identity(metrics_data.to_json(indent=None))
             encoded = (line + "\n").encode("utf-8")
             self._dir.mkdir(parents=True, exist_ok=True)
-            # ~/.kirocrew convention: telemetry stays private (dir 0o700, file
+            # ~/.kiro/crew convention: telemetry stays private (dir 0o700, file
             # 0o600). mkdir/open modes are masked by umask, so chmod explicitly.
             self._chmod(self._dir, 0o700)
             # Per-PID shards have one writer, so append + rotation need no
@@ -235,9 +301,7 @@ class JsonlMetricExporter(MetricExporter):
         try:
             with self._directory_lock() as acquired:
                 if not acquired:
-                    logger.debug(
-                        "metrics directory lock busy; skipping prune cycle"
-                    )
+                    logger.debug("metrics directory lock busy; skipping prune cycle")
                     return
                 self._last_prune = now
                 self._prune()
@@ -256,9 +320,8 @@ class JsonlMetricExporter(MetricExporter):
         if mtime_ns >= recent_cutoff:
             return True
         current_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        return (
-            match.group("day") == current_day
-            and platform_compat.pid_exists(int(match.group("pid")))
+        return match.group("day") == current_day and platform_compat.pid_exists(
+            int(match.group("pid"))
         )
 
     def _prune(self) -> None:
@@ -291,7 +354,7 @@ class JsonlMetricExporter(MetricExporter):
         """Return exact exporter-owned shards eligible for deletion."""
         if not self._dir.exists():
             return []
-        shards: list[tuple[int, int, Path, bool]] = []
+        shards: list[_Shard] = []
         for path in self._dir.glob("metrics-*.jsonl"):
             if not self._is_exporter_shard(path):
                 continue
@@ -301,37 +364,41 @@ class JsonlMetricExporter(MetricExporter):
                 continue
             if not stat.S_ISREG(shard_stat.st_mode):
                 continue
-            protected = self._is_protected_writer(path, shard_stat.st_mtime_ns)
             shards.append(
-                (shard_stat.st_mtime_ns, shard_stat.st_size, path, protected)
+                _Shard(
+                    mtime_ns=shard_stat.st_mtime_ns,
+                    size=shard_stat.st_size,
+                    path=path,
+                    protected=self._is_protected_writer(path, shard_stat.st_mtime_ns),
+                )
             )
 
         deletions: list[Path] = []
         # Age cap: plan deletion for anything older than the retention window.
         if self._retention_days > 0:
             cutoff = time.time_ns() - self._retention_days * 86400 * 1_000_000_000
-            survivors: list[tuple[int, int, Path, bool]] = []
-            for mtime, size, path, protected in shards:
-                if mtime < cutoff and not protected:
-                    deletions.append(path)
+            survivors: list[_Shard] = []
+            for shard in shards:
+                if shard.mtime_ns < cutoff and not shard.protected:
+                    deletions.append(shard.path)
                 else:
-                    survivors.append((mtime, size, path, protected))
+                    survivors.append(shard)
             shards = survivors
 
         # Size cap: plan closed-shard deletion oldest-first until the surviving
         # footprint is within budget. Protected active writers may temporarily
         # keep the directory over budget.
         if self._max_total_bytes > 0:
-            total = sum(size for _mtime, size, _path, _protected in shards)
+            total = sum(shard.size for shard in shards)
             if total > self._max_total_bytes:
-                shards.sort(key=lambda item: item[0])
-                for _mtime, size, path, protected in shards:
+                shards.sort(key=lambda shard: shard.mtime_ns)
+                for shard in shards:
                     if total <= self._max_total_bytes:
                         break
-                    if protected:
+                    if shard.protected:
                         continue
-                    deletions.append(path)
-                    total -= size
+                    deletions.append(shard.path)
+                    total -= shard.size
         return deletions
 
     @staticmethod

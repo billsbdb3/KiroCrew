@@ -22,33 +22,43 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion, useReducedMotion } from 'framer-motion'
 import {
-  Copy, Check, RefreshCw, CircleDot, CircleCheck, CircleSlash, MessageSquare,
+  Copy, Check, AlertCircle, RefreshCw, CircleDot, CircleCheck, CircleSlash, MessageSquare,
   Tag, UserPlus, UserMinus, Pencil, Milestone as MilestoneIcon, GitPullRequest,
   GitCommitHorizontal, Link2, Users, CalendarDays, Lock, Sparkles,
-  Plus, ChevronDown, Loader2,
+  Plus, Loader2,
   ThumbsUp, ThumbsDown, Laugh, PartyPopper, Frown, Heart, Rocket, Eye,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import RefMarkdown from './RefMarkdown'
 import { parseRepoRef } from '../lib/refLinks'
+import DepsSection from './DepsSection'
 import { safeHttpUrl } from '../../../lib/safeUrl'
+import { copyToClipboard } from '../../../utils/clipboard'
 import { CommentCardSkeleton, HeaderSkeleton, TimelineSkeleton } from './DetailSkeleton'
 import AiSummaryCard from './AiSummaryCard'
-import Clickable from '../../../components/Clickable'
 import LabelChip from './LabelChip'
 import LabelPicker from './LabelPicker'
+import AssigneePicker from './AssigneePicker'
 import MemberBadge from './MemberBadge'
+import DetailHeader from './DetailHeader'
+import DetailOverflowMenu from './DetailOverflowMenu'
+import {
+  DropdownMenuItem, DropdownMenuSeparator,
+} from '../../../components/ui/dropdown-menu'
+import ListDetailBack from '../../../components/ListDetailBack'
 import InvestigateButton from './InvestigateButton'
 import { useIssueRadar } from '../context'
+import { useTitleScrolledOut } from '../lib/useTitleScrolledOut'
 import { relativeTimeOrDate, hexToRgba, asArray, detailPollMs } from '../lib/format'
 import {
   issueRadarApi,
+  AssigneesConflictError,
   type Issue, type Reactions, type TimelineEvent, type DetailLabel,
   type SuggestedLabel, type IssueDetailResponse, type IssuesResponse,
   type RepoRef,
 } from '../api'
 import { commitUrlFor, userUrlFor, repoScopeKey } from '../lib/links'
-import { providerTerms } from '../lib/links'
+import { providerTerms, readOnlyHint } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
 import { fmtDateTime, fmtDateTimeNumeric } from '../../../i18n/format'
@@ -121,67 +131,20 @@ function StatePill({ state, reason }: { state?: string; reason?: string | null }
   )
 }
 
-/** Header close/reopen control. Only rendered when the user can write. When the
- * issue is open, "Close" opens a tiny menu to pick the close reason (completed
- * vs not planned, matching GitHub); when closed, a single "Reopen" button. */
-function StateActions({
-  state, pending, onClose, onReopen,
-}: {
-  state: string
-  pending: boolean
-  onClose: (reason: 'completed' | 'not_planned') => void
-  onReopen: () => void
-}) {
-  const [menu, setMenu] = useState(false)
-  const btn =
-    'inline-flex items-center gap-1 text-[12px] px-2 py-1 rounded-md border border-border ' +
-    'text-muted hover:text-text hover:border-accent/50 disabled:opacity-40 disabled:cursor-default ' +
-    'cursor-pointer bg-transparent whitespace-nowrap'
-
-  if (state === 'closed') {
-    return (
-      <button onClick={onReopen} disabled={pending} title={i18nT('apps.issueRadar.components.issueDetail.reopen_this_issue')} className={btn}>
-        {pending ? <Loader2 size={13} className="animate-spin" /> : <CircleDot size={13} className="text-ok" />} {i18nT('apps.issueRadar.components.issueDetail.reopen')}
-      </button>
-    )
-  }
-  return (
-    <div className="relative">
-      <button onClick={() => setMenu((v) => !v)} disabled={pending} title={i18nT('apps.issueRadar.components.issueDetail.close_this_issue')} className={btn}>
-        {pending ? <Loader2 size={13} className="animate-spin" /> : <CircleCheck size={13} />} {i18nT('apps.issueRadar.components.issueDetail.close')} <ChevronDown size={12} />
-      </button>
-      {menu && (
-        <>
-          <Clickable className="fixed inset-0 z-10" aria-label={i18nT('apps.issueRadar.components.issueDetail.dismiss_menu')} onClick={() => setMenu(false)} />
-          <div className="absolute right-0 mt-1 z-20 w-48 rounded-md border border-border bg-card shadow-lg py-1 text-[12.5px]">
-            <button
-              onClick={() => { setMenu(false); onClose('completed') }}
-              className="w-full text-left px-3 py-1.5 hover:bg-bg-elevated flex items-center gap-2 cursor-pointer bg-transparent text-text"
-            >
-              <CircleCheck size={13} className="text-aim" /> {i18nT('apps.issueRadar.components.issueDetail.close_as_completed')}
-            </button>
-            <button
-              onClick={() => { setMenu(false); onClose('not_planned') }}
-              className="w-full text-left px-3 py-1.5 hover:bg-bg-elevated flex items-center gap-2 cursor-pointer bg-transparent text-text"
-            >
-              <CircleSlash size={13} className="text-muted" /> {i18nT('apps.issueRadar.components.issueDetail.close_as_not_planned')}
-            </button>
-          </div>
-        </>
-      )}
-    </div>
-  )
-}
-
 /** AI-suggested labels (those not already applied), rendered in the Labels
  * sidebar as dashed sparkle chips. Each has a one-click accept (＋) when the
  * user can write; on a read-only repo they show as suggestions only. */
 function AiSuggestions({
-  suggestions, loading, canWrite, pending, onAccept, colorByName,
+  suggestions, loading, canWrite, repoRef, pending, onAccept, colorByName,
 }: {
   suggestions: SuggestedLabel[]
   loading: boolean
   canWrite: boolean
+  /** The active repo, for why a write is refused: on a provider that supports no
+   * writes at all, "get triage/push access" is a remedy that changes nothing.
+   * Both the per-suggestion tooltip and the always-visible caption below need it,
+   * which is why this is the ref rather than one pre-resolved string. */
+  repoRef: RepoRef
   pending: boolean
   onAccept: (name: string) => void
   colorByName: Map<string, string>
@@ -208,7 +171,10 @@ function AiSuggestions({
             ? (s.reason
               ? i18nT('apps.issueRadar.components.issueDetail.add_with_reason', { name: s.name, reason: s.reason })
               : i18nT('apps.issueRadar.components.issueDetail.add', { name: s.name }))
-            : (s.reason || i18nT('apps.issueRadar.components.issueDetail.read_only_connect_with_triage_push_access_to_app_2'))
+            : (s.reason || readOnlyHint(
+              repoRef,
+              i18nT('apps.issueRadar.components.issueDetail.read_only_connect_with_triage_push_access_to_app_2'),
+            ))
           return (
             <motion.button
               key={s.name}
@@ -245,8 +211,15 @@ function AiSuggestions({
           )
         })}
       </div>
+      {/* The caption, unlike the per-suggestion tooltip above, needs no hover -- so
+          on a provider that refuses every write this is the sentence a user
+          actually reads, and telling them to go get access they already hold is the
+          failure this routes around. */}
       {!canWrite && (
-        <div className="text-[10.5px] text-muted mt-1.5">{i18nT('apps.issueRadar.components.issueDetail.read_only_connect_with_triage_push_access_to_app')}</div>
+        <div className="text-[10.5px] text-muted mt-1.5">{readOnlyHint(
+          repoRef,
+          i18nT('apps.issueRadar.components.issueDetail.read_only_connect_with_triage_push_access_to_app'),
+        )}</div>
       )}
     </div>
   )
@@ -497,7 +470,7 @@ function Section({
 export default function IssueDetail({ issue }: { issue: Issue }) {
   const {
     active, colorByName, memberRoleByLogin, repoLabels, countByLabel, canWrite, stateFilter,
-    refreshPrefs,
+    me, refreshPrefs, listDetail, refStack,
   } = useIssueRadar()
   const { owner, repo } = active
   const scopeKey = repoScopeKey(active)
@@ -510,22 +483,58 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
   // switches to a different issue (the component instance is reused).
   const [editingLabels, setEditingLabels] = useState(false)
   useEffect(() => { setEditingLabels(false) }, [issue.number])
+  // Assignee edit mode — same reset-on-switch discipline as the label editor.
+  const [editingAssignees, setEditingAssignees] = useState(false)
+  useEffect(() => { setEditingAssignees(false) }, [issue.number])
 
   // Copy-link affordance (the #number links out to GitHub; this copies the URL
-  // to the clipboard). Brief check-mark feedback, then reverts. Reads the URL off
-  // the live detail when it has arrived: a pane opened from a cross-reference
-  // starts from a PLACEHOLDER row whose url is synthesized, and GitHub's own url
-  // is the one worth putting on the clipboard.
-  const [copied, setCopied] = useState(false)
+  // to the clipboard). The row swaps to a tick or a warning for a moment as the
+  // result confirmation. Reads the URL off the live detail when it has arrived: a
+  // pane opened from a cross-reference starts from a PLACEHOLDER row whose url is
+  // synthesized, and GitHub's own url is the one worth putting on the clipboard.
+  //
+  // Goes through `copyToClipboard` rather than `navigator.clipboard` directly.
+  // The async Clipboard API exists only in a SECURE CONTEXT, so on a plain-http
+  // origin `navigator.clipboard` is undefined and the bare call throws before
+  // anything reaches the clipboard; the helper falls back to a textarea +
+  // `execCommand`, which works there.
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Bumped by anything that makes an IN-FLIGHT copy's result no longer this
+  // row's answer: a second press, the pane moving to another issue, unmount. The
+  // clipboard write is awaited, so without this a copy that settles late would
+  // report a tick for the URL the pane has already left behind.
+  const copyAttemptRef = useRef(0)
+  useEffect(() => () => {
+    copyAttemptRef.current += 1
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+  }, [])
+  useEffect(() => {
+    copyAttemptRef.current += 1
+    setCopyStatus('idle')
+  }, [issue.number])
   const copyLink = async () => {
+    const attempt = ++copyAttemptRef.current
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+    let next: 'copied' | 'failed'
     try {
-      await navigator.clipboard.writeText(detail?.url ?? issue.url)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
+      await copyToClipboard(detail?.url ?? issue.url)
+      next = 'copied'
     } catch {
-      /* clipboard unavailable (blocked / insecure context) — no-op */
+      // Reported, never swallowed: a row that does nothing on press is
+      // indistinguishable from a copy that worked, so the URL is silently
+      // missing from the clipboard at the moment it is about to be pasted.
+      next = 'failed'
     }
+    if (attempt !== copyAttemptRef.current) return
+    setCopyStatus(next)
+    copyTimerRef.current = setTimeout(() => setCopyStatus('idle'), 1500)
   }
+  const copyLabel = copyStatus === 'copied'
+    ? i18nT('apps.issueRadar.components.issueDetail.link_copied')
+    : copyStatus === 'failed'
+      ? i18nT('apps.issueRadar.components.issueDetail.copy_failed')
+      : i18nT('apps.issueRadar.components.issueDetail.copy_link_to_this_issue')
 
   // refreshRef lets the header refresh button force a server re-fetch
   // (?refresh=1) through react-query's normal refetch(), without a second
@@ -559,7 +568,18 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
     ),
     refetchIntervalInBackground: refreshPrefs.pollInBackground,
   })
-  const refreshDetail = () => { refreshRef.current = true; detailQuery.refetch() }
+  // Tracks a USER-REQUESTED refresh so the overflow trigger can acknowledge it.
+  // Deliberately NOT `detailQuery.isFetching`: `refetchInterval` polls this query
+  // in the background, so that flag would spin the trigger with no user action —
+  // a spinner that misreports what is happening is worse than none. `refreshRef`
+  // cannot serve either: it is a ref consumed inside the queryFn, so it never
+  // re-renders anything.
+  const [refreshing, setRefreshing] = useState(false)
+  const refreshDetail = () => {
+    refreshRef.current = true
+    setRefreshing(true)
+    detailQuery.refetch().finally(() => setRefreshing(false))
+  }
 
   // AI triage (summary + suggested labels): fires on open, cache-first
   // server-side (one model call per issue, served instantly on re-open). The
@@ -711,6 +731,74 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
     },
   })
 
+  // ── assignees: replace the whole set ──
+  // Like the label write, this patches the detail cache and the open/closed list
+  // caches so the sidebar and the row stay in step without a full re-fetch. The
+  // server is authoritative about what stuck (it drops non-assignable logins and
+  // caps the count), so the response set — not the requested set — is written.
+  const assigneesMutation = useMutation({
+    // `expected` is the set this pane RENDERED. The server refuses the write if the
+    // forge has moved since, so a concurrent edit is a 409 rather than a silent
+    // overwrite of someone else's addition.
+    mutationFn: (next: string[]) =>
+      issueRadarApi.setIssueAssignees(active, issue.number, next, assignees),
+    onSuccess: (res) => {
+      queryClient.setQueryData<IssueDetailResponse>(detailKey, (old) =>
+        old ? { ...old, detail: { ...old.detail, assignees: res.assignees } } : old)
+      for (const sf of ['open', 'closed'] as const) {
+        queryClient.setQueryData<IssuesResponse>(
+          ['issue-radar', 'issues', scopeKey, sf],
+          (old) => old
+            ? { ...old, issues: old.issues.map((i) => i.number === issue.number ? { ...i, assignees: res.assignees } : i) }
+            : old,
+        )
+      }
+    },
+    onError: (err) => {
+      // A stale precondition is recoverable and NOT the user's mistake: adopt the
+      // set the forge actually holds so the sidebar stops showing a view the write
+      // was rejected against, and let them redo the edit on current state.
+      //
+      // Both caches, exactly as the success path does. Patching only the detail
+      // left the list row stale, so the "assigned to me" filter and the Overview
+      // counts kept reading the pre-conflict assignees.
+      if (err instanceof AssigneesConflictError) {
+        queryClient.setQueryData<IssueDetailResponse>(detailKey, (old) =>
+          old ? { ...old, detail: { ...old.detail, assignees: err.current } } : old)
+        for (const sf of ['open', 'closed'] as const) {
+          queryClient.setQueryData<IssuesResponse>(
+            ['issue-radar', 'issues', scopeKey, sf],
+            (old) => old
+              ? { ...old, issues: old.issues.map((i) => i.number === issue.number ? { ...i, assignees: err.current } : i) }
+              : old,
+          )
+        }
+      }
+    },
+  })
+  // GitHub caps an issue at 10 assignees; mirror the backend cap so the picker
+  // stops offering more (the backend rejects an 11th regardless).
+  const MAX_ASSIGNEES = 10
+  const isAssigned = (login: string) => assignees.some((a) => a.toLowerCase() === login.toLowerCase())
+  const toggleAssignee = (login: string) => {
+    if (!canWrite || assigneesMutation.isPending) return
+    const next = isAssigned(login)
+      ? assignees.filter((a) => a.toLowerCase() !== login.toLowerCase())
+      : [...assignees, login]
+    if (next.length > MAX_ASSIGNEES) return
+    assigneesMutation.mutate(next)
+  }
+  // "Assign to me" / "Unassign me" — the one-click quick action. `me` is the
+  // current user's login on the active provider (null when it could not be
+  // resolved, which hides the affordance).
+  const assignedToMe = !!me && isAssigned(me)
+  const toggleSelf = () => {
+    if (!me) return
+    toggleAssignee(me)
+  }
+  // The member roster's logins drive the picker.
+  const memberLogins = Array.from(memberRoleByLogin.keys())
+
   // The row handed to the child ACTIONS (investigate) — the live title/body when
   // they have arrived. A pane opened from a cross-reference starts from a
   // placeholder row, and the seed prompt names the issue it is about.
@@ -720,87 +808,140 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
   // detail cache updates). Kept to labels that still exist on the repo.
   const suggestions = asArray<SuggestedLabel>(aiQuery.data?.suggested_labels).filter((s) => !currentNames.includes(s.name))
 
+  // The tall title is ordinary scrolling content now; the compact echo in the
+  // sticky bar fades in exactly when that title leaves the scroller.
+  const { scrolledOut, setScroller, setTitle } = useTitleScrolledOut()
+  const title = detail?.title ?? issue.title
+
   return (
     <article className="h-full flex flex-col">
-      {/* ── Header (does not scroll) ── */}
-      <header className="px-6 pt-5 pb-4 border-b border-border">
-        <div className="flex items-start gap-3">
-          <div className="flex-1 min-w-0">
-            {awaitingFirstPaint ? <HeaderSkeleton /> : (<>
-            <h1 className="text-[27px] font-bold leading-tight text-text-strong break-words">
-              {detail?.title ?? issue.title}
-            </h1>
-            <div className="flex items-center gap-2 mt-3 flex-wrap text-[12.5px] text-muted">
-              <StatePill state={state} reason={stateReason} />
-              {/* Copy-link + issue number, sitting right after the state pill.
-                  The copy button writes the URL to the clipboard; the #number
-                  itself links out to the provider. */}
-              <span className="inline-flex items-center gap-1">
-                <button
-                  onClick={copyLink}
-                  title={copied ? i18nT('apps.issueRadar.components.issueDetail.link_copied') : i18nT('apps.issueRadar.components.issueDetail.copy_link_to_this_issue')}
-                  aria-label={i18nT('apps.issueRadar.components.issueDetail.copy_link_to_this_issue')}
-                  className="inline-flex items-center -ml-0.5 p-0.5 cursor-pointer bg-transparent text-muted hover:text-accent"
-                >
-                  {copied ? <Check size={13} className="text-ok" /> : <Copy size={13} />}
-                </button>
-                <a
-                  href={safeHttpUrl(detail?.url ?? issue.url ?? '') ?? undefined}
-                  target="_blank"
-                  rel="noreferrer"
-                  title={`Open on ${terms.providerName}`}
-                  className="font-mono text-muted hover:text-accent hover:underline"
-                >
-                  #{issue.number}
-                </a>
-              </span>
+      {/* The header lives INSIDE the scroller now, so its height is not standing
+          furniture on a phone: the tall title scrolls away by physics and a
+          sticky bar keeps state + the actions reachable. Above `sm:` the wrapper
+          below stops scrolling and this reads exactly as it did before — a static
+          block above both body columns. See DetailHeader for the full rationale. */}
+      <div className="flex-1 min-h-0 overflow-hidden">
+        <div
+          ref={setScroller}
+          className="h-full flex flex-col overflow-y-auto sm:overflow-visible"
+        >
+          <DetailHeader
+            collapsed={scrolledOut}
+            title={title}
+            titleRef={setTitle}
+            /* Suppressed inside a cross-reference sheet. RefSheet reuses this
+               whole pane as a detour over the workspace, and this control's
+               `closeDetail` acts on the workspace BEHIND the sheet — it would
+               mutate hidden state while the sheet stayed open. The sheet has its
+               own chrome (a stack-back plus owner/repo/#number), so nothing is
+               lost by leaving navigation to it. */
+            back={listDetail.isMobile && refStack.length === 0
+              ? <ListDetailBack label={i18nT('apps.issueRadar.components.leftRail.issues')} onBack={listDetail.closeDetail} />
+              : null}
+            awaitingFirstPaint={awaitingFirstPaint}
+            skeleton={<HeaderSkeleton />}
+            meta={<>
               <MemberBadge role={authorRole} assoc={association} />
               <span>
                 {author ? <span className="text-text font-medium">{author}</span> : 'someone'} {i18nT('apps.issueRadar.components.issueDetail.opened')}{' '}
                 {createdAt ? <RelTime iso={createdAt} /> : ''}
               </span>
+            </>}
+            identity={<>
+              <StatePill state={state} reason={stateReason} />
+              {/* The #number links out to the provider. Copy-link is NOT here: it
+                  is an action control, and a fourth one on this row breaks
+                  `max-two-buttons-per-row`. It lives in the overflow menu, where
+                  it also gains a text label it never had as a bare icon. */}
+              <a
+                href={safeHttpUrl(detail?.url ?? issue.url ?? '') ?? undefined}
+                target="_blank"
+                rel="noreferrer"
+                title={`Open on ${terms.providerName}`}
+                className="font-mono text-muted hover:text-accent hover:underline"
+              >
+                #{issue.number}
+              </a>
+              {/* Lock state stands with the state pill rather than scrolling away
+                  with the metadata: CommentCard takes author/when/assoc/role/
+                  body/reactions and carries no lock, so a locked issue would
+                  otherwise show no lock indicator anywhere once scrolled. */}
               {locked && <span className="inline-flex items-center gap-1 text-warn"><Lock size={12} /> {i18nT('apps.issueRadar.components.issueDetail.locked')}</span>}
-            </div>
-            </>)}
-          </div>
-          <div className="flex-shrink-0 flex items-center gap-1.5">
-            {/* Withheld until the pane has something real to describe: the seed
-                prompt names the issue by title, so firing it from a placeholder
-                row would persist a session titled "#0" with a malformed context
-                line. */}
-            {!awaitingFirstPaint && <InvestigateButton repoRef={active} issue={actionIssue} />}
-            {canWrite && stateKnown && (
-              <StateActions
-                state={state}
-                pending={stateMutation.isPending}
-                onClose={(reason) => stateMutation.mutate({ state: 'closed', reason })}
-                onReopen={() => stateMutation.mutate({ state: 'open' })}
-              />
+            </>}
+            /* TWO controls, per `max-two-buttons-per-row`: the pane's primary
+               action, and one overflow trigger for the rest. */
+            actions={<>
+              {/* Withheld until the pane has something real to describe: the seed
+                  prompt names the issue by title, so firing it from a placeholder
+                  row would persist a session titled "#0" with a malformed context
+                  line. */}
+              {!awaitingFirstPaint && <InvestigateButton repoRef={active} issue={actionIssue} />}
+              {/* `pending` surfaces the state write's in-flight state on the
+                  trigger, since the menu closes as soon as the item is chosen. */}
+              <DetailOverflowMenu pending={stateMutation.isPending || refreshing}>
+                {canWrite && stateKnown && (state === 'closed' ? (
+                  <DropdownMenuItem disabled={stateMutation.isPending} onSelect={() => stateMutation.mutate({ state: 'open' })}>
+                    <CircleDot size={13} className="shrink-0 text-ok" />
+                    <span>{i18nT('apps.issueRadar.components.issueDetail.reopen')}</span>
+                  </DropdownMenuItem>
+                ) : (<>
+                  {/* The two close reasons are separate items rather than a
+                      submenu — GitHub treats them as two verbs, and flattening
+                      them costs one row instead of a second hover level. */}
+                  <DropdownMenuItem disabled={stateMutation.isPending} onSelect={() => stateMutation.mutate({ state: 'closed', reason: 'completed' })}>
+                    <CircleCheck size={13} className="shrink-0 text-aim" />
+                    <span>{i18nT('apps.issueRadar.components.issueDetail.close_as_completed')}</span>
+                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled={stateMutation.isPending} onSelect={() => stateMutation.mutate({ state: 'closed', reason: 'not_planned' })}>
+                    <CircleSlash size={13} className="shrink-0 text-muted" />
+                    <span>{i18nT('apps.issueRadar.components.issueDetail.close_as_not_planned')}</span>
+                  </DropdownMenuItem>
+                </>))}
+                {canWrite && stateKnown && <DropdownMenuSeparator />}
+                {/* Keeps the menu OPEN on select: the copy affordance's whole
+                    feedback is the glyph flipping to a tick and back, and an item
+                    that closes the menu on select would take that confirmation
+                    off screen the instant it was earned. */}
+                <DropdownMenuItem onSelect={(e) => { e.preventDefault(); copyLink() }}>
+                  {copyStatus === 'copied'
+                    ? <Check size={13} className="shrink-0 text-ok" aria-hidden="true" />
+                    : copyStatus === 'failed'
+                      ? <AlertCircle size={13} className="shrink-0 text-danger" aria-hidden="true" />
+                      : <Copy size={13} className="shrink-0 text-muted" aria-hidden="true" />}
+                  {/* One span across all three states so the swap lands as an
+                      UPDATE to a live region a screen reader is already on,
+                      rather than three alternating nodes. */}
+                  <span aria-live="polite">{copyLabel}</span>
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled={detailQuery.isFetching} onSelect={refreshDetail}>
+                  <RefreshCw size={13} className={`shrink-0 text-muted ${detailQuery.isFetching ? 'animate-spin' : ''}`} />
+                  <span>{i18nT('apps.issueRadar.components.issueDetail.refresh_issue_details')}</span>
+                </DropdownMenuItem>
+              </DetailOverflowMenu>
+            </>}
+            extra={stateMutation.isError && (
+              <div className="mt-2 text-[12px] text-danger">
+                {(stateMutation.error as Error).message}
+              </div>
             )}
-            <button
-              onClick={refreshDetail}
-              disabled={detailQuery.isFetching}
-              aria-label={i18nT('apps.issueRadar.components.issueDetail.refresh_issue_details')}
-              title={i18nT('apps.issueRadar.components.issueDetail.re_fetch_issue_and_timeline_from', { provider: terms.providerName })}
-              className="inline-flex items-center text-muted hover:text-text disabled:opacity-30 cursor-pointer bg-transparent p-1"
-            >
-              <RefreshCw size={14} className={detailQuery.isFetching ? 'animate-spin' : ''} />
-            </button>
-          </div>
-        </div>
-        {stateMutation.isError && (
-          <div className="mt-2 text-[12px] text-danger">
-            {(stateMutation.error as Error).message}
-          </div>
-        )}
-      </header>
+          />
 
-      {/* ── Scroll area: timeline + sidebar ── */}
-      <div className="flex-1 min-h-0 overflow-hidden">
-        <div className="flex gap-6 px-6 py-5 h-full items-stretch">
+        {/* Stacked while narrow. Side by side, the 236px sidebar took the width
+            out of the column holding the summary, description and timeline: at
+            390px that column measured 34px and clipped its text to two or three
+            characters a line. The metadata reads fine full-width underneath. */}
+        <div className="flex flex-col sm:flex-row gap-6 px-4 md:px-6 py-5 sm:flex-1 sm:min-h-0 sm:items-stretch">
           {/* Main column — AI summary, the pinned description, linked refs,
               then the activity timeline (newest-first). */}
-          <main className="flex-1 min-w-0 overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
+          {/* Scroll ownership is transferred WHOLE at the breakpoint. Keeping an
+              unconditional flex-1 + overflow-y-auto here would clamp this column
+              to the space a shrink-0 metadata block left over and then hide the
+              overflow behind scrollbar-none: on an issue with tall metadata the
+              description and timeline collapse into a near-zero inner window that
+              scrolls invisibly, and the wrapper scroller never engages because the
+              children already sum to the container. While narrow this takes its
+              natural height and the wrapper is the single scroller. */}
+          <main className="min-w-0 sm:flex-1 sm:overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
             <AiSummaryCard
               summary={aiQuery.data?.summary ?? ''}
               fromCache={aiQuery.data?.from_cache ?? false}
@@ -826,6 +967,9 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
 
             {/* Linked PRs / issues — their own section, lifted off the rail. */}
             {relatedRefs.length > 0 && <RelatedLinks items={relatedRefs} />}
+
+            {/* Dependency edges — blocked by / blocking (deps cache). */}
+            <DepsSection number={issue.number} />
 
             {/* Activity timeline — newest first, latest node pulsing. */}
             <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-muted mb-3 font-medium">
@@ -861,9 +1005,46 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
           </main>
 
           {/* Sidebar — most triage-useful GitHub metadata. */}
-          <aside className="w-[236px] flex-shrink-0 overflow-y-auto scrollbar-none text-[12.5px]" style={{ scrollbarWidth: 'none' }}>
-            <Section title={i18nT('apps.issueRadar.components.issueDetail.assignees')} icon={<Users size={12} />}>
-              {assignees.length > 0 ? (
+          <aside className="w-full sm:w-[236px] shrink-0 sm:overflow-y-auto scrollbar-none text-[12.5px]" style={{ scrollbarWidth: 'none' }}>
+            <Section
+              title={i18nT('apps.issueRadar.components.issueDetail.assignees')}
+              icon={<Users size={12} />}
+              action={canWrite ? (
+                <div className="flex items-center gap-2">
+                  {me && !editingAssignees && (
+                    <button
+                      onClick={toggleSelf}
+                      disabled={assigneesMutation.isPending}
+                      className="inline-flex items-center gap-1 text-[11px] text-muted hover:text-accent cursor-pointer bg-transparent disabled:opacity-50"
+                    >
+                      {assignedToMe
+                        ? <><UserMinus size={11} /> {i18nT('apps.issueRadar.components.issueDetail.unassign_me')}</>
+                        : <><UserPlus size={11} /> {i18nT('apps.issueRadar.components.issueDetail.assign_me')}</>}
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setEditingAssignees((v) => !v)}
+                    aria-label={editingAssignees
+                      ? i18nT('apps.issueRadar.components.issueDetail.done_editing_assignees')
+                      : i18nT('apps.issueRadar.components.issueDetail.edit_assignees')}
+                    className="inline-flex items-center gap-1 text-[11px] text-muted hover:text-accent cursor-pointer bg-transparent"
+                  >
+                    {editingAssignees ? <>{i18nT('apps.issueRadar.components.issueDetail.done')}</> : <><Pencil size={11} /> {i18nT('apps.issueRadar.components.issueDetail.edit')}</>}
+                  </button>
+                </div>
+              ) : undefined}
+            >
+              {editingAssignees && canWrite ? (
+                <div className={assigneesMutation.isPending ? 'opacity-60 pointer-events-none' : ''}>
+                  <AssigneePicker
+                    members={memberLogins}
+                    selected={assignees}
+                    onToggle={toggleAssignee}
+                    me={me}
+                    atCap={assignees.length >= MAX_ASSIGNEES}
+                  />
+                </div>
+              ) : assignees.length > 0 ? (
                 <div className="flex flex-col gap-1">
                   {assignees.map((a) => (
                     <a key={a} href={userUrlFor(active, a)} target="_blank" rel="noreferrer" className="text-text hover:text-accent hover:underline truncate">
@@ -874,6 +1055,10 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
               ) : (
                 <span className="text-muted">{i18nT('apps.issueRadar.components.issueDetail.no_one_assigned')}</span>
               )}
+
+              {assigneesMutation.isError && (
+                <div className="mt-2 text-[11px] text-danger">{(assigneesMutation.error as Error).message}</div>
+              )}
             </Section>
 
             <Section
@@ -882,6 +1067,13 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
               action={canWrite && repoLabels.length > 0 ? (
                 <button
                   onClick={() => setEditingLabels((v) => !v)}
+                  // An explicit accessible name: the sidebar now has TWO edit
+                  // toggles (labels and assignees), and a bare "Edit" on both
+                  // reads as "Edit, Edit" to a screen reader with no way to tell
+                  // which block it acts on. The visible text stays short.
+                  aria-label={editingLabels
+                    ? i18nT('apps.issueRadar.components.issueDetail.done_editing_labels')
+                    : i18nT('apps.issueRadar.components.issueDetail.edit_labels')}
                   className="inline-flex items-center gap-1 text-[11px] text-muted hover:text-accent cursor-pointer bg-transparent"
                 >
                   {editingLabels ? <>{i18nT('apps.issueRadar.components.issueDetail.done')}</> : <><Pencil size={11} /> {i18nT('apps.issueRadar.components.issueDetail.edit')}</>}
@@ -909,6 +1101,7 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
                 suggestions={suggestions}
                 loading={aiQuery.isLoading}
                 canWrite={canWrite}
+                repoRef={active}
                 pending={labelMutation.isPending}
                 onAccept={acceptSuggestion}
                 colorByName={colorByName}
@@ -951,6 +1144,7 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
               </dl>
             </Section>
           </aside>
+        </div>
         </div>
       </div>
     </article>

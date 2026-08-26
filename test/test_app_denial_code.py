@@ -24,6 +24,9 @@ import pytest
 
 from kiro_crew.apps.manager import AppResult
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 DENIAL_CODE = "app_execution_denied"
 
 
@@ -112,6 +115,14 @@ class TestRegistryInstallDenialCarriesCode:
         # `registry.config_dir` would not redirect the policy read.
         monkeypatch.setattr(admission, "config_dir", lambda: tmp_path)
 
+        # The resolution path consults the official catalog FIRST, with a fresh
+        # uncached HTTPS fetch (#4236); pin "catalog reachable, app absent" so
+        # the seeded row below is what resolves, deterministically.
+        monkeypatch.setattr(
+            "kiro_crew.apps.official_catalog.inventory_for_install",
+            lambda name: None,
+        )
+
         monkeypatch.setattr(
             registry,
             "_load_registry_file",
@@ -152,5 +163,5 @@ def test_denial_code_matches_the_open_command_route():
     place, this fails rather than leaving the affordance silently dead on the
     other paths.
     """
-    src = Path("src/kiro_crew/apps/routes.py").read_text(encoding="utf-8")
+    src = (_REPO_ROOT / "src/kiro_crew/apps/routes.py").read_text(encoding="utf-8")
     assert f'"code": "{DENIAL_CODE}"' in src

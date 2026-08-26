@@ -12,6 +12,7 @@ Host). Two origin flavors:
 Append-only: preserves the existing config (default S3 behavior, other apps).
 CloudFront is global; region is only for CLI profile plumbing.
 """
+
 import argparse
 import json
 import os
@@ -27,7 +28,6 @@ OAC_NAME = "kirocrew-deploy-lambda-oac"
 
 
 def aws(profile, region, *args):
-    cmd = ["aws"] + (["--profile", profile] if profile else []) + ["--region", region, *args]
     # Every AWS spawn from these LLM-facing helpers MUST route through
     # the sandbox chokepoint. Failing open when kiro_crew is not importable
     # would run completely unsandboxed, which is exactly the environment an
@@ -35,7 +35,8 @@ def aws(profile, region, *args):
     # run via the package venv (pip install -e / the skill's documented
     # invocation), never bare python3 without kiro_crew on sys.path.
     try:
-        from kiro_crew.sandbox import resource_limit_preexec, sandboxed_spawn_argv
+        from kiro_crew.deploy.engine import resolve_aws_bin
+        from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
     except ImportError:
         sys.stderr.write(
             "error: kiro_crew package not importable — refusing to spawn AWS "
@@ -43,20 +44,32 @@ def aws(profile, region, *args):
             "python (see skills/artifact-deploy/SKILL.md).\n"
         )
         sys.exit(1)
-    wrapped_argv, env, cleanup = sandboxed_spawn_argv(cmd)
-    _preexec = resource_limit_preexec()
-    # Kernel RLIMIT ceiling on the child (fork bomb / FD / mem / CPU) — the
-    # spawn-audit rule requires this on every sandbox-routed spawn.
-    r = subprocess.run(  # noqa: S603
-        wrapped_argv, capture_output=True, text=True, env=env, preexec_fn=_preexec
+    # Resolved absolutely (shared deploy-engine resolver) so a GUI-launched
+    # gateway's minimal PATH still finds the CLI (#4770).
+    cmd = (
+        [resolve_aws_bin()]
+        + (["--profile", profile] if profile else [])
+        + ["--region", region, *args]
     )
-    if cleanup:
-        import os as _os
-
-        try:
-            _os.unlink(cleanup)
-        except OSError:
-            pass
+    wrapped_argv, env, cleanup = sandboxed_spawn_argv(cmd)
+    # Kernel RLIMIT ceiling on the child (fork bomb / FD / mem / CPU) — the
+    # spawn-audit rule requires this on every sandbox-routed spawn; run_limited
+    # delivers it after exec via the spawn shim rather than in a fork child.
+    # The timeout bounds an otherwise-unbounded synchronous AWS CLI call so a
+    # stalled endpoint cannot hang the deploy indefinitely.
+    try:
+        r = run_limited(  # noqa: S603
+            wrapped_argv, capture_output=True, text=True, env=env, timeout=300
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"error: aws command timed out after 300s: {' '.join(cmd)}\n")
+        sys.exit(1)
+    finally:
+        if cleanup:
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
     if r.returncode != 0:
         sys.stderr.write(r.stderr)
         sys.exit(r.returncode)

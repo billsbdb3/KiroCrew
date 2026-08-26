@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import urllib.parse
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -20,6 +21,22 @@ logger = logging.getLogger(__name__)
 # conversations.list pagination limits
 _CONVERSATIONS_LIST_MAX_PAGES = 20  # 20 pages × 1000 = 20k channels max
 _CONVERSATIONS_LIST_PAGE_SIZE = 1000
+
+# A Slack file fetch is the one outbound request that carries the bot token in
+# an ``Authorization`` header, and its URL is not ours: it is whatever
+# ``url_private_download`` / ``url_private`` the inbound event envelope carried.
+# So the host is constrained to Slack's own domain, which is the boundary that
+# makes attaching the credential safe at all — anything else is a request to
+# hand bot-level workspace access to a third party. Suffix-matched rather than
+# an exact host set because Slack serves files from several hosts under this
+# domain and varies them by install shape (Enterprise Grid included); the
+# credential stays inside Slack either way.
+_SLACK_FILE_DOMAIN = "slack.com"
+
+# A download that stalls holds an ingest slot and a temp file. 60s is generous
+# for the 20 MiB document ceiling in ``messaging/attachments.py`` while still
+# bounded, where aiohttp's 5-minute default is not.
+_FILE_DOWNLOAD_TIMEOUT_SECS = 60
 
 
 class SlackClientOps(ABC):
@@ -217,19 +234,29 @@ class RealSlackClient(SlackClientOps):
 
     def __init__(self, bot_token: str):
         self._web = AsyncWebClient(token=bot_token)
-        # Channel→workspace team_id cache.  Populated from inbound events
-        # by record_channel_team() and used to auto-inject team_id into
+        # Channel→workspace team_id cache. Populated ONLY from
+        # conversations_info()'s home-workspace answer by
+        # ensure_channel_team(), and used to auto-inject team_id into
         # outbound chat.* / reactions.* calls so org-wide (Enterprise Grid)
-        # installs route to the correct workspace.  Empty for non-org-wide
-        # installs — _inject_team becomes a no-op in that case.
+        # installs route to the correct workspace. The team on an inbound
+        # event is the AUTHOR's workspace, which on a Slack Connect shared
+        # channel is not the workspace the channel lives in, so it must
+        # never feed this cache. Empty for non-org-wide installs —
+        # _inject_team becomes a no-op in that case.
         self._channel_team: dict[str, str] = {}
+        # Channels whose home team could not be resolved this process. One
+        # failed lookup must not become one extra API call per inbound
+        # message for the rest of the run; a gateway restart clears the set
+        # and lets resolution try again.
+        self._channel_team_unresolvable: set[str] = set()
 
     def record_channel_team(self, channel: str, team_id: str) -> None:
         """Cache the workspace team_id for a channel.  Idempotent.
 
-        Called from inbound event handlers so subsequent outbound API
-        calls on the same channel can include team_id, which org-wide
-        installs require to avoid ``team_access_not_granted``.
+        Only a CANONICAL home-team answer may enter here: outbound calls
+        route by the workspace the channel lives in, so this method must be
+        fed from :meth:`ensure_channel_team` (conversations_info), never
+        from an inbound event's author-side ``team`` field.
         """
         if not (channel and team_id):
             return
@@ -240,6 +267,53 @@ class RealSlackClient(SlackClientOps):
             cache = {}
             self._channel_team = cache
         cache[channel] = team_id
+
+    async def ensure_channel_team(self, channel: str) -> None:
+        """Resolve a channel's HOME workspace into the routing cache.
+
+        Inbound handlers call this once per message. conversations_info
+        answers with the caller's own ``context_team_id`` for the channel,
+        which is the workspace the channel lives in — the value every
+        outbound ``team_id`` has to carry on an org-wide install. Recording
+        the author's team instead is what flipped shared-channel caches to
+        a participant's workspace and demoted replies off streaming with
+        ``team_access_not_granted``.
+
+        Best-effort: a channel that cannot be resolved simply stays out of
+        the cache, which leaves outbound calls without team_id — the same
+        routing Slack does for a cache miss — and lands in
+        ``_channel_team_unresolvable`` so the failure costs one lookup per
+        process rather than one per message.
+        """
+        if not channel:
+            return
+        cache = getattr(self, "_channel_team", None) or {}
+        if channel in cache:
+            return
+        unresolvable = getattr(self, "_channel_team_unresolvable", None)
+        if unresolvable is None:
+            unresolvable = set()
+            self._channel_team_unresolvable = unresolvable
+        if channel in unresolvable:
+            return
+        try:
+            resp = await self._web.conversations_info(channel=channel)
+            ch = (
+                resp.data.get("channel", {})  # type: ignore[union-attr]
+                if hasattr(resp, "data")
+                else {}
+            )
+            home = str(ch.get("context_team_id") or "")
+        except Exception:
+            logger.info(
+                "could not resolve the home workspace of channel %s", channel,
+                exc_info=True,
+            )
+            home = ""
+        if home:
+            self.record_channel_team(channel, home)
+        else:
+            unresolvable.add(channel)
 
     def _inject_team(self, channel: str, kwargs: dict[str, Any]) -> None:
         """Add team_id to kwargs from cache, if known and not already set.
@@ -465,17 +539,25 @@ class RealSlackClient(SlackClientOps):
                 "task_display_mode": "plan",
             }
             # Workspace routing for org-wide installs.  Prefer the cached
-            # team for this channel — that's the workspace the channel lives
-            # in, which is what ``body["team_id"]`` must route to.  Fall
-            # back to the recipient's team_id only when the cache hasn't
-            # been populated yet (first message into a never-seen channel).
+            # home team for this channel — that's the workspace the channel
+            # lives in, which is what ``body["team_id"]`` must route to.
+            # Fall back to the caller-supplied recipient's team_id only when
+            # the home team hasn't been resolved yet.
             cache = getattr(self, "_channel_team", None)
             cached_team = cache.get(channel) if cache else None
             workspace_team = cached_team or team_id
             if workspace_team:
                 body["team_id"] = workspace_team
-            if team_id:
-                body["recipient_team_id"] = team_id
+            # An org-wide install rejects startStream with
+            # ``missing_recipient_team_id`` when the recipient's workspace is
+            # unknown, so fall back to the channel's cached team: for a channel
+            # message the recipient's workspace IS the channel's workspace.
+            # Without the fallback every caller that does not thread an explicit
+            # team_id (the renderer transport path) is rejected on each turn and
+            # silently demoted to the non-streaming chat.update surface.
+            recipient_team = team_id or cached_team
+            if recipient_team:
+                body["recipient_team_id"] = recipient_team
             if user_id:
                 body["recipient_user_id"] = user_id
             chunks: list[dict[str, Any]] = []
@@ -726,11 +808,44 @@ class RealSlackClient(SlackClientOps):
         return out
 
     async def download_file(self, url: str, dest: str) -> None:
-        """Download a Slack-hosted file using the bot token for auth."""
+        """Download a Slack-hosted file using the bot token for auth.
+
+        The URL comes from the inbound event envelope, not from us, so it is
+        validated before the bot token is attached to a request for it: HTTPS,
+        a host inside :data:`_SLACK_FILE_DOMAIN`, and the default port. Redirects
+        are refused rather than followed, because aiohttp replays an explicitly
+        set ``Authorization`` header across a redirect — so following one would
+        let an allowed URL bounce a bot-level workspace credential to an
+        arbitrary host, and the host check would have been true only of the hop
+        that did not carry the bytes. Mirrors
+        ``discord/client.py::download_attachment``, which guards its (credential
+        -free) CDN fetch the same way.
+        """
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("invalid Slack file URL") from exc
+        host = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme != "https"
+            or not (host == _SLACK_FILE_DOMAIN or host.endswith(f".{_SLACK_FILE_DOMAIN}"))
+            or port not in (None, 443)
+        ):
+            raise ValueError("refusing non-Slack file URL")
+
         headers = {"Authorization": f"Bearer {self._web.token}"}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
+        timeout = aiohttp.ClientTimeout(total=_FILE_DOWNLOAD_TIMEOUT_SECS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers, allow_redirects=False) as resp:
+                if 300 <= resp.status < 400:
+                    raise ValueError("refusing redirected Slack file URL")
                 resp.raise_for_status()
-                with open(dest, "wb") as f:
+                # Off-loop: a 20 MiB document is ~2,500 write() calls, and this
+                # runs on the gateway's single event loop.
+                fh = await asyncio.to_thread(open, dest, "wb")
+                try:
                     async for chunk in resp.content.iter_chunked(8192):
-                        f.write(chunk)
+                        await asyncio.to_thread(fh.write, chunk)
+                finally:
+                    await asyncio.to_thread(fh.close)

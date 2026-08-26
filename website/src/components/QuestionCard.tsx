@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, memo } from 'react'
+import { useImeGuard } from '../hooks/useImeGuard'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ChevronDown, ChevronRight, ChevronsDownUp, ChevronsUpDown, MessageSquare } from 'lucide-react'
 
 import { i18nT } from '../i18n/t'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 interface QuestionOption {
   label: string
   description?: string
@@ -35,6 +37,8 @@ interface QuestionCardProps {
 }
 
 function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftChange }: QuestionCardProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const ime = useImeGuard()
   const [selections, setSelections] = useState<Record<number, Set<string>>>({})
   const [customInputs, setCustomInputs] = useState<Record<number, string>>({})
   const reduceMotion = useReducedMotion()
@@ -233,8 +237,14 @@ function QuestionCard({ questions, onSubmit, onDismiss, busy = false, onDraftCha
                     setCustomInputs(prev => ({ ...prev, [qIdx]: e.target.value }))
                     setSelections(prev => ({ ...prev, [qIdx]: new Set() }))
                   }}
-                  onKeyDown={e => { if (e.key === 'Enter' && allAnswered && !busy) handleSubmit() }}
-                  className="mt-2 w-full px-3 py-2 rounded-lg border border-border bg-bg text-text text-[13px] placeholder:text-muted focus:border-accent focus:outline-none"
+                  {...ime.bindComposition()}
+                  onKeyDown={e => {
+                    if (e.key !== 'Enter') return
+                    // Rule 1: single-line input; the readiness test stays outside.
+                    if (ime.isComposing(e)) return
+                    if (allAnswered && !busy) handleSubmit()
+                  }}
+                  className="mt-2 w-full px-3 py-2 rounded-lg border border-border bg-bg text-text text-[13px] placeholder:text-muted focus-visible:border-accent focus:outline-none"
                 />
                 </motion.div>
               )}

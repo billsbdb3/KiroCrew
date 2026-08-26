@@ -194,6 +194,35 @@ test("manualDownloadUrl: per-platform artifact on the byte host", () => {
     manualDownloadUrl("insider", "darwin"),
     `${DOWNLOAD_BASE}/desktop/insider/latest/KiroCrew.dmg`,
   );
+  assert.strictEqual(
+    manualDownloadUrl("nightly", "win32", "x64"),
+    `${DOWNLOAD_BASE}/desktop/nightly/latest/KiroCrew-Setup.exe`,
+  );
+});
+
+test("manualDownloadUrl: Windows publishes x64 on every known channel", () => {
+  // The published basename is publish-windows.yml's contract.
+  assert.strictEqual(
+    manualDownloadUrl("insider", "win32", "x64"),
+    `${DOWNLOAD_BASE}/desktop/insider/latest/KiroCrew-Setup.exe`,
+  );
+  // Stable publishes too, by promoting the verified bundle's installer rather
+  // than rebuilding. Windows carries no channel restriction of its own.
+  assert.strictEqual(
+    manualDownloadUrl("stable", "win32", "x64"),
+    `${DOWNLOAD_BASE}/desktop/stable/latest/KiroCrew-Setup.exe`,
+  );
+  // An unknown channel still yields nothing: a link there would be a 404, and
+  // offering nothing beats offering a dead link.
+  assert.strictEqual(manualDownloadUrl("experimental", "win32", "x64"), null);
+  // Only x64 is built; arm64 has no lane and no feed entry, so no link either.
+  assert.strictEqual(manualDownloadUrl("insider", "win32", "arm64"), null);
+  assert.strictEqual(manualDownloadUrl("insider", "win32", "ia32"), null);
+  // The arch gate is Windows-specific: the other platforms are unaffected.
+  assert.strictEqual(
+    manualDownloadUrl("stable", "darwin"),
+    `${DOWNLOAD_BASE}/desktop/stable/latest/KiroCrew.dmg`,
+  );
 });
 
 test("manualDownloadUrl: Linux picks the AppImage for the running arch", () => {
@@ -215,12 +244,36 @@ test("manualDownloadUrl: Linux picks the AppImage for the running arch", () => {
   );
 });
 
+test("manualDownloadUrl: the link matches the format they installed", () => {
+  // A package install's escape hatch must hand back the SAME format. Offering an
+  // AppImage to someone whose files are managed by dpkg/rpm creates a second,
+  // unmanaged install beside the first instead of repairing it -- and the
+  // package manager then knows nothing about the copy they actually run.
+  assert.strictEqual(
+    manualDownloadUrl("stable", "linux", "x64", "deb"),
+    `${DOWNLOAD_BASE}/desktop/stable/latest/KiroCrew-x86_64.deb`,
+  );
+  assert.strictEqual(
+    manualDownloadUrl("stable", "linux", "arm64", "rpm"),
+    `${DOWNLOAD_BASE}/desktop/stable/latest/KiroCrew-aarch64.rpm`,
+  );
+  // No format, or one we do not publish, falls back to the AppImage rather than
+  // inventing an extension no lane serves.
+  assert.strictEqual(
+    manualDownloadUrl("stable", "linux", "x64", ""),
+    `${DOWNLOAD_BASE}/desktop/stable/latest/KiroCrew-x86_64.AppImage`,
+  );
+  assert.strictEqual(
+    manualDownloadUrl("stable", "linux", "x64", "pacman"),
+    `${DOWNLOAD_BASE}/desktop/stable/latest/KiroCrew-x86_64.AppImage`,
+  );
+});
+
 test("manualDownloadUrl: null wherever there is no publish lane", () => {
-  // A dev build has no channel lane, and Windows has none until
-  // publish-windows.yml lands -- offering a 404 is worse than offering nothing.
+  // A dev build has no channel lane -- offering a 404 is worse than offering
+  // nothing.
   assert.strictEqual(manualDownloadUrl("dev", "darwin"), null);
   assert.strictEqual(manualDownloadUrl("", "darwin"), null);
-  assert.strictEqual(manualDownloadUrl("nightly", "win32"), null);
   assert.strictEqual(manualDownloadUrl(undefined, undefined), null);
   // A Linux arch with no published AppImage returns null rather than guessing
   // x86_64: a wrong-arch binary is a worse answer than no link.

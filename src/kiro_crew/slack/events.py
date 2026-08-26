@@ -16,6 +16,7 @@ processing the same Slack event twice.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -66,7 +67,13 @@ from kiro_crew.slack.blocks import (
     dashboard_link_block,
     voice_config_modal,
 )
-from kiro_crew.slack.files import SLACK_AUDIO_MIMETYPES, process_slack_files
+from kiro_crew.slack.files import (
+    VOICE_MEMO_FAILED,
+    VOICE_MEMO_UNAVAILABLE,
+    is_voice_memo,
+    process_slack_files,
+    voice_memo_notes,
+)
 from kiro_crew.slack.handler import (
     APPROVAL_AUTO,
     APPROVAL_INTERACTIVE,
@@ -1222,17 +1229,23 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
             if isinstance(all_vs, list):
                 total_lessons = len(all_vs)
                 # get_lessons() returns ORDER BY updated_at DESC (most recent first).
+                # Deferred import: ``vector_memory`` pulls snowballstemmer plus
+                # the optional numpy/faiss imports, and this renderer is the
+                # module's only use of it, on an owner-command path.
+                from kiro_crew.vector_memory import _lesson_display_text
+
                 for entry in all_vs[:5]:
                     try:
                         parsed = json.loads(entry["value_json"])
-                        rule = (
-                            parsed.get("rule", str(parsed))
-                            if isinstance(parsed, dict)
-                            else str(parsed)
-                        )
-                        lesson_lines.append(
-                            f"• {redact_credentials(redact_exfiltration_urls(rule)[0])[0][:100]}"
-                        )
+                        # Rendered text for either storage shape, so a
+                        # mapping-shaped row keeps its NOT-clause instead of
+                        # showing rule-only (or a dict repr).  Credential
+                        # redaction runs on the FULL display text (rule +
+                        # negative combined) before truncation, so embedded
+                        # secrets in either field are replaced.
+                        rule = _lesson_display_text(parsed) or str(parsed)
+                        safe = redact_credentials(redact_exfiltration_urls(rule)[0])[0]
+                        lesson_lines.append(f"• {safe[:100]}")
                     except Exception:
                         logger.debug("Skipping malformed lesson entry", exc_info=True)
                 vs_ok = True
@@ -1270,8 +1283,8 @@ async def _publish_home_tab(orch: GatewayOrchestrator, user_id: str) -> None:
         # ── Version ──
         version_text = f"📦 Kiro Crew v{__version__}"
         update_info = get_update_info()
-        remote_ver = update_info.get("remote_version")
-        if update_info.get("available") and remote_ver is not None:
+        remote_ver = update_info.get("latest_version")
+        if update_info.get("update_available") and remote_ver:
             version_text += f"  •  🆕 v{remote_ver} available — open Dashboard to update"
         version_text = redact_credentials(redact_exfiltration_urls(version_text)[0])[0]
         blocks.append({"type": "divider"})
@@ -1430,9 +1443,32 @@ def _maybe_prompt_owner(orch: GatewayOrchestrator, event: dict) -> None:
 # Audio transcription helper
 # ---------------------------------------------------------------------------
 
-# Single source of truth lives with the attachment adapter so the
-# transcriber and the ingestion path cannot disagree about what is audio.
-_AUDIO_MIMETYPES = SLACK_AUDIO_MIMETYPES
+# What counts as a voice memo lives with the attachment adapter
+# (``slack/files.py::is_voice_memo``) so the transcriber and the ingestion path
+# cannot disagree about what is audio.
+
+
+def _voice_memo_context(
+    text: str, memos: int, transcribed: int, *, available: bool
+) -> str:
+    """*text* plus one visible note per voice memo that produced no words.
+
+    A memo whose transcription is unavailable or failed used to be dropped in
+    TOTAL silence: nothing was appended to the prompt, so a voice-only message
+    had no text at all and the turn never started. The sender's send succeeded, so
+    from their side that is indistinguishable from being ignored, and the agent
+    was never told anything arrived. The note makes both true again: the turn runs,
+    and it runs knowing a memo it cannot hear is what the user sent.
+
+    The wording is the neutral half's (``slack/files.py`` pins it), so the same
+    failure reads the same way whichever channel the memo came from.
+    """
+    missing = memos - transcribed
+    if missing <= 0:
+        return text
+    note = VOICE_MEMO_UNAVAILABLE if not available else VOICE_MEMO_FAILED
+    block = "\n\n".join(voice_memo_notes(missing, note))
+    return f"{text}\n\n{block}" if text else block
 
 
 async def _transcribe_with_reaction(
@@ -1466,11 +1502,14 @@ async def _transcribe_with_reaction(
 
 
 async def _transcribe_files(orch: "GatewayOrchestrator", files: list[dict]) -> list[str]:
-    """Download and transcribe audio files, return list of transcription strings."""
+    """Download and transcribe audio files, return list of transcription strings.
+
+    Only what speech-to-text could hear. A memo that produced nothing is reported
+    by the caller, which knows how many arrived: see :func:`_voice_memo_context`.
+    """
     results: list[str] = []
     for f in files:
-        mimetype = f.get("mimetype", "")
-        if not any(mimetype.startswith(prefix) for prefix in _AUDIO_MIMETYPES):
+        if not is_voice_memo(f):
             continue
         url = f.get("url_private_download") or f.get("url_private", "")
         if not url:
@@ -1636,6 +1675,10 @@ async def _dispatch_queued(
                 show_thinking=KiroCrewConfig.load().slack.show_thinking,
                 consolidator=orch.consolidator,
                 user_display_name=kwargs.get("user_display_name"),
+                # Live gateway state for the session-directive consumer (a
+                # monitor directive on a dashboard-owned thread resolves its
+                # slot through orch.dashboard_state).
+                gateway=orch,
             )
             return
         await handle_message(
@@ -1918,12 +1961,20 @@ async def _route_message(
 
     # ── Workspace routing cache for org-wide installs ──
     # Slack Web API calls (chat.postMessage, chat.startStream, etc.) need
-    # team_id when the bot is org-wide installed; record the channel→team
-    # mapping so outbound posts on this channel route to the correct
-    # workspace and avoid ``team_access_not_granted``.
-    record_team = getattr(orch.slack, "record_channel_team", None)
-    if record_team and team_id:
-        record_team(channel, team_id)
+    # team_id when the bot is org-wide installed, and the value must be the
+    # workspace the CHANNEL lives in. ``event.team`` is the AUTHOR's
+    # workspace — a participant's, not the channel's, on a Slack Connect
+    # shared channel — so it must never seed this cache; resolve the home
+    # workspace from conversations_info instead (cached per process).
+    ensure_home_team = getattr(orch.slack, "ensure_channel_team", None)
+    if ensure_home_team is not None:
+        # The seam is duck-typed on purpose: orch.slack may be the real
+        # client, a test double, or a wrapper that implements this hook
+        # synchronously or as a coroutine. Accept either; only an awaitable
+        # is awaited.
+        outcome = ensure_home_team(channel)
+        if inspect.isawaitable(outcome):
+            await outcome
 
     # ── Access control: record authorization decision early for SEL audit ──
     # The ephemeral rejection is deferred until after activation checks so
@@ -2214,21 +2265,28 @@ async def _route_message(
     _image_temp_paths: list[str] = []
     _had_voice_input = False
     if files and orch.slack and _user_authorized:
-        if stt_available():
-            transcripts = await _transcribe_with_reaction(
-                orch.slack,
-                channel,
-                msg_ts,
-                orch,
-                files,
-            )
-            if transcripts:
-                raw = "\n".join(transcripts)
-                raw, _ = redact_exfiltration_urls(raw)
-                raw, _ = redact_credentials(raw)
-                prefix = f"[Voice memo transcription]\n{raw}\n[End of transcription]"
-                text = f"{prefix}\n\n{text}" if text else prefix
-                _had_voice_input = True
+        memos = [f for f in files if is_voice_memo(f)]
+        if memos:
+            transcripts: list[str] = []
+            # Decided once per message, not per memo: an unusable transcriber
+            # cannot become usable between two attachments of one message.
+            stt_ok = stt_available()
+            if stt_ok:
+                transcripts = await _transcribe_with_reaction(
+                    orch.slack,
+                    channel,
+                    msg_ts,
+                    orch,
+                    files,
+                )
+                if transcripts:
+                    raw = "\n".join(transcripts)
+                    raw, _ = redact_exfiltration_urls(raw)
+                    raw, _ = redact_credentials(raw)
+                    prefix = f"[Voice memo transcription]\n{raw}\n[End of transcription]"
+                    text = f"{prefix}\n\n{text}" if text else prefix
+                    _had_voice_input = True
+            text = _voice_memo_context(text, len(memos), len(transcripts), available=stt_ok)
 
         # ── Process non-audio files (images, text, etc.) ──
         image_paths, text_blocks = await process_slack_files(orch, files)
@@ -2518,6 +2576,10 @@ async def _route_message(
                 # handle_message (parity: don't drop these on the transport path).
                 consolidator=orch.consolidator,
                 user_display_name=_sender_display,
+                # Live gateway state for the session-directive consumer (a
+                # monitor directive on a dashboard-owned thread resolves its
+                # slot through orch.dashboard_state).
+                gateway=orch,
             )
         )
         orch._session_tasks[session_key] = t

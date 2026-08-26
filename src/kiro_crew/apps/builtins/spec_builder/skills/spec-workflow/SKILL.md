@@ -24,6 +24,14 @@ the output is portable to Kiro IDE/CLI.
   recommended answer, and wait. Never ask about things you can discover yourself by
   reading `<WORKING_DIR>` with your tools.
 - Keep every file self-contained, concrete, and free of placeholders.
+- **Read the project's own conventions before you write anything.** Check
+  `<WORKING_DIR>` for `.kiro/steering/**/*.md` and `AGENTS.md`, and read whatever you
+  find. Those files carry the build commands, test layout, naming rules and review
+  conventions the rest of the toolchain already honors, so a spec written without them
+  can plan work that contradicts the repo it targets. Let them constrain the design and
+  the task list (which test framework a task uses, which directory a module belongs in,
+  how a change gets verified). When steering contradicts the user's request, say so in
+  chat and ask which wins rather than silently picking one.
 
 ## Spec types
 
@@ -61,6 +69,12 @@ Rules:
 - Add a decision entry whenever you ask the user a choice in chat (same
   options, keep `id` stable). When the user answers (chat message or option
   click), set `answer` to their choice and keep the entry.
+- An answered decision is **final**. Once the user has answered, that `id` is
+  settled: the app records the answer itself and its card will never offer the
+  options again, so re-emitting the same `id` with `answer: null` does not
+  re-ask the question — it just shows the recorded answer. If a decision genuinely
+  has to be revisited (new information invalidated it), ask it as a NEW entry with
+  a NEW `id`, and say in chat why you are re-opening it.
 - `blocking` is ONE plain-language sentence: what you are waiting on, or what
   happens next. Clear it (`null`) when nothing blocks.
 - `context.template` = the existing code/module you are modeling the work on,

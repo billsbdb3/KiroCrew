@@ -384,9 +384,9 @@ describe('ChatPanel reset confirmation', () => {
     await screen.findByText('kept turn')
     fireEvent.contextMenu(container.firstChild as HTMLElement, { clientX: 5, clientY: 5 })
     await userEvent.click(await screen.findByRole('menuitem', { name: 'Reset Mochi' }))
-    await screen.findByText('Reset Mochi?')
+    await screen.findByText('Reset \u201cMochi\u201d?')
     await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    await waitFor(() => expect(screen.queryByText('Reset Mochi?')).not.toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByText('Reset \u201cMochi\u201d?')).not.toBeInTheDocument())
     expect(resetMochi).not.toHaveBeenCalled()
     expect(screen.getByText('kept turn')).toBeInTheDocument()
   })
@@ -786,6 +786,23 @@ describe('ChatPanel pointer feedback', () => {
     expect(reveal.style.color).toBe('var(--accent)')
     fireEvent.mouseLeave(reveal)
     expect(reveal.style.color).toBe('var(--text-muted)')
+  })
+
+  /**
+   * The reveal label follows the SHELL's platform, not the gateway's: `revealFile`
+   * is an IPC send Mochi's Electron main process handles, so that host decides
+   * which application opens. With no shell at all — a browser tab — nothing can
+   * be revealed and nothing may be named.
+   */
+  it.each([
+    ['darwin', 'Open in Finder'],
+    ['win32', 'Open in File Explorer'],
+    ['linux', 'Show in file manager'],
+  ])('names the reveal action for a %s desktop shell', async (platform, label) => {
+    stubGlobal('kirocrew', { isElectron: true, platform })
+    history = [turn('assistant', 'Check `src/app/notes.md` please.')]
+    await renderPanel()
+    expect(await screen.findByRole('button', { name: label })).toBeInTheDocument()
   })
 })
 

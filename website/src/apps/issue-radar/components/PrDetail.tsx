@@ -16,22 +16,29 @@
 import { useEffect, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  Copy, Check, RefreshCw, GitPullRequest, GitMerge, GitPullRequestClosed, GitPullRequestDraft,
+  Copy, Check, AlertCircle, RefreshCw, GitPullRequest, GitMerge, GitPullRequestClosed, GitPullRequestDraft,
   MessageSquare, Tag, Users, CalendarDays, GitCommitHorizontal, FileDiff, Milestone as MilestoneIcon,
   Link2, CircleDot, CircleSlash, Pencil, UserPlus, UserMinus,
   CheckCircle2, XCircle, Eye, GitBranch, ChevronDown, ChevronUp, Loader2, ShieldCheck,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import RefMarkdown from './RefMarkdown'
+import DepsSection from './DepsSection'
 import { CommentCardSkeleton, HeaderSkeleton, TimelineSkeleton } from './DetailSkeleton'
 import { safeHttpUrl } from '../../../lib/safeUrl'
+import { copyToClipboard } from '../../../utils/clipboard'
 import LabelChip from './LabelChip'
 import MemberBadge from './MemberBadge'
 import AiSummaryCard from './AiSummaryCard'
 import ReviewButton from './ReviewButton'
 import PrActionsBar from './PrActionsBar'
 import PrRunActions from './PrRunActions'
+import DetailHeader from './DetailHeader'
+import DetailOverflowMenu from './DetailOverflowMenu'
+import { DropdownMenuItem } from '../../../components/ui/dropdown-menu'
+import ListDetailBack from '../../../components/ListDetailBack'
 import { useIssueRadar } from '../context'
+import { useTitleScrolledOut } from '../lib/useTitleScrolledOut'
 import { relativeTimeOrDate, asArray, detailPollMs } from '../lib/format'
 import {
   issueRadarApi,
@@ -515,18 +522,50 @@ function AutoReviewChecks(
 }
 
 export default function PrDetail({ pull }: { pull: PullRequest }) {
-  const { active, colorByName, memberRoleByLogin, canWrite, refreshPrefs } = useIssueRadar()
+  const {
+    active, colorByName, memberRoleByLogin, canWrite, refreshPrefs, listDetail, refStack,
+  } = useIssueRadar()
   const scopeKey = repoScopeKey(active)
   // GitLab calls these merge requests; the whole pane's copy follows the ref.
   const terms = providerTerms(active)
 
-  const [copied, setCopied] = useState(false)
+  // Copy-link affordance. The row swaps to a tick or a warning for a moment as
+  // the result confirmation, and goes through `copyToClipboard` rather than
+  // `navigator.clipboard` directly: the async Clipboard API exists only in a
+  // SECURE CONTEXT, so on a plain-http origin the bare call throws before
+  // anything reaches the clipboard, and the helper's textarea + `execCommand`
+  // fallback is what works there.
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Bumped by anything that makes an IN-FLIGHT copy's result no longer this
+  // row's answer: a second press, the pane moving to another subject, unmount.
+  // The clipboard write is awaited, so without this a copy that settles late
+  // would report a tick for the URL the pane has already left behind.
+  const copyAttemptRef = useRef(0)
+  useEffect(() => () => {
+    copyAttemptRef.current += 1
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+  }, [])
+  useEffect(() => {
+    copyAttemptRef.current += 1
+    setCopyStatus('idle')
+  }, [pull.number])
   const copyLink = async () => {
+    const attempt = ++copyAttemptRef.current
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+    let next: 'copied' | 'failed'
     try {
-      await navigator.clipboard.writeText(detail?.url ?? pull.url)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch { /* clipboard unavailable */ }
+      await copyToClipboard(detail?.url ?? pull.url)
+      next = 'copied'
+    } catch {
+      // Reported, never swallowed: a row that does nothing on press is
+      // indistinguishable from a copy that worked, so the URL is silently
+      // missing from the clipboard at the moment it is about to be pasted.
+      next = 'failed'
+    }
+    if (attempt !== copyAttemptRef.current) return
+    setCopyStatus(next)
+    copyTimerRef.current = setTimeout(() => setCopyStatus('idle'), 1500)
   }
 
   const queryClient = useQueryClient()
@@ -556,7 +595,18 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
     ),
     refetchIntervalInBackground: refreshPrefs.pollInBackground,
   })
-  const refreshDetail = () => { refreshRef.current = true; detailQuery.refetch() }
+  // Tracks a USER-REQUESTED refresh so the overflow trigger can acknowledge it.
+  // Deliberately NOT `detailQuery.isFetching`: `refetchInterval` polls this query
+  // in the background, so that flag would spin the trigger with no user action —
+  // a spinner that misreports what is happening is worse than none. `refreshRef`
+  // cannot serve either: it is a ref consumed inside the queryFn, so it never
+  // re-renders anything.
+  const [refreshing, setRefreshing] = useState(false)
+  const refreshDetail = () => {
+    refreshRef.current = true
+    setRefreshing(true)
+    detailQuery.refetch().finally(() => setRefreshing(false))
+  }
 
   // Push the freshly-read check state onto this PR's row in whichever cached
   // list holds it (plain list and search results both). Without this the card
@@ -697,74 +747,114 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
   // from a cross-reference starts from a placeholder row.
   const actionPull: PullRequest = { ...pull, title: detail?.title ?? pull.title, body }
 
+  // The tall title is ordinary scrolling content now; the compact echo in the
+  // sticky bar fades in exactly when that title leaves the scroller.
+  const { scrolledOut, setScroller, setTitle } = useTitleScrolledOut()
+  const title = detail?.title ?? pull.title
+
   return (
     <article className="h-full flex flex-col">
-      {/* ── Header (does not scroll) ── */}
-      <header className="px-6 pt-5 pb-4 border-b border-border">
-        <div className="flex items-start gap-3">
-          <div className="flex-1 min-w-0">
-            {awaitingFirstPaint ? <HeaderSkeleton /> : (<>
-            <h1 className="text-[27px] font-bold leading-tight text-text-strong break-words">
-              {detail?.title ?? pull.title}
-            </h1>
-            <div className="flex items-center gap-2 mt-3 flex-wrap text-[12.5px] text-muted">
-              <StatePill state={state} draft={draft} merged={merged} />
-              <span className="inline-flex items-center gap-1">
-                <button
-                  onClick={copyLink}
-                  title={copied ? i18nT('apps.issueRadar.components.prDetail.link_copied') : i18nT('apps.issueRadar.components.prDetail.copy_link_to_this', { subject: terms.changeRequestTitle })}
-                  aria-label={i18nT('apps.issueRadar.components.prDetail.copy_link_to_this', { subject: terms.changeRequestTitle })}
-                  className="inline-flex items-center -ml-0.5 p-0.5 cursor-pointer bg-transparent text-muted hover:text-accent"
-                >
-                  {copied ? <Check size={13} className="text-ok" /> : <Copy size={13} />}
-                </button>
-                <a href={safeHttpUrl(detail?.url ?? pull.url ?? '') ?? undefined} target="_blank" rel="noreferrer" title={`Open on ${terms.providerName}`} className="font-mono text-muted hover:text-accent hover:underline">
-                  #{pull.number}
-                </a>
-              </span>
+      {/* Header inside the scroller — same shape and same reasoning as the issue
+          pane; see DetailHeader. */}
+      <div className="flex-1 min-h-0 overflow-hidden">
+        <div
+          ref={setScroller}
+          className="h-full flex flex-col overflow-y-auto sm:overflow-visible"
+        >
+          <DetailHeader
+            collapsed={scrolledOut}
+            title={title}
+            titleRef={setTitle}
+            /* Suppressed inside a cross-reference sheet. RefSheet reuses this
+               whole pane as a detour over the workspace, and this control's
+               `closeDetail` acts on the workspace BEHIND the sheet — it would
+               mutate hidden state while the sheet stayed open. The sheet has its
+               own chrome (a stack-back plus owner/repo/#number), so nothing is
+               lost by leaving navigation to it. */
+            back={listDetail.isMobile && refStack.length === 0
+              ? <ListDetailBack label={terms.changeRequestPluralTitle} onBack={listDetail.closeDetail} />
+              : null}
+            awaitingFirstPaint={awaitingFirstPaint}
+            skeleton={<HeaderSkeleton />}
+            meta={<>
               <MemberBadge role={authorRole} assoc={association} />
               <span>
                 {author ? <span className="text-text font-medium">{author}</span> : 'someone'} {i18nT('apps.issueRadar.components.prDetail.opened')}{' '}
                 {createdAt ? <RelTime iso={createdAt} /> : ''}
               </span>
-            </div>
-            </>)}
-          </div>
-          <div className="flex-shrink-0 flex items-center gap-1.5">
-            {/* Same reason as IssueDetail's Investigate: the review seed prompt
-                names the PR by title. */}
-            {!awaitingFirstPaint && <ReviewButton repoRef={active} pull={actionPull} />}
-            <button
-              onClick={refreshDetail}
-              disabled={detailQuery.isFetching}
-              aria-label={i18nT('apps.issueRadar.components.prDetail.refresh_details', { subject: terms.changeRequestTitle })}
-              title={i18nT('apps.issueRadar.components.prDetail.re_fetch_this_and_its_timeline_from', { subject: terms.changeRequestShort, provider: terms.providerName })}
-              className="inline-flex items-center text-muted hover:text-text disabled:opacity-30 cursor-pointer bg-transparent p-1"
-            >
-              <RefreshCw size={14} className={detailQuery.isFetching ? 'animate-spin' : ''} />
-            </button>
-          </div>
-        </div>
+            </>}
+            identity={<>
+              <StatePill state={state} draft={draft} merged={merged} />
+              {/* Copy-link is an action control and lives in the overflow menu —
+                  see DetailOverflowMenu. Only the outbound #number stays here. */}
+              <a href={safeHttpUrl(detail?.url ?? pull.url ?? '') ?? undefined} target="_blank" rel="noreferrer" title={`Open on ${terms.providerName}`} className="font-mono text-muted hover:text-accent hover:underline">
+                #{pull.number}
+              </a>
+            </>}
+            /* TWO controls, per `max-two-buttons-per-row`. */
+            actions={<>
+              {/* Same reason as IssueDetail's Investigate: the review seed prompt
+                  names the PR by title. */}
+              {!awaitingFirstPaint && <ReviewButton repoRef={active} pull={actionPull} />}
+              {/* The trigger carries in-flight state for the actions it hosts;
+                  this pane has no state write, so refresh is the only one. */}
+              <DetailOverflowMenu pending={refreshing}>
+                {/* Keeps the menu OPEN on select: the copy affordance's whole
+                    feedback is the glyph flipping to a tick and back, and an item
+                    that closes the menu on select would take that confirmation
+                    off screen the instant it was earned. */}
+                <DropdownMenuItem onSelect={(e) => { e.preventDefault(); copyLink() }}>
+                  {copyStatus === 'copied'
+                    ? <Check size={13} className="shrink-0 text-ok" aria-hidden="true" />
+                    : copyStatus === 'failed'
+                      ? <AlertCircle size={13} className="shrink-0 text-danger" aria-hidden="true" />
+                      : <Copy size={13} className="shrink-0 text-muted" aria-hidden="true" />}
+                  {/* One span across all three states so the swap lands as an
+                      UPDATE to a live region a screen reader is already on,
+                      rather than three alternating nodes. */}
+                  <span aria-live="polite">
+                    {copyStatus === 'copied'
+                      ? i18nT('apps.issueRadar.components.prDetail.link_copied')
+                      : copyStatus === 'failed'
+                        ? i18nT('apps.issueRadar.components.prDetail.copy_failed')
+                        : i18nT('apps.issueRadar.components.prDetail.copy_link_to_this', { subject: terms.changeRequestTitle })}
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled={detailQuery.isFetching} onSelect={refreshDetail}>
+                  <RefreshCw size={13} className={`shrink-0 text-muted ${detailQuery.isFetching ? 'animate-spin' : ''}`} />
+                  <span>{i18nT('apps.issueRadar.components.prDetail.refresh_details', { subject: terms.changeRequestTitle })}</span>
+                </DropdownMenuItem>
+              </DetailOverflowMenu>
+            </>}
+            /* The review/comment composer needs the full header width, and a row
+               that grows in place keeps the title from reflowing when it opens.
+               It rides in the sticky bar so a reviewer can approve without
+               scrolling back to the top. */
+            extra={!awaitingFirstPaint && (
+              <div className="mt-2">
+                <PrActionsBar
+                  repoRef={active}
+                  pull={actionPull}
+                  detail={detail}
+                  canWrite={canWrite}
+                />
+              </div>
+            )}
+          />
 
-        {/* Actions on their own row rather than beside Review: the review/comment
-            composer needs the full header width, and a row that grows in place
-            keeps the title from reflowing when it opens. */}
-        {!awaitingFirstPaint && (
-          <div className="mt-3">
-            <PrActionsBar
-              repoRef={active}
-              pull={actionPull}
-              detail={detail}
-              canWrite={canWrite}
-            />
-          </div>
-        )}
-      </header>
-
-      {/* ── Scroll area: main column + sidebar ── */}
-      <div className="flex-1 min-h-0 overflow-hidden">
-        <div className="flex gap-6 px-6 py-5 h-full items-stretch">
-          <main className="flex-1 min-w-0 overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
+        {/* Stacked while narrow: side by side, the 236px sidebar took the
+            width out of the column holding the summary, description, files and
+            timeline, leaving it unreadable on a phone. */}
+        <div className="flex flex-col sm:flex-row gap-6 px-4 md:px-6 py-5 sm:flex-1 sm:min-h-0 sm:items-stretch">
+          {/* Scroll ownership is transferred WHOLE at the breakpoint. Keeping an
+              unconditional flex-1 + overflow-y-auto here would clamp this column
+              to the space a shrink-0 metadata block left over and then hide the
+              overflow behind scrollbar-none: on an issue with tall metadata the
+              description and timeline collapse into a near-zero inner window that
+              scrolls invisibly, and the wrapper scroller never engages because the
+              children already sum to the container. While narrow this takes its
+              natural height and the wrapper is the single scroller. */}
+          <main className="min-w-0 sm:flex-1 sm:overflow-y-auto scrollbar-none" style={{ scrollbarWidth: 'none' }}>
             <AiSummaryCard
               summary={aiQuery.data?.summary ?? ''}
               fromCache={aiQuery.data?.from_cache ?? false}
@@ -804,6 +894,9 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
                   />
                 )}
             </div>
+
+            {/* Dependency edges — blocked by / blocking (deps cache). */}
+            <DepsSection number={pull.number} />
 
             {/* Activity timeline — newest first, latest node pulsing. */}
             <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wider text-muted mb-3 font-medium">
@@ -867,7 +960,7 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
           </main>
 
           {/* Sidebar — the most useful PR metadata. */}
-          <aside className="w-[236px] flex-shrink-0 overflow-y-auto scrollbar-none text-[12.5px]" style={{ scrollbarWidth: 'none' }}>
+          <aside className="w-full sm:w-[236px] shrink-0 sm:overflow-y-auto scrollbar-none text-[12.5px]" style={{ scrollbarWidth: 'none' }}>
             {/* Auto review first — failing/running checks are the most
                 actionable thing on a PR. */}
             <AutoReviewChecks
@@ -1002,6 +1095,7 @@ export default function PrDetail({ pull }: { pull: PullRequest }) {
               </dl>
             </Section>
           </aside>
+        </div>
         </div>
       </div>
     </article>

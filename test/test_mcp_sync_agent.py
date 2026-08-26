@@ -18,6 +18,21 @@ from kiro_crew.dashboard.handlers.agents import (
 from kiro_crew.mcp_provenance import without_marker
 
 
+@pytest.fixture(autouse=True)
+def _owner_caller(monkeypatch):
+    """Run as the dashboard owner: these tests exercise handler behavior PAST
+    the owner boundary on the agents module's mutating endpoints, which has
+    its own enumerate-the-invariant coverage in
+    test_agents_endpoints_owner_auth.py."""
+    monkeypatch.setattr(
+        "kiro_crew.dashboard.handlers.agents.is_owner_dashboard_request",
+        lambda request: True,
+    )
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
 @pytest.fixture()
 def mcp_env(tmp_path: Path):
     """Set up agent config and global mcp.json in tmp_path."""
@@ -1260,10 +1275,9 @@ class TestOffloadedSyncHoldsTheConfigLock:
     """
 
     def test_every_offloaded_sync_is_under_the_config_lock(self) -> None:
-        from pathlib import Path
 
         lines = (
-            Path("src/kiro_crew/dashboard/handlers/mcp.py").read_text(encoding="utf-8").splitlines()
+            (_REPO_ROOT / "src/kiro_crew/dashboard/handlers/mcp.py").read_text(encoding="utf-8").splitlines()
         )
         offenders: list[str] = []
         for i, ln in enumerate(lines):

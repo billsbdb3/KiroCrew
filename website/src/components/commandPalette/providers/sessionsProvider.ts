@@ -1,13 +1,14 @@
 import { createElement } from 'react'
 import { MessageSquare } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { api } from '../../../api/client'
-import { useAppDispatch } from '../../../store'
+import { useAppDispatch, useAppSelector } from '../../../store'
 import { resumeFromHistory } from '../../../store/chatSlice'
-import { fuzzyMatch, makeScoreThenNameComparator, substringIndices } from '../../../utils/fuzzyMatch'
+import { useSelectInstance } from '../../../hooks/useSelectInstance'
+import { fuzzyMatch, substringIndices } from '../../../utils/fuzzyMatch'
 import { i18nT } from '../../../i18n/t'
 import type { Result, ResourceProvider } from '../types'
 
@@ -75,6 +76,10 @@ export interface SessionSearchItem {
   folder_id?: string
   memory_mode?: 'persistent' | 'incognito' | 'temporary'
   clean_mode?: boolean
+  /** Owning remote instance, present only on federated-search rows. */
+  instance_id?: string
+  /** Display name of the owning remote instance (raw, never translated). */
+  instance_name?: string
 }
 
 /** Shape of the `/api/sessions/search` response envelope. */
@@ -86,6 +91,8 @@ export interface SessionSearchResponse {
 export interface SessionRef {
   key: string
   title: string
+  /** Set for a remote instance's session: activating it switches panes. */
+  instanceId?: string
 }
 
 /**
@@ -157,21 +164,48 @@ export function createSessionsProvider(deps: SessionsProviderDeps): ResourceProv
         fid ? folders.find((f) => f.id === fid)?.name : undefined
       const sessions = data?.sessions ?? []
 
-      const results: Result[] = sessions.map((s) => {
+      // Backend position per row id, used as the sort tiebreak below. Kept in a
+      // parallel Map rather than on the row itself so the shared `Result` type
+      // (../types) is not widened with a field only this provider can populate.
+      const backendIndexById = new Map<string, number>()
+
+      const results: Result[] = sessions.map((s, backendIndex) => {
         const title = s.title || s.key
         // Highlight + client-side rank bias; never used to drop backend hits.
         const match = fuzzyMatch(q, title)
-        const ref: SessionRef = { key: s.key, title }
+        const remote = Boolean(s.instance_id)
+        const ref: SessionRef = { key: s.key, title, instanceId: s.instance_id }
         // Body match: show the snippet (why it surfaced) with the query
-        // highlighted; else fall back to the agent name.
+        // highlighted; else fall back to the agent name. Remote rows prefix the
+        // owning instance's raw name so identical titles from two gateways are
+        // distinguishable at a glance.
         const snippet = s.snippet?.trim()
         const subIdx = snippet ? substringIndices(q, snippet) : undefined
+        const baseSubtitle = snippet || s.agent || undefined
+        const prefix = remote ? `${s.instance_name || s.instance_id} · ` : ''
+        const subtitle = remote
+          ? [s.instance_name || s.instance_id, baseSubtitle].filter(Boolean).join(' · ')
+          : baseSubtitle
+        // Highlight offsets are computed against the bare snippet; a remote
+        // row's instance-name prefix shifts the snippet within the rendered
+        // subtitle, so shift the offsets by the prefix length instead of
+        // dropping the highlights (identical-looking rows should behave the
+        // same). Only applicable when the snippet is actually the subtitle
+        // body (subIdx exists only when a snippet does).
+        const shiftedIdx =
+          subIdx && subIdx.length
+            ? remote && snippet
+              ? subIdx.map((i) => i + prefix.length)
+              : subIdx
+            : undefined
+        const id = remote ? `${PROVIDER_ID}:${s.instance_id}:${s.key}` : `${PROVIDER_ID}:${s.key}`
+        backendIndexById.set(id, backendIndex)
         return {
-          id: `${PROVIDER_ID}:${s.key}`,
+          id,
           providerId: PROVIDER_ID,
           title,
-          subtitle: snippet || s.agent || undefined,
-          subtitleIndices: subIdx && subIdx.length ? subIdx : undefined,
+          subtitle,
+          subtitleIndices: shiftedIdx,
           folder: folderName(s.folder_id),
           icon: sessionIcon(),
           score: match ? match.score : 0,
@@ -184,15 +218,33 @@ export function createSessionsProvider(deps: SessionsProviderDeps): ResourceProv
           // `onActivate`) and as the legacy/mouse fallback.
           enter: { kind: 'open-session', sessionKey: s.key, title },
           onActivate: () => openSession(ref),
-          onCmdActivate: openInSplit ? () => openInSplit(ref) : undefined,
+          // A remote session cannot open in the LOCAL split grid — its
+          // transcript lives on the other gateway. A bare `undefined` here is
+          // NOT enough: the palette's dispatchEnter falls back to onActivate
+          // when onCmdActivate is absent, so ⌘Enter would silently switch
+          // panes. Bind an explicit no-op so the modifier chord stays inert
+          // on remote rows.
+          onCmdActivate: remote ? () => {} : openInSplit ? () => openInSplit(ref) : undefined,
         }
       })
 
-      // Title matches first, then deterministic name order. Skip the re-rank on
-      // an empty query so the backend's recency ordering is preserved (Sessions
-      // tab + All-tab recents rely on it).
+      // Title matches first, then the BACKEND's relevance order as the tiebreak
+      // (issue #4568). `search_sessions` already ranked these rows (weighted
+      // occurrence counts, phrase bonus, recency boost); an alphabetical
+      // fallback threw that ranking away whenever every hit was a body match
+      // (all scores 0 — e.g. searching a PR number that appears in transcripts
+      // but never in a title). Backend index is just as deterministic for
+      // rendering, and strictly more useful. Deliberately NOT the shared
+      // `makeScoreThenNameComparator`: its name tiebreak is right for the nine
+      // providers that score locally, wrong here where the server has already
+      // ranked. Skip the re-rank on an empty query so the backend's recency
+      // ordering is preserved as-is (Sessions tab + All-tab recents rely on it).
       if (q.length > 0) {
-        results.sort(makeScoreThenNameComparator<Result>(r => r.score, r => r.title))
+        results.sort(
+          (a, b) =>
+            b.score - a.score ||
+            (backendIndexById.get(a.id) ?? 0) - (backendIndexById.get(b.id) ?? 0),
+        )
       }
       return results
     },
@@ -212,22 +264,71 @@ export function createSessionsProvider(deps: SessionsProviderDeps): ResourceProv
  *
  * @param opts.openInSplit - Optional Session Grid opener supplied by the
  *   palette host; when omitted, ⌘Enter is unbound for session rows.
+ * @param opts.active - Whether this provider's own background queries may run.
+ *   Defaults to true, which is the palette's behaviour: it mounts its providers
+ *   when the palette opens and searching is the point. A host that constructs the
+ *   provider BEFORE the user has asked for session search -- a launcher whose first
+ *   page is deliberately request-free -- passes false until the search surface is
+ *   actually entered, so merely building the provider issues nothing. `search()`
+ *   is unaffected either way; it is an imperative call, not a subscription.
  */
 export function useSessionsProvider(opts?: {
   openInSplit?: (ref: SessionRef) => void
+  active?: boolean
 }): ResourceProvider {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const openInSplit = opts?.openInSplit
+  const active = opts?.active ?? true
+  // True when at least one remote instance holds a live connection; drives the
+  // federated-vs-local endpoint choice per keystroke without rebuilding the
+  // provider (read via ref inside the memoized fetch). Guarded read: the
+  // palette mounts in many test harnesses whose partial stores omit the
+  // instances slice.
+  const hasWarmInstances = useAppSelector(
+    (s) => Object.keys(s.instances?.warm ?? {}).length > 0,
+  )
+  const hasWarmRef = useRef(hasWarmInstances)
+  hasWarmRef.current = hasWarmInstances
+  // Shared ['instances'] cache (same key the tab bar subscribes to) feeds the
+  // shared select-and-maybe-reconnect semantics; enabled only while a warm
+  // connection exists, so a peerless install never issues the query (and never
+  // hits the 403 when the instances feature is disabled).
+  const instancesQuery = useQuery({
+    queryKey: ['instances'],
+    queryFn: () => api.listInstances(),
+    // `active` is what keeps a request-free host request-free: constructing the
+    // provider must not subscribe anything until its surface is entered.
+    enabled: active && hasWarmInstances,
+  })
+  // Memoize the `[]` fallback so its identity is stable across renders (same
+  // pattern as InstanceTabBar) — it feeds selectInstance's useCallback deps.
+  const instancesData = instancesQuery.data?.instances
+  const instances = useMemo(() => instancesData ?? [], [instancesData])
+  const { selectInstance } = useSelectInstance(instances)
 
   return useMemo(
     () =>
       createSessionsProvider({
         fetchSessions: (q) =>
           queryClient.fetchQuery<SessionSearchResponse>({
-            queryKey: ['palette', 'sessions', q],
-            queryFn: () => api.sessionsSearch(q),
+            // The endpoint is part of the key: federated and local replies for
+            // the same q are different result sets and must not share a cache
+            // entry across a connect/disconnect.
+            queryKey: ['palette', 'sessions', hasWarmRef.current ? 'federated' : 'local', q],
+            queryFn: async () => {
+              if (!hasWarmRef.current) return api.sessionsSearch(q)
+              try {
+                // Backend merges local + every connected peer (rank-interleaved),
+                // so this REPLACES the local call rather than adding to it.
+                return (await api.instancesSearchSessions(q)) as SessionSearchResponse
+              } catch {
+                // 403 (instances feature off), a peerless hub mid-teardown, or
+                // any transient failure: the local search is always the floor.
+                return api.sessionsSearch(q)
+              }
+            },
             staleTime: SESSIONS_STALE_MS,
           }),
         // Shared ['chat-folders'] cache (sidebar + recents use the same key),
@@ -239,6 +340,14 @@ export function useSessionsProvider(opts?: {
             staleTime: SESSIONS_STALE_MS,
           }),
         openSession: (ref) => {
+          if (ref.instanceId) {
+            // A remote session lives on another gateway: switch to (and, if
+            // needed, reconnect) that instance's pane. Deep-linking into the
+            // specific session inside the embedded SPA is a follow-up — the
+            // iframe protocol has no open-session message yet.
+            selectInstance(ref.instanceId)
+            return
+          }
           void dispatch(resumeFromHistory(ref))
           // The palette can be opened from ANY page (artifacts, settings, …);
           // resumeFromHistory only activates the slot in the store, so land
@@ -247,6 +356,6 @@ export function useSessionsProvider(opts?: {
         },
         openInSplit,
       }),
-    [dispatch, navigate, queryClient, openInSplit],
+    [dispatch, navigate, queryClient, openInSplit, selectInstance],
   )
 }

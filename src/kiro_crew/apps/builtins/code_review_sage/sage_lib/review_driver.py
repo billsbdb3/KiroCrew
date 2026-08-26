@@ -90,8 +90,8 @@ if _APP_ROOT not in sys.path:  # allow `python3 sage_lib/review_driver.py` (run 
 
 from sage_lib import (  # noqa: E402
     adapters,
-    chat_session,
     discovery,
+    followup,
     pipeline,
     report,
     results,
@@ -119,7 +119,17 @@ DEFAULT_REPORT_RETENTION = 20    # keep the N most-recent report artifacts; prun
 
 def _api_request(method: str, path: str, body: dict | None = None, timeout: int = 30) -> dict:
     """Authenticated loopback call to the gateway API. Never raises."""
-    base, secret = _gateway_base(), _local_secret()
+    base = _gateway_base()
+    # The credential belongs to the gateway this call DIALS, so it is read for the
+    # port carried by the resolved base rather than from the home-wide file, which
+    # names whichever generation wrote it last. An unparseable base leaves no dial
+    # target to name, and a credential for an unknown gateway is not a thing that
+    # exists -- so that is an error, not a reason to fall back to a home-wide read.
+    try:
+        base_port = int(base.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return {"error": f"could not read a port from the gateway base {base!r}"}
+    secret = _local_secret(base_port)
     if not secret:
         return {"error": "gateway IPC secret unavailable"}
     headers = {"X-Internal-Secret": secret}
@@ -257,6 +267,46 @@ def _confirmed_host(link: str) -> str:
         return ""
 
 
+def python_command() -> str:
+    """Absolute interpreter the worker must use for the app's ``sage_lib/...`` commands.
+
+    The prompts hand a session on some host shell a command line, so they have to
+    name an interpreter that exists there. ``python3`` does not: neither the
+    python.org installer nor ``python -m venv`` creates a ``python3.exe`` on
+    Windows, where the name instead resolves to a Microsoft Store app-execution
+    alias that runs no Python — the command then produces no result record and
+    the review yields nothing while looking like it ran. ``sys.executable`` is an
+    absolute path to a real interpreter on every platform, so it satisfies that.
+
+    This returns the path RAW, and deliberately does no shell quoting. Quoting
+    requires knowing the worker's shell, which is not pinned: on Windows the
+    session may get PowerShell or cmd, and the two disagree — a quoted path is a
+    string literal needing PowerShell's call operator in one and a syntax error
+    with that operator in the other. Since a Windows profile with a space in it
+    (``C:\\Users\\First Last\\...``) is ordinary rather than exceptional, guessing
+    wrong would restore the same silent no-result failure for a large share of
+    Windows users. The worker knows its own shell, so the prompt tells it to
+    quote as that shell requires.
+    Deliberately NOT the shared ``resolve_app_python(app_root)`` policy, which
+    prefers ``<app_root>/.venv``'s interpreter. ``store.app_root()`` resolves under
+    ``KIROCREW_HOME`` -- the same writable tree the review worker itself writes into,
+    and that worker is prompt-injectable. A worker that planted an executable at
+    ``.venv/Scripts/python.exe`` would have the NEXT review execute it: arbitrary
+    code execution as the gateway plus forged result records, and persistence into
+    a later run rather than a capability it already had. So the interpreter is taken
+    from the process the prompt is built IN, never from a path the worker can write.
+
+    Nothing is given up by declining the venv preference here. That preference
+    exists so an app's own dependencies are importable, and this app has no
+    ``requirements.txt``; the only non-stdlib import anywhere in ``sage_lib`` is
+    ``kiro_crew`` itself, which is importable under ``sys.executable`` by
+    construction because that is the interpreter running the gateway. An app venv
+    would in fact be the weaker choice: it need not have ``kiro_crew`` installed
+    at all, which would fail every ``sage_lib`` import instead of just the review.
+    """
+    return sys.executable
+
+
 def _fetch_instruction(link: str) -> str:
     """Platform-aware FETCH instruction for the gate/deep prompts (GitHub only),
     carrying the link's confirmed host so the worker pulls the PR from ITS
@@ -315,17 +365,12 @@ def build_consolidation_task(namespace: str, live_path: str, candidate_path: str
 logger = logging.getLogger(__name__)
 
 
-def _close_retained_chat(run_id: str, change_id: str) -> None:
-    """Drop the post-review chat for this review, best-effort.
-
-    Routed through ``chat_session.close_soon`` because this runs on a
-    ThreadPoolExecutor worker: there is no running loop here, so scheduling the
-    close directly would fail every time and silently leave the chat live.
-    """
+def _forget_followup(run_id: str, change_id: str) -> None:
+    """Drop this review's kept transcript, best-effort."""
     try:
-        chat_session.close_soon(chat_session.chat_key(run_id, change_id))
+        followup.forget(run_id, change_id)
     except Exception:  # pragma: no cover - never break the review
-        logger.debug("closing the retained chat failed", exc_info=True)
+        logger.debug("dropping the kept review transcript failed", exc_info=True)
 
 
 def _accepts_kwarg(dispatch: Callable[..., Any], name: str) -> bool:
@@ -355,17 +400,22 @@ def build_review_task(change_link: str) -> str:
     separate gated stage; the driver runs neither a gate turn nor a convergence
     loop. The session RECORDS findings only — it never posts (the driver builds the
     Python-redacted bodies and a separate poster publishes them verbatim)."""
+    py = python_command()
     return (
         "You are a Code Review Sage reviewer running in an ISOLATED, CLEAN session. "
         "Do the COMPLETE review of EXACTLY ONE change in a SINGLE thorough pass: "
         + change_link + ". There is NO separate gate and NO follow-up round — cover "
         "everything now, carefully, at maximum thinking effort.\n"
+        "Run every `sage_lib/...` command — the ones below AND the ones the skill "
+        "writes as `<python> ...` — with this interpreter: `" + py + "`. Use that "
+        "absolute path verbatim (quote it as YOUR shell requires if it contains "
+        "spaces); do NOT substitute `python3` or `python`.\n"
         "Load the `sage-review` skill and follow its per-change review ruleset:\n"
         "  1. Self-heal the store; load patterns from active namespaces "
-        "(`python3 sage_lib/learning.py list-for-review`).\n"
+        "(`" + py + " sage_lib/learning.py list-for-review`).\n"
         "  2. Resolve the per-repo rule pack (if any) and apply it as additional rules.\n"
         "  3. Fetch the change — " + _fetch_instruction(change_link) + " — and "
-        "normalize via `python3 sage_lib/pipeline.py prepare --link " + change_link
+        "normalize via `" + py + " sage_lib/pipeline.py prepare --link " + change_link
         + " --payload-file <file>`.\n"
         "  4. DESIGN dimension (THINK DEEPLY — highest leverage): work the change "
         "through the skill's `Deep design reasoning` lenses (architectural fit, "
@@ -412,7 +462,7 @@ def build_review_task(change_link: str) -> str:
         "  8. If this change is itself a FIX (is_fix), run INLINE miss-analysis "
         "(learn-from-sage): trace the introducing change, ask which dimension was "
         "blind, and STAGE the learning "
-        "(`python3 sage_lib/learning.py stage --file <pattern.json> --source fix_introduce`) "
+        "(`" + py + " sage_lib/learning.py stage --file <pattern.json> --source fix_introduce`) "
         "— NOT applied to the live ruleset until a human consolidates.\n"
         "Do NOT spawn further subagents. Execute; do not ask questions."
     )
@@ -424,16 +474,21 @@ def build_review_followup_task(change_link: str) -> str:
     changed files and APPENDS only net-new findings (never repeats/removes existing
     ones), then marks coverage complete. It runs at most one targeted pass,
     signal-driven, not count-delta-driven."""
+    py = python_command()
     return (
         "You are a Code Review Sage reviewer running in an ISOLATED, CLEAN session. "
         "A prior pass reviewed EXACTLY ONE change: " + change_link + " but reported "
         "INCOMPLETE file coverage (coverage_complete=false) in data/results/<id>.json.\n"
+        "Run every `sage_lib/...` command — the ones below AND the ones the skill "
+        "writes as `<python> ...` — with this interpreter: `" + py + "`. Use that "
+        "absolute path verbatim (quote it as YOUR shell requires if it contains "
+        "spaces); do NOT substitute `python3` or `python`.\n"
         "Load the `sage-review` skill and follow its per-change review ruleset:\n"
         "  1. Self-heal the store; load patterns "
-        "(`python3 sage_lib/learning.py list-for-review`).\n"
+        "(`" + py + " sage_lib/learning.py list-for-review`).\n"
         "  2. Resolve the per-repo rule pack (if any) and apply it as additional rules.\n"
         "  3. Fetch the change — " + _fetch_instruction(change_link) + " — and "
-        "normalize via `python3 sage_lib/pipeline.py prepare --link " + change_link
+        "normalize via `" + py + " sage_lib/pipeline.py prepare --link " + change_link
         + " --payload-file <file>`. READ the existing record: its `findings` and "
         "`files_covered`.\n"
         "  4. Review ONLY the changed files NOT already in `files_covered`, against "
@@ -522,8 +577,23 @@ _RESOLVED_BASE: str | None = None
 
 
 def _candidate_ports() -> list[int]:
-    """Ports to try for the live gateway: KIROCREW_PORT, config.json dashboard.url,
-    then the common gateway range (the gateway may be on 5477+ if 5476 was taken)."""
+    """Ports this process can claim as ITS OWN gateway, in order of authority.
+
+    Only self-declared sources are eligible: ``KIROCREW_BOUND_PORT`` (exported by
+    the parent gateway once its listener is bound), then ``KIROCREW_PORT``, then this
+    home's ``config.json`` ``dashboard.url``. The bound port leads because it carries
+    the port actually held: a gateway asked for 5476 but given 5477 has the truth
+    only there, and a ``--port auto`` gateway has no other numeric source at all.
+    A pod deliberately drops it so it never inherits its parent's listener.
+
+    A blind sweep of the common gateway range is deliberately NOT included, because
+    every probe carries that port's own credential -- so a sweep would authenticate
+    against whichever sibling gateway answered first and this app would then create
+    and delete review artifacts in that instance's store. A port we cannot justify
+    as ours is not a discovery candidate; when no source names one the caller falls
+    back to the default and the request errors clearly, which fails closed instead
+    of writing to a stranger.
+    """
     out: list[int] = []
 
     def _add(v) -> None:
@@ -534,6 +604,7 @@ def _candidate_ports() -> list[int]:
         if 1 <= p <= 65535 and p not in out:
             out.append(p)
 
+    _add(os.environ.get("KIROCREW_BOUND_PORT"))
     _add(os.environ.get("KIROCREW_PORT"))
     try:
         cfg = store.crew_home() / "config.json"
@@ -545,8 +616,6 @@ def _candidate_ports() -> list[int]:
                 _add(m.group(1))
     except Exception:
         pass
-    for p in (5476, 5477, 5478, 5479, 5480, 5486):
-        _add(p)
     return out
 
 
@@ -575,19 +644,50 @@ def _gateway_base() -> str:
     global _RESOLVED_BASE
     if _RESOLVED_BASE:
         return _RESOLVED_BASE
-    secret = _local_secret()
     ports = _candidate_ports()
     for port in ports:
         base = f"http://localhost:{port}"
-        if _probe(base, secret):
+        # Each candidate is probed with ITS OWN credential. A single secret read
+        # before the loop comes from the home-wide file, which holds one slot per
+        # data home: on a host running more than one gateway that names whichever
+        # generation wrote last, so every probe against the others 403s and the
+        # resolution falls through to a guess.
+        if _probe(base, _local_secret(port)):
             _RESOLVED_BASE = base
             return base
-    # best guess; the request will error clearly if wrong
-    return f"http://localhost:{ports[0] if ports else '5476'}"
+    # No candidate answered. Fall back only to a port a source positively NAMED
+    # (ports[0]); do NOT invent 5476. An unnamed default is a guess, and dialing it
+    # with its own credential is how a report write lands in whatever SIBLING gateway
+    # happens to own that port. When no source names a port at all, there is no base
+    # to justify -- return empty so _api_request fails closed with a clear error
+    # rather than authenticating against a stranger.
+    return f"http://localhost:{ports[0]}" if ports else ""
 
 
-def _local_secret() -> str:
-    """Read the gateway IPC secret (same mechanism the MCP server uses)."""
+def _local_secret(port: int) -> str:
+    """Credential for the gateway on *port*, via the shared resolver.
+
+    The per-port-then-shared order lives in ``config.loader.read_local_secret``;
+    duplicating it here would give this surface its own copy to drift. Only the
+    fallback differs: this app addresses its data home through ``store.crew_home()``,
+    so a home-wide read is retried against that when the shared resolver finds
+    nothing.
+
+    *port* is required for the same reason it is required there: the credential is
+    only valid for the gateway it belongs to, so the dial target is never inferred.
+    """
+    try:
+        # Optional dependency, so function-local: this app also runs STANDALONE,
+        # outside the Kiro Crew package, where this import raises and the
+        # crew_home() read below is the only resolution available. A module-scope
+        # import would make the module itself unimportable there.
+        from kiro_crew.config.loader import read_local_secret
+
+        secret = read_local_secret(port)
+        if secret:
+            return secret
+    except Exception:
+        pass
     try:
         return (store.crew_home() / ".local_secret").read_text(encoding="utf-8").strip()
     except Exception:
@@ -1086,14 +1186,14 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
                 "skipped_reason": "review_failed",
             }
         slot_clear = results.stake_shared(change_id, root)
-        # Keep THIS session (the deep review) for post-review chat: the findings'
-        # reasoning is in its context, so it is the only one worth asking. The
+        # Keep THIS session (the deep review) resumable: the findings' reasoning
+        # is in its context, so it is the only one worth asking about. The
         # gate/follow-up/post sessions are not kept.
         review_kwargs: dict[str, Any] = {}
         if _accepts_activity(dispatch):
             review_kwargs["on_activity"] = report
         if _accepts_kwarg(dispatch, "keep_session_key"):
-            review_kwargs["keep_session_key"] = chat_session.chat_key(
+            review_kwargs["keep_session_key"] = followup.chat_key(
                 run_id or "", change_id)
         review_spawn = dispatch(review_prompt, timeout, **review_kwargs)
         # The worker writes the shared data/results/<id>.json its prompt names;
@@ -1151,22 +1251,23 @@ def run_review(changes: list[str], *, dispatch=None, archiver=_default_archiver,
                 followup_prompt: str | None = build_review_followup_task(link)
             except pipeline.adapters.AdapterError:
                 followup_prompt = None
-            followup = (dispatch(followup_prompt, timeout)
-                        if followup_prompt and (published or not run_id)
-                        else {"ok": False})
-            if followup.get("ok", False):
+            second_pass = (dispatch(followup_prompt, timeout)
+                           if followup_prompt and (published or not run_id)
+                           else {"ok": False})
+            if second_pass.get("ok", False):
                 results.adopt_from_shared(change_id, root, run_id)
                 rev_rec = results.read_result(change_id, root, run_id) or rev_rec
                 rec["deep_rounds"] = 2
                 rec["deep_reviewed"] = bool((rev_rec or {}).get("deep_reviewed"))
-                # The retained chat is the FIRST pass's session, and this
+                # The kept transcript is the FIRST pass's session, and this
                 # follow-up just added findings for files that pass never saw.
                 # Asking it about one of those would get a confident answer
-                # reconstructed from nothing — worse than having no chat. The
-                # follow-up's own session is no better (it only covered the
-                # remainder), so neither holds the whole record: close the chat
-                # and let the panel offer nothing rather than something wrong.
-                _close_retained_chat(run_id or "", change_id)
+                # reconstructed from nothing — worse than having no follow-up at
+                # all. The follow-up pass's own session is no better (it only
+                # covered the remainder), so neither holds the whole record: drop
+                # the kept transcript and let the panel offer nothing rather than
+                # something wrong.
+                _forget_followup(run_id or "", change_id)
 
         counts = (rev_rec or {}).get("counts") or {}
         red, yellow = counts.get("red", 0), counts.get("yellow", 0)

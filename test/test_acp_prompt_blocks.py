@@ -103,8 +103,15 @@ class TestBuildPromptBlocks:
 
     @pytest.mark.parametrize("suffix,mime", sorted(IMAGE_MEDIA_TYPES.items()))
     def test_every_supported_suffix_maps_to_its_mime(self, tmp_path, suffix, mime):
+        # Fixtures are format-faithful (real bytes per format, not one PNG
+        # renamed): the emitted mimeType tracks the header-DETECTED format,
+        # because the backend validates the bytes, not the file extension.
+        pil = pytest.importorskip("PIL.Image")
+        fmt = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG",
+               ".gif": "GIF", ".webp": "WEBP", ".bmp": "BMP"}[suffix]
         p = tmp_path / f"img{suffix}"
-        p.write_bytes(_PNG)
+        mode = "P" if fmt == "GIF" else "RGB"
+        pil.new(mode, (2, 2)).save(p, format=fmt)
         blocks = build_prompt_blocks(f"see {p}")
         assert blocks[1]["mimeType"] == mime
 
@@ -501,11 +508,17 @@ class TestImageDownscale:
 
 
 def _noise_image(tmp_path, w, h, name="noise.png", fmt="PNG"):
-    """An image that resists compression, so its encoded size tracks pixel count."""
+    """An image that resists compression, so its encoded size tracks pixel count.
+
+    Built from one bytes buffer rather than a list of per-pixel tuples: at
+    2400x2400 that list is 5.76M three-tuples, ~390 MiB of transient peak for a
+    17 MB image, and it was the largest single-test excursion in the suite. A
+    worker's high-water mark is what the memory budget has to reserve for, so a
+    spike nobody sees still costs every other worker headroom.
+    """
     pil = pytest.importorskip("PIL.Image")
     rnd = random.Random(1234)
-    img = pil.new("RGB", (w, h))
-    img.putdata([(rnd.randrange(256), rnd.randrange(256), rnd.randrange(256)) for _ in range(w * h)])
+    img = pil.frombytes("RGB", (w, h), rnd.randbytes(w * h * 3))
     p = tmp_path / name
     img.save(p, format=fmt)
     return p
@@ -524,8 +537,10 @@ class TestImageEncodedBudget:
         assert prompt_blocks.MAX_IMAGE_B64_BYTES == 5 * 1024 * 1024
 
     def test_b64_len_matches_real_encoding(self):
+        from kiro_crew.imaging import _b64_len
+
         for n in (0, 1, 2, 3, 4, 100, 1023, 4096):
-            assert prompt_blocks._b64_len(n) == len(base64.b64encode(b"x" * n))
+            assert _b64_len(n) == len(base64.b64encode(b"x" * n))
 
     def test_image_inside_dimension_cap_but_over_budget_is_shrunk(self, tmp_path):
         """The exact production defect: dimensions are already legal, so the

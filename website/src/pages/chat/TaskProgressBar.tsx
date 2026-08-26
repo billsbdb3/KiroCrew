@@ -6,6 +6,7 @@ import type { TodoList } from '../../types'
 import { useRowDisclosure } from './rowDisclosure'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 /** Rows rendered before the list scrolls internally — bounds DOM on long plans. */
 const MAX_VISIBLE_ROWS = 12
 
@@ -21,6 +22,7 @@ const MAX_VISIBLE_ROWS = 12
  * absent at the data layer.
  */
 const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: { slot: string | null; disclosureKey?: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
   // Select the primitive-bearing todo object for this slot only, so unrelated
   // slot churn in the slots array doesn't re-render the pill.
@@ -43,7 +45,7 @@ const TaskProgressBar = memo(function TaskProgressBar({ slot, disclosureKey }: {
   const pct = total > 0 ? Math.round((done / total) * 100) : 0
 
   return (
-    <div className="px-5 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
+    <div className="px-4 mx-auto w-full" style={{ maxWidth: 'var(--mc-content-width, 900px)' }}>
       {/* Collapsed = a small pill that hugs its content; expanded = a full-width
           panel. Keeping the collapsed state inline stops it reading as another
           full-width bar competing with the composer below it. */}

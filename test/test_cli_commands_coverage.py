@@ -19,6 +19,7 @@ import argparse
 import io
 import json
 import urllib.error
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -27,9 +28,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from kiro_crew import cli_commands as cc
+from kiro_crew import sel as sel_mod
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, WorkspaceConfig
 from kiro_crew.cron import CronSchedule
 from kiro_crew.eval.scenario import AssertionType
+from kiro_crew.vector_memory import LessonWriteOutcome, LessonWriteResult
 
 # ── helpers ──
 
@@ -38,7 +41,9 @@ def _ns(**kw: Any) -> argparse.Namespace:
     return argparse.Namespace(**kw)
 
 
-def _http_error(code: int, body: bytes | None = None, reason: str = "Boom") -> urllib.error.HTTPError:
+def _http_error(
+    code: int, body: bytes | None = None, reason: str = "Boom"
+) -> urllib.error.HTTPError:
     """Build an ``HTTPError`` whose ``.read()`` yields *body*."""
     fp = io.BytesIO(body if body is not None else b"")
     return urllib.error.HTTPError("http://localhost/x", code, reason, {}, fp)  # type: ignore[arg-type]
@@ -93,13 +98,14 @@ def _cfg_with(
 class TestSmallHelpers:
     def test_internal_secret_reads_file(self, tmp_path: Path) -> None:
         (tmp_path / ".local_secret").write_text("  s3cr3t\n", encoding="utf-8")
-        with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
-            assert cc._internal_secret() == "s3cr3t"
+        with patch("kiro_crew.cli_commands.read_local_secret", return_value="s3cr3t") as read:
+            assert cc._internal_secret(6123) == "s3cr3t"
+        read.assert_called_once_with(6123)
 
     def test_internal_secret_missing_file_is_empty(self, tmp_path: Path) -> None:
         """A missing secret must yield "" so the server answers 403, not a crash."""
-        with patch("kiro_crew.cli_commands.config_dir", return_value=tmp_path):
-            assert cc._internal_secret() == ""
+        with patch("kiro_crew.cli_commands.read_local_secret", return_value=""):
+            assert cc._internal_secret(6123) == ""
 
     def test_format_schedule_non_schedule_falls_back_to_str(self) -> None:
         assert cc._format_schedule("weekly-ish") == "weekly-ish"
@@ -153,8 +159,12 @@ class TestWorkspaceDirGuard:
 
 
 class TestSpawnCli:
-    def test_list_prints_agents_with_status_glyphs(self, capsys: pytest.CaptureFixture[str]) -> None:
-        payload = {"agents": [{"id": "a1", "task": "do x", "done": True}, {"id": "a2", "task": "y"}]}
+    def test_list_prints_agents_with_status_glyphs(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        payload = {
+            "agents": [{"id": "a1", "task": "do x", "done": True}, {"id": "a2", "task": "y"}]
+        }
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value="s"),
             patch("kiro_crew.cli_commands.loopback_urlopen", return_value=_FakeResponse(payload)),
@@ -166,7 +176,10 @@ class TestSpawnCli:
     def test_list_empty_says_so(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value=""),
-            patch("kiro_crew.cli_commands.loopback_urlopen", return_value=_FakeResponse({"agents": []})),
+            patch(
+                "kiro_crew.cli_commands.loopback_urlopen",
+                return_value=_FakeResponse({"agents": []}),
+            ),
         ):
             cc._spawn(_ns(spawn_action="list", port=1234))
         assert "No subagents." in capsys.readouterr().out
@@ -189,7 +202,9 @@ class TestSpawnCli:
     ) -> None:
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value=""),
-            patch("kiro_crew.cli_commands.loopback_urlopen", side_effect=_http_error(503, b"<html>")),
+            patch(
+                "kiro_crew.cli_commands.loopback_urlopen", side_effect=_http_error(503, b"<html>")
+            ),
             pytest.raises(SystemExit),
         ):
             cc._spawn(_ns(spawn_action="list", port=1234))
@@ -200,7 +215,10 @@ class TestSpawnCli:
     ) -> None:
         with (
             patch("kiro_crew.cli_commands._internal_secret", return_value=""),
-            patch("kiro_crew.cli_commands.loopback_urlopen", side_effect=urllib.error.URLError("refused")),
+            patch(
+                "kiro_crew.cli_commands.loopback_urlopen",
+                side_effect=urllib.error.URLError("refused"),
+            ),
             pytest.raises(SystemExit) as exc,
         ):
             cc._spawn(_ns(spawn_action="list", port=4321))
@@ -344,9 +362,7 @@ class TestAppCli:
         out = capsys.readouterr().out
         assert "one" in out and "enabled" in out and "two" in out and "disabled" in out
 
-    def test_enable_success_counts_registrations(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_enable_success_counts_registrations(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
             patch("kiro_crew.cli_commands.enable_app", return_value=_result(True, message="on")),
             patch(
@@ -398,9 +414,7 @@ class TestAppCli:
         with (
             patch("kiro_crew.cli_commands._cleanup_app_crons_from_scheduler"),
             patch("kiro_crew.cli_commands.deregister_app"),
-            patch(
-                "kiro_crew.cli_commands.uninstall_app", return_value=_result(True)
-            ) as uninstall,
+            patch("kiro_crew.cli_commands.uninstall_app", return_value=_result(True)) as uninstall,
         ):
             cc._handle_app(_ns(app_action="uninstall", name="demo", purge_data=purge))
         uninstall.assert_called_once_with("demo", keep_data=expect_keep_data)
@@ -496,8 +510,12 @@ class TestAppCli:
 class TestRunAppMcpServer:
     def test_missing_module_exits_1_on_stderr(self, capsys: pytest.CaptureFixture[str]) -> None:
         """stdout is the JSON-RPC channel -- diagnostics must go to stderr."""
+        target = "kiro_crew.apps.builtins.my_app.mcp_server"
         with (
-            patch("importlib.import_module", side_effect=ImportError("nope")),
+            patch(
+                "importlib.import_module",
+                side_effect=ModuleNotFoundError(f"No module named {target!r}", name=target),
+            ),
             pytest.raises(SystemExit) as exc,
         ):
             cc._run_app_mcp_server("my-app")
@@ -505,6 +523,44 @@ class TestRunAppMcpServer:
         assert exc.value.code == 1
         assert captured.out == ""
         assert "my-app" in captured.err
+
+    def test_missing_parent_package_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A ModuleNotFoundError naming a PARENT package of the target is the
+        target being unimportable -- same clean refusal."""
+        parent = "kiro_crew.apps.builtins.my_app"
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=ModuleNotFoundError(f"No module named {parent!r}", name=parent),
+            ),
+            pytest.raises(SystemExit) as exc,
+        ):
+            cc._run_app_mcp_server("my-app")
+        assert exc.value.code == 1
+        assert "my-app" in capsys.readouterr().err
+
+    def test_missing_dependency_inside_module_propagates(self) -> None:
+        """A dependency missing INSIDE mcp_server.py is a real defect: it must
+        keep its traceback, not exit with a misleading 'has no MCP server'."""
+        with (
+            patch(
+                "importlib.import_module",
+                side_effect=ModuleNotFoundError(
+                    "No module named 'some_missing_dep'", name="some_missing_dep"
+                ),
+            ),
+            pytest.raises(ModuleNotFoundError, match="some_missing_dep"),
+        ):
+            cc._run_app_mcp_server("my-app")
+
+    def test_nameless_import_error_propagates(self) -> None:
+        """An ImportError that names no module cannot be attributed to the
+        target -- it must propagate."""
+        with (
+            patch("importlib.import_module", side_effect=ModuleNotFoundError("boom")),
+            pytest.raises(ModuleNotFoundError, match="boom"),
+        ):
+            cc._run_app_mcp_server("my-app")
 
     def test_module_without_runner_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
@@ -896,6 +952,48 @@ class TestSecurityCli:
             cc._security(_ns(sec_action="events", limit=5))
         assert "No security events recorded." in capsys.readouterr().out
 
+    def test_events_passes_the_time_window_through(self) -> None:
+        """``-n`` alone cannot express "the last two hours" (issue #4843)."""
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            sel.return_value.recent.return_value = []
+            cc._security(
+                _ns(sec_action="events", limit=5, since="2026-08-21T00:00:00Z", until="2h")
+            )
+        kwargs = sel.return_value.recent.call_args.kwargs
+        assert kwargs["since"] == datetime(2026, 8, 21, tzinfo=timezone.utc)
+        assert kwargs["until"] is not None and kwargs["until"].tzinfo is not None
+
+    def test_events_rejects_an_unreadable_time(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """A typo must not read as "no events in that window"."""
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            with pytest.raises(SystemExit) as exc:
+                cc._security(_ns(sec_action="events", limit=5, since="yesterdayish"))
+        assert exc.value.code == 2
+        assert "cannot read" in capsys.readouterr().out
+        sel.return_value.recent.assert_not_called()
+
+    def test_events_rejects_an_inverted_window(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            with pytest.raises(SystemExit) as exc:
+                cc._security(
+                    _ns(
+                        sec_action="events",
+                        limit=5,
+                        since="2026-08-21T10:00:00Z",
+                        until="2026-08-21T09:00:00Z",
+                    )
+                )
+        assert exc.value.code == 2
+        assert "--since must be earlier than --until" in capsys.readouterr().out
+        sel.return_value.recent.assert_not_called()
+
+    def test_events_names_the_window_when_empty(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("kiro_crew.cli_commands.sel") as sel:
+            sel.return_value.recent.return_value = []
+            cc._security(_ns(sec_action="events", limit=5, since="2026-08-21T00:00:00Z"))
+        out = capsys.readouterr().out
+        assert "No security events recorded in [2026-08-21T00:00:00+00:00, now)." in out
+
     def test_events_renders_error_and_downstream(self, capsys: pytest.CaptureFixture[str]) -> None:
         events = [
             {
@@ -916,18 +1014,42 @@ class TestSecurityCli:
         assert "cron.add → allowed" in out and "error: boom" in out and "slack" in out
 
     @pytest.mark.parametrize(
-        ("total", "valid", "expected"),
+        ("total", "valid", "verifiable", "expected"),
         [
-            (0, 0, "No security events to verify."),
-            (3, 3, "HMAC chain intact"),
-            (3, 1, "HMAC chain COMPROMISED"),
+            (0, 0, True, "No security events to verify."),
+            (3, 3, True, "HMAC chain intact"),
+            (3, 1, True, "HMAC chain COMPROMISED"),
+            (
+                5,
+                5,
+                False,
+                "Audit history UNVERIFIABLE: segment directory refused to pin",
+            ),
+            (0, 0, False, "Audit history UNVERIFIABLE"),
+            (
+                5,
+                3,
+                False,
+                "the live log shows tampered entries: 3/5 entries valid",
+            ),
         ],
     )
     def test_verify_reports_chain_state(
-        self, total: int, valid: int, expected: str, capsys: pytest.CaptureFixture[str]
+        self,
+        total: int,
+        valid: int,
+        verifiable: bool,
+        expected: str,
+        capsys: pytest.CaptureFixture[str],
     ) -> None:
+        outcome = sel_mod.SelVerification(
+            total=total,
+            valid=valid,
+            history_verifiable=verifiable,
+            reason="" if verifiable else "segment directory refused to pin (planted link?)",
+        )
         with patch("kiro_crew.cli_commands.sel") as sel:
-            sel.return_value.verify_integrity.return_value = (total, valid)
+            sel.return_value.verify_integrity.return_value = outcome
             cc._security(_ns(sec_action="verify"))
         assert expected in capsys.readouterr().out
 
@@ -946,6 +1068,58 @@ def _fake_ceiling() -> Any:
         boot=SimpleNamespace(require_sandbox=True, allow_terminal=False, fail_closed=True),
         controls={"capabilities.telemetry": "off"},
     )
+
+
+class TestParseTimeSelector:
+    """``--since``/``--until`` input handling for ``security events``."""
+
+    def test_empty_means_no_bound(self) -> None:
+        assert cc.parse_time_selector("") is None
+        assert cc.parse_time_selector("   ") is None
+
+    @pytest.mark.parametrize(
+        ("text", "secs"),
+        [("45s", 45), ("30m", 1800), ("2h", 7200), ("7d", 604800), ("1w", 604800 * 1)],
+    )
+    def test_relative_age_counts_back_from_now(self, text: str, secs: int) -> None:
+        now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+        assert cc.parse_time_selector(text, now=now) == now - timedelta(seconds=secs)
+
+    def test_relative_age_is_case_insensitive(self) -> None:
+        now = datetime(2026, 8, 21, 12, 0, tzinfo=timezone.utc)
+        assert cc.parse_time_selector("2H", now=now) == cc.parse_time_selector("2h", now=now)
+
+    def test_iso_instant_with_z_suffix(self) -> None:
+        # fromisoformat only accepts "Z" from 3.11; the package supports 3.10.
+        assert cc.parse_time_selector("2026-08-21T04:00:00Z") == datetime(
+            2026, 8, 21, 4, tzinfo=timezone.utc
+        )
+
+    def test_bare_date_is_read_as_utc(self) -> None:
+        """The audit log is written in UTC.
+
+        Reading a bare date as local time would silently shift the window by the
+        host's offset, so a window that looks right returns the wrong records.
+        """
+        assert cc.parse_time_selector("2026-08-21") == datetime(2026, 8, 21, tzinfo=timezone.utc)
+
+    def test_offset_is_normalized_to_utc(self) -> None:
+        assert cc.parse_time_selector("2026-08-21T10:00:00+02:00") == datetime(
+            2026, 8, 21, 8, tzinfo=timezone.utc
+        )
+
+    def test_unreadable_input_raises_with_the_accepted_forms(self) -> None:
+        with pytest.raises(ValueError, match="relative age"):
+            cc.parse_time_selector("last tuesday")
+
+    def test_an_absurd_but_well_formed_age_raises_instead_of_overflowing(self) -> None:
+        """``timedelta`` overflows before the subtraction.
+
+        Uncaught, that is an OverflowError traceback and exit 1 from a bad flag
+        value -- the CLI must still refuse it as input (exit 2) with guidance.
+        """
+        with pytest.raises(ValueError, match="too far in the past"):
+            cc.parse_time_selector("999999999999999999w")
 
 
 class TestPolicyCli:
@@ -970,6 +1144,49 @@ class TestPolicyCli:
         assert "provenance: unsigned" in out
         assert "require_sandbox=True" in out
         assert "capabilities.telemetry: off" in out
+
+    def test_show_without_policy_includes_denied_command_summary(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Regression for #3454: an agent's only prior discovery mechanism for
+        the 139 built-in denied-command rules was to attempt one and be
+        refused. `policy show` must surface them even on a standalone
+        (non-enterprise) install, which is the common case the early-return
+        branch serves."""
+        with patch(
+            "kiro_crew.platform.context.current_context",
+            return_value=SimpleNamespace(governance=None),
+        ):
+            cc._policy(_ns(policy_action="show"))
+        out = capsys.readouterr().out
+        assert "commands.denied: 140 rules in 10 categories" in out
+        assert "aws-destructive(47)" in out
+        # Counts only by default -- rule ids are the --ids opt-in.
+        assert "aws-destructive-ec2-terminate-instances" not in out
+
+    def test_show_with_policy_also_includes_denied_command_summary(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with patch(
+            "kiro_crew.platform.context.current_context",
+            return_value=SimpleNamespace(governance=_fake_ceiling()),
+        ):
+            cc._policy(_ns(policy_action="show"))
+        assert "commands.denied:" in capsys.readouterr().out
+
+    def test_show_ids_lists_rule_ids_per_category(self, capsys: pytest.CaptureFixture[str]) -> None:
+        # Named --ids, not --verbose: the top-level parser already defines
+        # --verbose/-v as an int `count` (log level); a same-named store_true
+        # on this subparser would collide via argparse's parent/subparser
+        # default-override gotcha.
+        with patch(
+            "kiro_crew.platform.context.current_context",
+            return_value=SimpleNamespace(governance=None),
+        ):
+            cc._policy(_ns(policy_action="show", ids=True))
+        out = capsys.readouterr().out
+        assert "aws-destructive-ec2-terminate-instances" in out
+        assert "reverse-shell-nc" in out
 
     def test_show_with_no_governed_scopes(self, capsys: pytest.CaptureFixture[str]) -> None:
         ceiling = _fake_ceiling()
@@ -1023,9 +1240,7 @@ class TestPolicyCli:
         assert "bad.json: INVALID→deny-all" in out
         assert "some profiles failed validation" in out
 
-    def test_explain_unknown_scope_lists_catalog(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_explain_unknown_scope_lists_catalog(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
             patch(
                 "kiro_crew.platform.context.current_context",
@@ -1049,9 +1264,7 @@ class TestPolicyCli:
         out = capsys.readouterr().out
         assert "Unknown scope" in out and "capabilities.telemetry" in out
 
-    def test_explain_known_scope_prints_verdicts(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_explain_known_scope_prints_verdicts(self, capsys: pytest.CaptureFixture[str]) -> None:
         decision = SimpleNamespace(
             permitted=False, rule="deny", layer="policy", reason="pinned off"
         )
@@ -1129,9 +1342,7 @@ class TestPolicyCli:
                 "kiro_crew.platform.context.current_context",
                 return_value=SimpleNamespace(governance=None),
             ),
-            patch(
-                "kiro_crew.platform.governance_profiles.get_store_profile", return_value=None
-            ),
+            patch("kiro_crew.platform.governance_profiles.get_store_profile", return_value=None),
         ):
             cc._policy(_ns(policy_action="profile", name="ghost"))
         assert "No profile named 'ghost'" in capsys.readouterr().out
@@ -1148,9 +1359,7 @@ class TestPolicyCli:
                 "kiro_crew.platform.context.current_context",
                 return_value=SimpleNamespace(governance=None),
             ),
-            patch(
-                "kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof
-            ),
+            patch("kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof),
         ):
             cc._policy(_ns(policy_action="profile", name="team"))
         out = capsys.readouterr().out
@@ -1164,9 +1373,7 @@ class TestPolicyCli:
                 "kiro_crew.platform.context.current_context",
                 return_value=SimpleNamespace(governance=None),
             ),
-            patch(
-                "kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof
-            ),
+            patch("kiro_crew.platform.governance_profiles.get_store_profile", return_value=prof),
         ):
             cc._policy(_ns(policy_action="profile", name="empty"))
         out = capsys.readouterr().out
@@ -1209,21 +1416,53 @@ class _LearnHarness:
 class TestLearnCli:
     def test_add_prefers_vector_store(self, capsys: pytest.CaptureFixture[str]) -> None:
         with _LearnHarness() as h:
-            h.vs.write_lesson.return_value = True
+            h.vs.write_lesson.return_value = LessonWriteResult(LessonWriteOutcome.INSERTED)
             cc._learn(_ns(learn_action="add", rule="do x", category="tool", negative="not y"))
         h.vs.write_lesson.assert_called_once_with("do x", "tool", "not y")
         h.jsonl.save.assert_not_called()
         h.vs.close.assert_called_once()
         assert "Saved: do x (not y) [tool]" in capsys.readouterr().out
 
-    def test_add_falls_back_to_jsonl_store(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_add_does_not_write_jsonl_when_the_store_declines(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """This replaces a test that PINNED the defect (issue #2325).
+
+        It asserted the JSONL fallback fires whenever the vector store returns a
+        falsy value -- which is most often "the lesson is already stored exactly as
+        submitted". So the old contract was: write a duplicate record for a lesson
+        that was fine, and print "Saved:" when nothing needed saving. The declining
+        outcomes are now distinguished, and none of them routes to the other store.
+        """
         with _LearnHarness() as h:
-            h.vs.write_lesson.return_value = False
+            h.vs.write_lesson.return_value = LessonWriteResult(LessonWriteOutcome.UNCHANGED)
             cc._learn(_ns(learn_action="add", rule="do x", category="knowledge", negative=None))
-        h.jsonl.save_or_enrich.assert_called_once()
-        saved = h.jsonl.save_or_enrich.call_args[0][0]
-        assert saved.rule == "do x" and saved.category == "knowledge"
-        assert "Saved: do x [knowledge]" in capsys.readouterr().out
+        h.jsonl.save_or_enrich.assert_not_called()
+        h.jsonl.save.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Already stored, nothing written: do x" in out
+        # The store keeps the stored category on a re-submit, so echoing the submitted
+        # one would show a value it may not hold.
+        assert "[knowledge]" not in out
+
+    def test_add_refusal_exits_non_zero_without_writing_jsonl(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A refusal stored nothing anywhere, so the command must fail loudly.
+
+        Routing it to the JSONL store was the sharper half of the defect: that store
+        validates no content, so a value the vector store rejected landed there and
+        the context builder reads it whenever the vector store holds no lessons.
+        """
+        with _LearnHarness() as h:
+            h.vs.write_lesson.return_value = LessonWriteResult(
+                LessonWriteOutcome.REFUSED, "injection_blocked"
+            )
+            with pytest.raises(SystemExit) as exc:
+                cc._learn(_ns(learn_action="add", rule="do x", category="knowledge", negative=None))
+        assert exc.value.code == 1
+        h.jsonl.save_or_enrich.assert_not_called()
+        assert "NOT saved" in capsys.readouterr().err
 
     def test_list_from_vector_store(self, capsys: pytest.CaptureFixture[str]) -> None:
         with _LearnHarness() as h:
@@ -1239,6 +1478,22 @@ class TestLearnCli:
             ]
             cc._learn(_ns(learn_action="list"))
         assert "[tool] r — n" in capsys.readouterr().out
+
+    def test_list_jsonl_fallback_normalizes_blank_category(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The JSONL fallback branch applies the same display policy as the
+        vector-store branch and the dashboard: a blank/legacy category renders
+        the store's own "knowledge" default, never a bare []."""
+        with _LearnHarness() as h:
+            h.vs.get_lessons.return_value = []
+            h.jsonl.load_all.return_value = [
+                SimpleNamespace(category="", rule="legacy row", negative=None)
+            ]
+            cc._learn(_ns(learn_action="list"))
+        out = capsys.readouterr().out
+        assert "[knowledge] legacy row" in out
+        assert "[]" not in out
 
     def test_list_empty(self, capsys: pytest.CaptureFixture[str]) -> None:
         with _LearnHarness() as h:

@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import os
 import re
 import subprocess
@@ -20,7 +21,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from kiro_crew import hooks
+from conftest import requires_symlinks
+from kiro_crew import hooks, mcp_grant
 from kiro_crew.connections import mint
 from kiro_crew.dashboard.handlers import connections
 
@@ -75,7 +77,7 @@ def _state_only(view: dict | None) -> dict:
 
 def _grant_reads_recorded(seen: list[int]) -> Any:
     """The real grant predicate, plus the id of the thread each read ran on."""
-    real = mint.grant_present
+    real = mcp_grant.grant_presence
 
     def recorded(url: str, **kw: Any) -> bool:
         seen.append(threading.get_ident())
@@ -86,8 +88,8 @@ def _grant_reads_recorded(seen: list[int]) -> Any:
 
 def _write_paired_grant_artifacts(mcp_url: str) -> None:
     """Land a grant kiro-cli would recognize in the scratch cache dir."""
-    cache_dir = mint.kiro_oauth_cache_dir()
-    key = mint.grant_key(mcp_url)
+    cache_dir = mcp_grant.kiro_oauth_cache_dir()
+    key = mcp_grant.grant_key(mcp_url)
     (cache_dir / f"{key}.token.json").write_text("{}", encoding="utf-8")
     (cache_dir / f"{key}.registration.json").write_text("{}", encoding="utf-8")
 
@@ -103,7 +105,7 @@ def _isolated_mint(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()
     monkeypatch.setattr("kiro_crew.agent.kiro_agents_dir_path", lambda: agents_dir)
-    monkeypatch.setattr(mint, "kiro_oauth_cache_dir", lambda **kw: cache_dir)
+    monkeypatch.setattr(mcp_grant, "kiro_oauth_cache_dir", lambda **kw: cache_dir)
     # The manifest is real gateway state; tests must never write the live one.
     monkeypatch.setattr(mint, "_mint_manifest_path", lambda: tmp_path / "mint-specs.json")
     monkeypatch.setattr(mint, "_mints", {})
@@ -164,7 +166,7 @@ async def test_the_mint_runs_on_a_dedicated_single_server_spec():
 async def test_an_existing_grant_short_circuits_without_spawning(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    monkeypatch.setattr(mint, "grant_present", lambda url, **kw: True)
+    monkeypatch.setattr(mcp_grant, "grant_presence", lambda url, **kw: True)
 
     await mint.start_oauth_mint("notion", _URL)
 
@@ -331,7 +333,7 @@ async def test_the_watcher_completes_teardown_when_it_disposes_its_own_row(
     assert spec_path.is_file()
 
     if terminal == "grant":
-        monkeypatch.setattr(mint, "grant_present", lambda url, **kw: True)
+        monkeypatch.setattr(mcp_grant, "grant_presence", lambda url, **kw: True)
     await asyncio.wait_for(entry["watcher"], timeout=5)
 
     # Cancelling the calling task would land the cancellation inside the client
@@ -372,7 +374,7 @@ async def test_a_teardown_cancelled_from_outside_still_releases_the_spec_and_pid
 @pytest.mark.asyncio
 async def test_a_watcher_never_writes_to_a_row_it_does_not_own(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(mint, "_MINT_GRANT_POLL_SECONDS", 0.001)
-    monkeypatch.setattr(mint, "grant_present", lambda url, **kw: True)
+    monkeypatch.setattr(mcp_grant, "grant_presence", lambda url, **kw: True)
     live: mint.MintState = {
         "state": "waiting",
         "started": 2.0,
@@ -629,7 +631,7 @@ async def test_the_mint_pid_is_protected_while_readiness_is_still_stalled(monkey
     # still initializing -- waiting for readiness leaves that whole window open.
     protected: list[int] = []
     monkeypatch.setattr(mint, "register_protected_pid", protected.append)
-    monkeypatch.setattr(mint, "grant_present", lambda url: False)
+    monkeypatch.setattr(mcp_grant, "grant_presence", lambda url: False)
     monkeypatch.setattr(mint, "_write_mint_agent_spec", lambda slug: ("agent", "/tmp/s.json"))
 
     ready = asyncio.Event()
@@ -803,7 +805,7 @@ async def test_a_reconnect_that_short_circuits_still_reaps_aged_orphans(monkeypa
     orphan.write_text("{}", encoding="utf-8")
     aged = time.time() - mint._MINT_SPEC_ORPHAN_SECONDS - 1
     mint._write_mint_manifest({str(orphan): aged})
-    monkeypatch.setattr(mint, "grant_present", lambda url: True)
+    monkeypatch.setattr(mcp_grant, "grant_presence", lambda url: True)
 
     await mint.start_oauth_mint("notion", _URL)
 
@@ -814,9 +816,7 @@ async def test_a_reconnect_that_short_circuits_still_reaps_aged_orphans(monkeypa
     mint._mints.pop("notion", None)
 
 
-def test_a_planted_absolute_victim_path_is_never_unlinked(
-    _isolated_mint: Path, tmp_path: Path
-):
+def test_a_planted_absolute_victim_path_is_never_unlinked(_isolated_mint: Path, tmp_path: Path):
     victim = tmp_path / "precious.json"
     victim.write_text("VICTIM", encoding="utf-8")
     _plant_row(victim)
@@ -840,6 +840,7 @@ def test_a_traversal_row_is_never_unlinked(_isolated_mint: Path, tmp_path: Path)
     assert victim.read_text(encoding="utf-8") == "VICTIM"
 
 
+@requires_symlinks
 def test_a_symlink_redirecting_outside_the_agents_dir_is_never_followed(
     _isolated_mint: Path, tmp_path: Path
 ):
@@ -915,6 +916,7 @@ def test_an_unrecorded_mint_shaped_file_in_the_agents_dir_is_never_unlinked(
     assert sibling.read_text(encoding="utf-8") == "SIBLING"
 
 
+@requires_symlinks
 def test_an_owned_name_symlinked_to_a_mint_shaped_file_is_never_unlinked(
     _isolated_mint: Path,
 ):
@@ -937,6 +939,7 @@ def test_an_owned_name_symlinked_to_a_mint_shaped_file_is_never_unlinked(
     assert target.is_file()
 
 
+@requires_symlinks
 def test_a_symlinked_mint_shaped_name_is_also_refused(_isolated_mint: Path):
     # Even when the link's OWN name is mint-shaped: a name and its target disagree
     # by construction, so there is no safe way to check one and unlink the other.
@@ -1031,15 +1034,24 @@ def test_writing_refuses_to_overwrite_an_existing_path(
 
 
 def test_a_grant_requires_both_paired_artifacts(tmp_path: Path):
-    key = mint.grant_key(_URL)
-    assert mint.grant_present(_URL, cache_dir=tmp_path) is False
+    key = mcp_grant.grant_key(_URL)
+    assert mcp_grant.grant_presence(_URL, cache_dir=tmp_path) is False
 
     (tmp_path / f"{key}.token.json").write_text("{}", encoding="utf-8")
     # A lone token file also matches the single-file SSO naming in this dir.
-    assert mint.grant_present(_URL, cache_dir=tmp_path) is False
+    assert mcp_grant.grant_presence(_URL, cache_dir=tmp_path) is False
 
     (tmp_path / f"{key}.registration.json").write_text("{}", encoding="utf-8")
-    assert mint.grant_present(_URL, cache_dir=tmp_path) is True
+    assert mcp_grant.grant_presence(_URL, cache_dir=tmp_path) is True
+
+
+def test_grant_artifact_paths_share_the_presence_layout(tmp_path: Path):
+    key = mcp_grant.grant_key(_URL)
+
+    assert mcp_grant.grant_artifact_paths(_URL, cache_dir=tmp_path) == (
+        tmp_path / f"{key}.token.json",
+        tmp_path / f"{key}.registration.json",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1048,14 +1060,21 @@ def test_a_grant_requires_both_paired_artifacts(tmp_path: Path):
         ("https://mcp.example.com/mcp", "https://MCP.Example.com/mcp"),
         ("https://mcp.example.com/mcp", "https://mcp.example.com:443/mcp"),
         ("https://mcp.example.com", "https://mcp.example.com/"),
+        ("https://bücher.example/mcp", "https://xn--bcher-kva.example/mcp"),
     ],
 )
 def test_the_grant_key_normalizes_the_way_the_runtime_does(left: str, right: str):
-    assert mint.grant_key(left) == mint.grant_key(right)
+    assert mcp_grant.grant_key(left) == mcp_grant.grant_key(right)
+
+
+def test_the_grant_key_keeps_ipv6_origin_brackets():
+    expected = hashlib.sha256(b"https://[2001:db8::1]/mcp").hexdigest()
+
+    assert mcp_grant.grant_key("https://[2001:db8::1]/mcp") == expected
 
 
 def test_the_grant_key_separates_distinct_endpoints():
-    assert mint.grant_key(_URL) != mint.grant_key("https://mcp.example.com/other")
+    assert mcp_grant.grant_key(_URL) != mcp_grant.grant_key("https://mcp.example.com/other")
 
 
 # ── the grant read stays off the event loop ──
@@ -1063,7 +1082,7 @@ def test_the_grant_key_separates_distinct_endpoints():
 # The predicate stats the user's home. That is sub-millisecond locally and
 # unbounded on a network-mounted home, and on the loop an unbounded stat takes the
 # gateway's heartbeat with it. Both call sites therefore run it in a worker thread.
-# ``grant_present`` is left UNPATCHED in these two -- only wrapped to record the
+# ``grant_presence`` is left UNPATCHED in these two -- only wrapped to record the
 # thread -- so each asserts the verdict still resolves through the wrapped path
 # rather than only that a thread was used.
 
@@ -1074,7 +1093,7 @@ async def test_the_reconnect_short_circuit_reads_a_real_grant_off_the_loop(
 ):
     _write_paired_grant_artifacts(_URL)
     seen: list[int] = []
-    monkeypatch.setattr(mint, "grant_present", _grant_reads_recorded(seen))
+    monkeypatch.setattr(mcp_grant, "grant_presence", _grant_reads_recorded(seen))
 
     await mint.start_oauth_mint("notion", _URL)
 
@@ -1093,15 +1112,57 @@ async def test_the_watcher_reads_a_real_grant_off_the_loop(
     assert entry["state"] == "waiting"
 
     # After the spawn, so the short-circuit above does not consume the grant and
-    # the recorder only sees the watcher's own reads.
-    _write_paired_grant_artifacts(_URL)
+    # the recorder only sees the watcher's own reads -- and the recorder BEFORE
+    # the grant becomes visible, so no poll issued after this point can read the
+    # grant through the un-instrumented predicate.
+    unwrapped = mcp_grant.grant_presence
     seen: list[int] = []
-    monkeypatch.setattr(mint, "grant_present", _grant_reads_recorded(seen))
+    monkeypatch.setattr(mcp_grant, "grant_presence", _grant_reads_recorded(seen))
+    # Ordering guard: the recorder is live while the grant is still invisible.
+    # Probes through the ORIGINAL predicate so this thread never enters ``seen``.
+    assert not unwrapped(_URL)
+    # Barrier for the in-flight tail: ``grant_observed`` freezes the predicate
+    # object at ``to_thread`` submission, so a poll submitted before the setattr
+    # above can still complete after the write below. The watcher polls
+    # sequentially, so once one recorded (necessarily negative) read has landed,
+    # no un-instrumented poll remains in flight and the grant may become visible.
+    deadline = time.monotonic() + 5
+    while not seen and time.monotonic() < deadline:
+        await asyncio.sleep(0.001)
+    assert seen, "no recorded watcher poll arrived before the deadline"
+    _write_paired_grant_artifacts(_URL)
 
     await asyncio.wait_for(entry["watcher"], timeout=5)
 
     assert mint._mints["notion"]["state"] == "granted"
     assert seen and threading.get_ident() not in seen
+
+
+def test_an_unreadable_artifact_is_unknowable_rather_than_absent(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The middle answer is the whole point of the tri-state, and it is fragile.
+
+    ``Path.is_file()`` swallows EVERY ``OSError`` from Python 3.14 on and answers
+    ``False``, so a permission error or a stalled mount would be indistinguishable
+    from "nothing was ever written" -- and the probe would tell the owner of an
+    already-authorized server to sign in again. This package declares
+    ``requires-python >= 3.10`` with no ceiling, so that version is allowed and the
+    derivation cannot rest on ``is_file()``.
+
+    The fake defines ONLY ``stat``: an implementation that reached for ``is_file()``
+    would raise ``AttributeError`` here rather than quietly answering ``False``.
+    """
+
+    class _Unreadable:
+        def stat(self, *a: object, **kw: object) -> object:
+            raise PermissionError("EACCES")
+
+    monkeypatch.setattr(
+        mcp_grant, "grant_artifact_paths", lambda url, **kw: (_Unreadable(), _Unreadable())
+    )
+
+    assert mcp_grant.grant_presence(_URL) is None
 
 
 # ── the grant-presence stat is SEL-audited ──
@@ -1122,7 +1183,7 @@ def _audit_calls_recorded(monkeypatch: pytest.MonkeyPatch, recorded: bool = True
         seen.append((read_id, outcome, threading.get_ident()))
         return recorded
 
-    monkeypatch.setattr(mint._hooks, "emit_internal_read_audit", fake)
+    monkeypatch.setattr(mcp_grant._hooks, "emit_internal_read_audit", fake)
     return seen
 
 
@@ -1133,7 +1194,7 @@ def test_the_grant_presence_read_id_is_registered_for_audit():
     False WITHOUT emitting, so a call site whose id is missing from the registry
     records nothing while looking audited at the point of use.
     """
-    assert mint._GRANT_PRESENCE_READ_ID in hooks._AUDIT_ONLY_READ_IDS
+    assert mcp_grant._GRANT_PRESENCE_READ_ID in hooks._AUDIT_ONLY_READ_IDS
 
 
 @pytest.mark.asyncio
@@ -1145,7 +1206,7 @@ async def test_observing_a_grant_audits_once_off_the_loop(monkeypatch: pytest.Mo
 
     assert _state_only(mint.pending_mint_for("notion")) == {"state": "granted"}
     assert [(rid, outcome) for rid, outcome, _ in seen] == [
-        (mint._GRANT_PRESENCE_READ_ID, "success")
+        (mcp_grant._GRANT_PRESENCE_READ_ID, "success")
     ]
     # Critical SEL events drain the queue on the calling thread.
     assert threading.get_ident() not in [thread for _, _, thread in seen]
@@ -1171,6 +1232,48 @@ async def test_polling_for_an_absent_grant_never_audits(
 
 
 @pytest.mark.asyncio
+async def test_an_unreadable_lookup_audits_as_unreadable(monkeypatch: pytest.MonkeyPatch):
+    """ "Could not look" is its own audit outcome, not folded into "missing"."""
+
+    class _Unreadable:
+        def stat(self, *a: object, **kw: object) -> object:
+            raise PermissionError("EACCES")
+
+    monkeypatch.setattr(
+        mcp_grant, "grant_artifact_paths", lambda url, **kw: (_Unreadable(), _Unreadable())
+    )
+    seen = _audit_calls_recorded(monkeypatch)
+
+    assert await mcp_grant.grant_observed(_URL, audit_absence=True) is None
+
+    assert [(rid, outcome) for rid, outcome, _ in seen] == [
+        (mcp_grant._GRANT_PRESENCE_READ_ID, "unreadable")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_caller_that_acts_on_absence_audits_the_absence(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A negative that DRIVES a verdict owes a trail as much as a positive one.
+
+    The mint polls for a grant to appear, so its negatives change nothing and stay
+    unaudited. The probe reads once and renders either answer -- an absent pair is
+    what makes a row read "Sign-in required" -- so it opts in, and the access is
+    recorded whichever way the stat came out.
+    """
+    seen = _audit_calls_recorded(monkeypatch)
+
+    assert await mcp_grant.grant_observed(_URL, audit_absence=True) is False
+
+    assert [(rid, outcome) for rid, outcome, _ in seen] == [
+        (mcp_grant._GRANT_PRESENCE_READ_ID, "missing")
+    ]
+    # Critical SEL events drain the queue, so this stays off the event loop.
+    assert threading.get_ident() not in [thread for _, _, thread in seen]
+
+
+@pytest.mark.asyncio
 async def test_an_unrecordable_audit_does_not_withhold_the_grant(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -1186,6 +1289,32 @@ async def test_an_unrecordable_audit_does_not_withhold_the_grant(
 
     assert _state_only(mint.pending_mint_for("notion")) == {"state": "granted"}
     assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_unaudited_warning_names_the_key_not_the_url(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """This warning lands in gateway.log, which is not a credential store.
+
+    The lookup is reachable for ANY endpoint a user configured, not just a vetted
+    registry one, so the url can carry a credential in its userinfo or query
+    string. The sha256 cache key identifies the artifacts consulted without
+    carrying anything back out.
+    """
+    secret_url = "https://user:sup3r-secret@mcp.example.com/mcp?token=abcd1234"
+    _audit_calls_recorded(monkeypatch, recorded=False)
+    _write_paired_grant_artifacts(secret_url)
+
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.mcp_grant"):
+        assert await mcp_grant.grant_observed(secret_url) is True
+
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert "proceeding unaudited" in blob, "the fail-open warning must still be emitted"
+    assert "sup3r-secret" not in blob
+    assert "abcd1234" not in blob
+    assert "mcp.example.com" not in blob
+    assert mcp_grant.grant_key(secret_url) in blob
 
 
 # ── every OTHER filesystem touch stays off the event loop too ──
@@ -1350,7 +1479,7 @@ _FS_ATTRS = frozenset(
         # the event is marked critical, so it drains the queue on the calling
         # thread rather than merely enqueueing. Listed so a future DIRECT call
         # from a coroutine fails here instead of silently blocking the loop --
-        # ``_grant_observed`` passes it to ``asyncio.to_thread`` today.
+        # ``grant_observed`` passes it to ``asyncio.to_thread`` today.
         "emit_internal_read_audit",
     }
 )
@@ -1401,8 +1530,6 @@ def test_no_coroutine_in_the_mint_module_touches_the_filesystem_directly():
     # The known set, so a helper silently losing its filesystem work (and with it
     # this guard's coverage) is visible rather than a quietly weaker test.
     assert fs_helpers == {
-        "kiro_oauth_cache_dir",
-        "grant_present",
         "_is_reapable_spec",
         "_mint_manifest_path",
         "_read_mint_manifest",
@@ -1441,9 +1568,7 @@ def test_the_handlers_package_does_not_import_the_mint_engine():
         "import sys; import kiro_crew.dashboard.handlers;"
         " print('MINT' if 'kiro_crew.connections.mint' in sys.modules else 'CLEAN')"
     )
-    out = subprocess.run(
-        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=180
-    )
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=180)
     assert out.returncode == 0, out.stderr[-2000:]
     assert out.stdout.strip().endswith("CLEAN"), out.stdout
 
@@ -1468,9 +1593,7 @@ _RECORDED_GRANT_KEYS = {
     "https://mcp.atlassian.com/v1/sse": (
         "834761c496c5a564116b2f1c55805d4425c32caee9e86596590d3d6e332a3240"
     ),
-    "https://mcp.vercel.com": (
-        "27af4e7d14d9aa7579dff853f8b7033ffbaaf6fb734bf15aec53f68776bb4111"
-    ),
+    "https://mcp.vercel.com": ("27af4e7d14d9aa7579dff853f8b7033ffbaaf6fb734bf15aec53f68776bb4111"),
     "https://mcp.sentry.dev/mcp": (
         "956f74053c03bea04f650e2341a266b5e3162116bc5c7f74b1f4d5afb4654b72"
     ),
@@ -1491,23 +1614,23 @@ _RECORDED_GRANT_KEYS = {
 
 @pytest.mark.parametrize(("mcp_url", "recorded"), sorted(_RECORDED_GRANT_KEYS.items()))
 def test_the_grant_key_matches_its_recorded_value(mcp_url: str, recorded: str):
-    assert mint.grant_key(mcp_url) == recorded
+    assert mcp_grant.grant_key(mcp_url) == recorded
 
 
 def test_the_grant_key_formula_is_sha256_of_origin_and_path():
     """Independent restatement of the rule, so a rewrite cannot silently redefine it."""
     expected = hashlib.sha256(b"https://mcp.notion.com/mcp").hexdigest()
 
-    assert mint.grant_key("https://mcp.notion.com/mcp") == expected
+    assert mcp_grant.grant_key("https://mcp.notion.com/mcp") == expected
 
 
 def test_the_artifact_layout_assumptions_are_pinned():
     # The directory and the suffix PAIR are as much of the contract as the hash:
     # a layout move breaks detection exactly as silently as a key change.
-    assert mint._KIRO_OAUTH_CACHE_RELATIVE == (".aws", "sso", "cache")
-    assert mint._TOKEN_SUFFIX == ".token.json"
-    assert mint._REGISTRATION_SUFFIX == ".registration.json"
-    assert Path("/home/u").joinpath(*mint._KIRO_OAUTH_CACHE_RELATIVE) == Path(
+    assert mcp_grant._KIRO_OAUTH_CACHE_RELATIVE == (".aws", "sso", "cache")
+    assert mcp_grant._TOKEN_SUFFIX == ".token.json"
+    assert mcp_grant._REGISTRATION_SUFFIX == ".registration.json"
+    assert Path("/home/u").joinpath(*mcp_grant._KIRO_OAUTH_CACHE_RELATIVE) == Path(
         "/home/u/.aws/sso/cache"
     )
 
@@ -1524,6 +1647,7 @@ async def _client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     return client
 
 
+@requires_symlinks
 def test_a_row_whose_parent_is_a_symlink_is_never_unlinked(tmp_path, monkeypatch):
     # The leaf is a real file, so a leaf-only symlink check passes it, and the
     # resolved parent equals the agents dir -- yet unlink() re-resolves the link at
@@ -1562,7 +1686,7 @@ async def test_cancelling_a_mint_still_releases_what_it_holds(monkeypatch):
             raise asyncio.CancelledError()
 
     monkeypatch.setattr(mint, "_dispose_mint", _fake_dispose)
-    monkeypatch.setattr(mint, "grant_present", lambda url: False)
+    monkeypatch.setattr(mcp_grant, "grant_presence", lambda url: False)
     # Cancellation lands in ensure_ready, with the spec written and the client
     # already spawned -- the exact window the failure handler cannot see.
     monkeypatch.setattr(mint, "_acp_client_factory", lambda: _CancelDuringReady)
@@ -1594,7 +1718,7 @@ async def test_a_mint_with_no_entry_left_fails_instead_of_reporting_granted(monk
         return None
 
     monkeypatch.setattr(mint, "_dispose_mint", _fake_dispose)
-    monkeypatch.setattr(mint, "grant_present", lambda url: False)
+    monkeypatch.setattr(mcp_grant, "grant_presence", lambda url: False)
     monkeypatch.setattr(mint, "_acp_client_factory", lambda: _NoChallenge)
     monkeypatch.setattr(mint, "_write_mint_agent_spec", lambda slug: ("agent", "/tmp/spec.json"))
 
@@ -1878,3 +2002,104 @@ async def test_get_refuses_an_unknown_provider(monkeypatch: pytest.MonkeyPatch):
         assert resp.status == 400
     finally:
         await client.close()
+
+
+# ── cancel_mint and mint-tier telemetry (N1) ──
+
+
+@pytest.mark.asyncio
+async def test_cancel_mint_disposes_a_waiting_row():
+    await mint.start_oauth_mint("notion", _URL)
+    assert mint.pending_mint_for("notion") is not None
+    client = _FakeClient.instances[-1]
+
+    dropped = await mint.cancel_mint("notion")
+
+    assert dropped is True
+    assert mint.pending_mint_for("notion") is None
+    # The held kiro-cli process, its listener and its spec are released, not
+    # left to the TTL -- that release is the whole point of a real cancel.
+    assert client.shutdowns == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_mint_on_an_empty_table_is_idempotent():
+    assert await mint.cancel_mint("notion") is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_mint_is_fenced_by_the_row_token():
+    await mint.start_oauth_mint("notion", _URL)
+    token = mint._mints["notion"]["token"]
+    client = _FakeClient.instances[-1]
+
+    # A stale tab carries a token for a row this flow replaced: refuse to dispose
+    # the row that is no longer theirs. The row must SURVIVE intact -- both the
+    # table entry and the process holding the redeemable URL.
+    assert await mint.cancel_mint("notion", "not-the-token") is False
+    assert mint.pending_mint_for("notion") is not None
+    assert mint._mints["notion"]["token"] == token
+    assert mint._mints["notion"]["state"] == "waiting"
+    assert client.shutdowns == 0  # nothing was torn down
+    assert mint._mints["notion"].get("client") is client
+
+    # The row's own token disposes it: entry gone, process released.
+    assert await mint.cancel_mint("notion", token) is True
+    assert mint.pending_mint_for("notion") is None
+    assert "notion" not in mint._mints
+    assert client.shutdowns == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_mint_without_a_token_disposes_the_current_row():
+    # A caller that never held a token cannot distinguish rows, so its intent is
+    # only "cancel this provider" -- distinct from the fenced path above, and the
+    # path the card takes when its POST answered without a token.
+    await mint.start_oauth_mint("notion", _URL)
+    client = _FakeClient.instances[-1]
+
+    assert await mint.cancel_mint("notion") is True
+    assert mint.pending_mint_for("notion") is None
+    assert client.shutdowns == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_mint_records_the_outcome(monkeypatch: pytest.MonkeyPatch):
+    details: list[str] = []
+    monkeypatch.setattr(
+        mint, "_log_mint_outcome", lambda slug, outcome, detail: details.append(detail)
+    )
+    await mint.start_oauth_mint("notion", _URL)
+    details.clear()  # drop the mint's own outcome record; keep only the cancel's
+
+    await mint.cancel_mint("notion")
+
+    assert any("reason=cancelled" in detail for detail in details)
+
+
+@pytest.mark.asyncio
+async def test_a_cold_spawn_records_that_it_minted_a_url(monkeypatch: pytest.MonkeyPatch):
+    details: list[str] = []
+    monkeypatch.setattr(
+        mint, "_log_mint_outcome", lambda slug, outcome, detail: details.append(detail)
+    )
+
+    await mint.start_oauth_mint("notion", _URL)  # _FakeClient yields a fresh URL
+
+    assert any("url_minted=True" in detail for detail in details)
+    await mint._dispose_mint(mint._mints["notion"])
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_with_a_live_grant_records_already_granted(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _write_paired_grant_artifacts(_URL)  # kiro-cli already holds a grant
+    details: list[str] = []
+    monkeypatch.setattr(
+        mint, "_log_mint_outcome", lambda slug, outcome, detail: details.append(detail)
+    )
+
+    await mint.start_oauth_mint("notion", _URL)
+
+    assert any("reason=already_granted" in detail for detail in details)

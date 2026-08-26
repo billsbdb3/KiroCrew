@@ -31,9 +31,7 @@
 #          user namespaces + delete the key).
 #      First-run only: an existing config.json is operator-owned — never
 #      rewrite it, only print guidance. "First run" means config.json is
-#      absent (an EMPTY mounted volume is still a first run); a legacy
-#      ~/.kirocrew home is owned by the product's migration logic and is
-#      never pre-empted here.
+#      absent (an EMPTY mounted volume is still a first run).
 #
 #   3. Print how to mint a dashboard login link. Fresh links are minted via
 #      docker exec rather than parsed out of logs: the gateway's own startup
@@ -49,14 +47,11 @@ set -eu
 # ── Data-home resolution: ask the PRODUCT, never re-implement ────────────
 # ensure_data_home() (kiro_crew.config.paths) is the backend's single
 # source of truth: KIROCREW_HOME validation (system-dir rejection,
-# expanduser), legacy-home migration with its completion marker, and the
-# new-home default. A shell mirror of that logic drifted from the backend
-# twice in review; delegating closes the entire divergence class — the
-# entrypoint writes exactly where the gateway will read, by construction.
-# This runs the same lazy migration the gateway would run at boot, just
-# earlier in the same container (idempotent, cross-process locked).
-# KIROCREW_HOME itself passes through unmodified — the backend applies
-# the identical interpretation to it.
+# expanduser) and the default home. A shell mirror of that logic drifted
+# from the backend twice in review; delegating closes the entire divergence
+# class — the entrypoint writes exactly where the gateway will read, by
+# construction. KIROCREW_HOME itself passes through unmodified — the backend
+# applies the identical interpretation to it.
 if ! ACTIVE_HOME=$(python3 -c 'from kiro_crew.config.paths import ensure_data_home; print(ensure_data_home())' 2>/dev/null) || [ -z "$ACTIVE_HOME" ]; then
     ACTIVE_HOME="$HOME/.kiro/crew"
     echo "[entrypoint] WARNING: could not resolve the data home via kiro_crew" \
@@ -71,8 +66,11 @@ ENV_FILE="$ACTIVE_HOME/.env"
 # key added to one without the other fails CI. Replace-or-append line-wise so
 # operator-added lines and comments in .env survive; grep -v (not sed) avoids
 # escaping issues with arbitrary secret bytes.
-CRED_KEYS="SLACK_BOT_TOKEN SLACK_APP_TOKEN KIROCREW_OWNER_ID DISCORD_BOT_TOKEN TELEGRAM_BOT_TOKEN WECOM_BOT_ID WECOM_SECRET WEBEX_BOT_TOKEN MICROSOFT_APP_ID MICROSOFT_APP_PASSWORD MICROSOFT_APP_TENANT_ID WEIXIN_TOKEN JIRA_API_TOKEN KIRO_API_KEY"
-for KEY in $CRED_KEYS; do
+CRED_KEYS="SLACK_BOT_TOKEN SLACK_APP_TOKEN KIROCREW_OWNER_ID DISCORD_BOT_TOKEN TELEGRAM_BOT_TOKEN WECOM_BOT_ID WECOM_SECRET WEBEX_BOT_TOKEN MICROSOFT_APP_ID MICROSOFT_APP_PASSWORD MICROSOFT_APP_TENANT_ID WEIXIN_TOKEN FEISHU_APP_ID FEISHU_APP_SECRET JIRA_API_TOKEN KIRO_API_KEY"
+# Append any per-host Jira tokens (JIRA_TOKEN_<hex>) — dynamic keys not in the
+# static list above. Same persist-then-unset treatment in the single loop below.
+JIRA_DYNAMIC=$(env | grep -oE '^JIRA_TOKEN_[0-9A-Fa-f]+' 2>/dev/null || true)
+for KEY in $CRED_KEYS $JIRA_DYNAMIC; do
     VAL=$(eval "printf '%s' \"\${$KEY:-}\"")
     if [ -n "$VAL" ]; then
         mkdir -p "$ACTIVE_HOME"
@@ -104,18 +102,22 @@ for KEY in $CRED_KEYS; do
     fi
 done
 
-# Scrub per-host Jira tokens (JIRA_TOKEN_<hex>) — dynamic keys not in the
-# static CRED_KEYS list above. Same scrub pattern: move to .env, unset from env.
+# Catch-all: unset any remaining JIRA_TOKEN_* vars that didn't match the
+# hex-suffix pattern above (e.g. mistyped or non-standard names). These are
+# NOT persisted to .env (their names aren't well-formed per-host tokens), but
+# they must not linger in /proc/<pid>/environ. Plain unset — no eval needed
+# since we only need to remove them, not read their values.
 for KEY in $(env | grep -o '^JIRA_TOKEN_[^=]*' 2>/dev/null || true); do
     unset "$KEY"
 done
+
 # Signal to the gateway's load_credentials() that credentials were
 # deliberately scrubbed from the process environ and must NOT be
 # re-injected (which would leak into /proc/<pid>/environ).
 export _KIROCREW_CREDS_SCRUBBED=1
-# By this point the resolver above has already run the product's legacy-home
-# migration if one was pending, so $CONFIG is authoritative: present means
-# operator-owned state (never rewrite), absent means genuine first run.
+# The resolver above has resolved the data home, so $CONFIG is authoritative:
+# present means operator-owned state (never rewrite), absent means genuine
+# first run.
 if [ -f "$CONFIG" ]; then
     if ! grep -q sandbox_allow_unsandboxed_exec "$CONFIG"; then
         echo "[entrypoint] Note: agent.sandbox_allow_unsandboxed_exec is not set in $CONFIG." \

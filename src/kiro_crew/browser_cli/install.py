@@ -23,6 +23,7 @@ loop offloads it.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -33,6 +34,7 @@ from typing import Any
 
 from kiro_crew import platform_compat
 from kiro_crew.browser_cli import os_deps
+from kiro_crew.config.paths import config_dir
 from kiro_crew.env import augmented_path, find_node_tool, node_augmented_path
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -193,6 +195,7 @@ def _browsers_cache_dir() -> Path | None:
 # tuple, not free input: it is what validates the engine name before it reaches
 # argv (see `install_browser`), which is what keeps that spawn benign.
 BROWSER_ENGINES: tuple[str, ...] = ("chromium", "firefox", "webkit")
+_DEFAULT_BROWSER_ENGINE = BROWSER_ENGINES[0]
 
 
 def _cached_browser_names() -> set[str] | None:
@@ -206,17 +209,226 @@ def _cached_browser_names() -> set[str] | None:
         return None
 
 
+# playwright-core ships this manifest beside its entry point, listing the browser
+# revision each engine needs. It is the file `install-browser` consults, so it is
+# the authority on what "present" means for THIS installed CLI. Reading it is a
+# plain file read, which keeps `detect()` subprocess-free.
+_BROWSERS_MANIFEST = "browsers.json"
+_PLAYWRIGHT_CORE_PKG = "playwright-core"
+
+#: The CLI's own package coordinates. The manifest is only trusted when it is
+#: served to THIS package, so the scope and name are what anchors the search.
+_CLI_PKG_SCOPE = "@playwright"
+_CLI_PKG_NAME = "cli"
+
+#: Where the standalone installer puts the package tree. `npm --global --prefix`
+#: writes under ``<prefix>/lib/node_modules`` on POSIX and ``<prefix>/node_modules``
+#: on Windows, so both are probed.
+_STANDALONE_PREFIX_ENV = "KIROCREW_PLAYWRIGHT_CLI_HOME"
+_STANDALONE_PREFIX_DIR = "playwright-cli"
+_NODE_MODULES = "node_modules"
+
+
+def _standalone_node_modules() -> list[Path]:
+    """``node_modules`` roots of a standalone (unprivileged) CLI install.
+
+    Probed by KNOWN PATH rather than found by searching, because the standalone
+    installer generates a **wrapper script** instead of a symlink: the package
+    tree is not an ancestor of the launcher on PATH, so no walk up from the
+    resolved launcher can reach it. Without this the revision could not be read
+    for that install shape at all, and the check would silently degrade to the
+    presence-only answer whose false positives it exists to remove.
+    """
+    prefix_override = os.environ.get(_STANDALONE_PREFIX_ENV, "").strip()
+    prefix = Path(prefix_override) if prefix_override else config_dir() / _STANDALONE_PREFIX_DIR
+    return [prefix / "lib" / _NODE_MODULES, prefix / _NODE_MODULES]
+
+
+def _launcher_node_modules(anchor: Path) -> list[Path]:
+    """``node_modules`` roots to probe relative to the resolved launcher.
+
+    A launcher that is a SYMLINK resolves INTO the package tree, so an ancestor is
+    already the package directory and none of these are needed. A launcher that is
+    a real FILE resolves to itself, and then the tree has to be found beside it:
+    ``npm install -g`` writes a ``.cmd`` batch wrapper on Windows, and a generated
+    shell wrapper is what the standalone installer produces. Without this, those
+    shapes read no revision at all and fall back to presence-only -- the exact
+    false positive the revision gate exists to remove.
+
+    Bounded to the launcher's own install prefix rather than walked toward the
+    filesystem root, because an unbounded walk is what allowed a foreign tree to
+    supply the revision. Every candidate still has to hold ``@playwright/cli``
+    (see :func:`_cli_package_dirs`), so a stray ``playwright-core`` from an
+    unrelated install is still unreachable.
+    """
+    return [
+        # <prefix>/playwright-cli.cmd  ->  <prefix>/node_modules  (npm -g, Windows)
+        anchor.parent / _NODE_MODULES,
+        # <prefix>/bin/playwright-cli  ->  <prefix>/node_modules
+        anchor.parent.parent / _NODE_MODULES,
+        # <prefix>/bin/playwright-cli  ->  <prefix>/lib/node_modules  (npm -g, POSIX)
+        anchor.parent.parent / "lib" / _NODE_MODULES,
+    ]
+
+
+def _cli_package_dirs() -> list[Path]:
+    """``@playwright/cli`` package directories on this host, most specific first.
+
+    Three sources, in priority order: an ancestor of the resolved launcher (an
+    ``npm install -g`` symlink resolves into the package tree), a ``node_modules``
+    beside the launcher (a real-file wrapper resolves to itself, so nothing in its
+    ancestry is the package), and the standalone installer's known prefix.
+    """
+    dirs: list[Path] = []
+    cli = cli_path()
+    if cli is not None:
+        try:
+            anchor: Path | None = Path(cli).resolve()
+        except OSError:
+            anchor = None
+        if anchor is not None:
+            for parent in anchor.parents:
+                if parent.name == _CLI_PKG_NAME and parent.parent.name == _CLI_PKG_SCOPE:
+                    dirs.append(parent)
+                    break
+            for node_modules in _launcher_node_modules(anchor):
+                package = node_modules / _CLI_PKG_SCOPE / _CLI_PKG_NAME
+                if package.is_dir():
+                    dirs.append(package)
+    for node_modules in _standalone_node_modules():
+        package = node_modules / _CLI_PKG_SCOPE / _CLI_PKG_NAME
+        if package.is_dir():
+            dirs.append(package)
+    return dirs
+
+
+def _manifest_for_cli_package(package: Path) -> Path | None:
+    """The ``browsers.json`` of the ``playwright-core`` serving *package*.
+
+    Two layouts, both anchored ON the package so the manifest can only come from
+    the tree that will launch the browser: nested inside the package's own
+    ``node_modules``, or hoisted as a sibling in the ``node_modules`` that holds
+    ``@playwright/cli`` (``<pkg>/../..`` — up past ``@playwright``).
+    """
+    for candidate in (
+        package / _NODE_MODULES / _PLAYWRIGHT_CORE_PKG / _BROWSERS_MANIFEST,
+        package.parent.parent / _PLAYWRIGHT_CORE_PKG / _BROWSERS_MANIFEST,
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _browsers_manifest_path() -> Path | None:
+    """Locate the installed ``playwright-core/browsers.json``, or ``None``.
+
+    Resolution is anchored on the ``@playwright/cli`` package
+    (:func:`_cli_package_dirs`) rather than walked up from the launcher toward
+    the filesystem root. The anchor is the correctness property, not a
+    shortcut: an unbounded walk passes through ``$HOME`` on the standalone
+    layout, where a single unrelated ``~/node_modules/playwright-core`` would
+    supply a revision from a DIFFERENT install. That reports a **working**
+    browser broken, and keeps reporting it after the download the panel offers,
+    because the gate goes on reading the foreign manifest. Requiring the
+    manifest to be served to the CLI package makes a foreign tree unreachable.
+
+    ``None`` when no manifest can be attributed to a CLI package, which callers
+    treat as "revision unknown" and answer with the documented presence-only
+    fallback.
+    """
+    for package in _cli_package_dirs():
+        manifest = _manifest_for_cli_package(package)
+        if manifest is not None:
+            return manifest
+    return None
+
+
+def _required_revisions() -> dict[str, str] | None:
+    """Required revision per engine, read from ``browsers.json``, or ``None``.
+
+    ``None`` means the required revision cannot be determined -- the manifest is
+    absent, unreadable, or not the shape this expects. Callers treat that as
+    "cannot confirm a revision" and fall back to the older presence-only check
+    rather than turning a working browser into a reported-broken one.
+
+    Keyed by the manifest's own engine names (``chromium``,
+    ``chromium-headless-shell``, ``firefox``, ``webkit``, ...). Only entries with
+    a string ``name`` and ``revision`` are kept, so a malformed row is skipped
+    rather than crashing the read.
+    """
+    path = _browsers_manifest_path()
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    browsers = data.get("browsers") if isinstance(data, dict) else None
+    if not isinstance(browsers, list):
+        return None
+    revisions: dict[str, str] = {}
+    for entry in browsers:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        revision = entry.get("revision")
+        if isinstance(name, str) and isinstance(revision, str):
+            revisions[name] = revision
+    return revisions or None
+
+
+def _cache_dir_name_for(engine: str, revision: str) -> str:
+    """The cache directory name that satisfies *engine* at *revision*.
+
+    Playwright names the directory ``<engine>-<revision>`` (``chromium-1232``).
+    One name, not a set: the only caller passes engines from
+    :data:`BROWSER_ENGINES`, none of which contains a hyphen, so an underscore
+    variant of the same name could never match anything.
+    """
+    return f"{engine}-{revision}"
+
+
 def browsers_present() -> dict[str, bool]:
-    """Which engines have a downloaded build, keyed by engine name.
+    """Which engines have a build for the REVISION the installed CLI needs.
 
     Reported per engine rather than as one boolean so the panel can offer each
     download separately: a user who wants to check a page in Firefox should not
     have to discover that "browser installed" only ever meant Chromium.
+
+    A cache dir carries the revision (``chromium-1232``), and playwright-core
+    launches only the exact revision bound to its own version. A prefix match
+    (``name.startswith(engine)``) ignores that revision, so a stale
+    ``chromium-1208`` left over from before a CLI upgrade reads as present while
+    the launch fails ``Browser "chromium" is not installed`` -- and because the
+    gate reads ready, the panel never offers the download that would fix it. So
+    ``browsers.json`` supplies the required revision and the match is exact.
+
+    Degradation: when the required revision cannot be determined (manifest
+    absent/unreadable -- see :func:`_required_revisions`), fall back to the older
+    prefix match rather than reporting a browser broken on missing metadata. A
+    missing manifest is an unknown, not evidence of a stale cache.
     """
     names = _cached_browser_names()
     if names is None:
         return {engine: False for engine in BROWSER_ENGINES}
-    return {engine: any(name.startswith(engine) for name in names) for engine in BROWSER_ENGINES}
+    required = _required_revisions()
+    if required is None:
+        # Cannot confirm a revision: preserve the historical presence-only
+        # behaviour rather than failing closed on absent metadata.
+        return {
+            engine: any(name.startswith(engine) for name in names) for engine in BROWSER_ENGINES
+        }
+    result: dict[str, bool] = {}
+    for engine in BROWSER_ENGINES:
+        revision = required.get(engine)
+        if revision is None:
+            # The engine is not in the manifest at all: we cannot say which
+            # revision it needs, so degrade to presence-only for this one engine.
+            result[engine] = any(name.startswith(engine) for name in names)
+            continue
+        wanted = _cache_dir_name_for(engine, revision)
+        result[engine] = wanted in names
+    return result
 
 
 def _browser_present() -> bool:
@@ -452,7 +664,10 @@ def _download_browser(path: str, engine: str | None = None) -> list[dict[str, An
     Every attempt is judged on its output as well as its exit code: a build whose
     libraries are missing downloads "successfully" and cannot launch.
     """
-    base = [path, "install-browser"] + ([engine] if engine else [])
+    selected_engine = engine or _DEFAULT_BROWSER_ENGINE
+    base = [path, "install-browser", selected_engine]
+    # Keep baseline step names stable for the dashboard; optional engine
+    # downloads name their engine so concurrent outcomes remain distinguishable.
     suffix = f"-{engine}" if engine else ""
     hint = os_deps.missing_deps_hint()
 

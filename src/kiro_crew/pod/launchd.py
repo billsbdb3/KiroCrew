@@ -56,14 +56,13 @@ from __future__ import annotations
 import os
 import plistlib
 import re
-import shlex
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
 from kiro_crew.pod.config import PodConfig, environment_vars
-from kiro_crew.pod.unit import _kirocrew_bin
+from kiro_crew.pod.unit import _kirocrew_argv as _shared_kirocrew_argv
 
 # Reverse-DNS label namespace. One label per pod; the name has already been
 # through runtime.validate_name (single safe segment, no '/', no '..'), which is
@@ -166,13 +165,8 @@ def log_paths(cfg: PodConfig, name: str) -> tuple[Path, Path]:
 
 
 def _kirocrew_argv() -> list[str]:
-    """``ProgramArguments`` needs a real argv, not systemd's command string.
-
-    ``unit._kirocrew_bin()`` may return ``"<python> -m kiro_crew"`` (two words)
-    when no console script is installed, so it is split rather than used as a
-    single path.
-    """
-    return shlex.split(_kirocrew_bin())
+    """Return the shared entry-point prefix in launchd's list form."""
+    return list(_shared_kirocrew_argv())
 
 
 def render_plist(cfg: PodConfig, name: str) -> dict[str, object]:
@@ -243,7 +237,7 @@ def start(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
 def stop(cfg: PodConfig, name: str, *, timeout: float = 15.0) -> subprocess.CompletedProcess:
     """``bootout`` the agent, wait for it to actually go, and drop its plist.
 
-    Two things here are not obvious and were both found by a real bring-up:
+    Three things here are not obvious:
 
     **``bootout`` is asynchronous.** It returns before launchd has finished
     unloading, so immediately afterwards ``launchctl print`` still resolves the
@@ -273,9 +267,9 @@ def stop(cfg: PodConfig, name: str, *, timeout: float = 15.0) -> subprocess.Comp
     while time.monotonic() < deadline:
         probe = _print(cfg, name)
         # Only the EXPLICIT not-loaded result confirms the unload. Any other
-        # nonzero print (permissions, transient daemon error) proves nothing —
-        # treating it as gone was itself a review-blocking bug: teardown would
-        # delete a possibly-live pod's state on a flaky probe.
+        # nonzero print (permissions, transient daemon error) proves nothing;
+        # treating one as gone would let teardown delete a possibly-live pod's
+        # state on a flaky probe.
         if _service_absent(probe):
             unloaded = True
             break
@@ -293,10 +287,6 @@ def stop(cfg: PodConfig, name: str, *, timeout: float = 15.0) -> subprocess.Comp
         )
     plist_path(cfg, name).unlink(missing_ok=True)
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=cp.stdout or "", stderr="")
-
-
-def restart(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:
-    return launchctl("kickstart", "-k", service_target(cfg, name))
 
 
 def _print(cfg: PodConfig, name: str) -> subprocess.CompletedProcess:

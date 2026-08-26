@@ -16,7 +16,6 @@ Permission flow:
 from __future__ import annotations
 
 import asyncio
-import difflib
 import functools
 import glob
 import json
@@ -34,15 +33,22 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Sequence, TypeVar
 
-from kiro_crew import model_registry, platform_compat
+from kiro_crew import agent_scratch, model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
     _kiro_mcp_server_name,
     _kiro_tool_name,
+    derive_edit_diff,
     extract_tool_purpose,
+    make_unified_diff,
     parse_session_modes,
     parse_usage_update,
 )
-from kiro_crew.acp.liveness import VERDICT_UNKNOWN, VERDICT_WORKING, LivenessOracle
+from kiro_crew.acp.liveness import (
+    VERDICT_WORKING,
+    LivenessOracle,
+    _consume_future_exception,
+    consult_offloaded,
+)
 from kiro_crew.acp.prompt_blocks import build_prompt_blocks
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
@@ -65,6 +71,7 @@ from kiro_crew.acp.types import (
     EVENT_TOOL_CALL,
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
+    JSONRPC_METHOD_NOT_FOUND,
     KNOWN_SESSION_UPDATES,
     METHOD_AGENT_SWITCHED,
     METHOD_CANCEL,
@@ -121,9 +128,10 @@ from kiro_crew.mcp_gateway.session_servers import pooled_session_servers
 from kiro_crew.resource_status import inject_xdist_auto_cap
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_SESSION_HOST,
+    apply_windows_resource_ceiling,
     cgroup_scope_argv,
     create_subprocess_limited,
-    scrub_agent_denied_env,
+    scrub_agent_subprocess_env,
     wrap_argv,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -711,6 +719,55 @@ def _is_tool_interrupted_marker(chunk: str) -> bool:
     return chunk.strip() == _TOOL_INTERRUPTED_MARKER
 
 
+def format_command_result(result: dict) -> str:
+    """Extract displayable text from a commands/execute response.
+
+    Module-level (not a method) because both native slash-command paths need
+    it: AcpClient.stream_command (direct-spawn sessions) and
+    AcpSessionHandle.stream_command (shared-runtime sessions).
+
+    The output is two-pass redacted (URLs + credentials) HERE, in the shared
+    helper, so every present and future caller inherits the security control
+    (command output is backend-echoed text that reaches the dashboard) instead
+    of each call site re-discovering it. Call-site re-redaction stays
+    harmless — both passes are idempotent.
+    """
+    data = result.get("data")
+    message = result.get("message", "")
+    text = ""
+    # Structured data — format as readable JSON block
+    if isinstance(data, dict) and data:
+        # Filter out agent/model metadata (handled separately)
+        display = {k: v for k, v in data.items() if k not in ("agent", "model")}
+        if display:
+            block = json.dumps(display, indent=2)
+            text = (
+                f"{message}\n```json\n{block}\n```"
+                if message
+                else f"```json\n{block}\n```"
+            )
+    if not text:
+        text = message or ""
+    if text:
+        text, _ = redact_exfiltration_urls(text)
+        text, _ = redact_credentials(text)
+    return text
+
+
+def parse_slash_command(command: str) -> tuple[str, dict]:
+    """Parse ``/foo bar baz`` into TuiCommand ``(name, args)``.
+
+    Shared by AcpClient.stream_command and AcpSessionHandle.stream_command —
+    both send the OBJECT form (``{command, args}``) because kiro-cli 2.14.0
+    returns no response on the string form of ``_kiro.dev/commands/execute``.
+    """
+    parts = command.strip().split(None, 1)
+    name = parts[0].lstrip("/") if parts else command.lstrip("/")
+    value = parts[1] if len(parts) > 1 else None
+    args: dict = {"value": value} if value else {}
+    return name, args
+
+
 # Timeouts for session initialization steps
 _INIT_TIMEOUT = 240.0  # 4 min — MCP servers can be slow to initialize
 # set_mode/set_model: fire-and-forget.  kiro-cli accepts these commands
@@ -829,23 +886,6 @@ _WAIT_RESPONSE_MAX_TIMEOUT = 600.0  # 10 min absolute ceiling
 # and must never gate tool dispatch, so a wedged SEL backend is abandoned (the
 # worker thread may leak, which is survivable) after this timeout.
 _SEL_AUDIT_TIMEOUT_SECONDS = 5.0
-# JSON-RPC 2.0 reserved error code for an unrecognized method — used to answer
-# unknown server→client requests so the agent fails fast instead of hanging.
-_JSONRPC_METHOD_NOT_FOUND = -32601
-
-
-def _consume_future_exception(future: asyncio.Future[tuple[str, str]]) -> None:
-    """Retrieve a liveness consult's exception so asyncio does not report it.
-
-    The /proc walk keeps running after its awaiter goes away, so it can finish
-    with an exception nobody reads. ``Future.__del__`` reports that through the
-    loop exception handler, which the gateway records as an unhandled-asyncio
-    crash for what is an ordinary probe failure.
-    """
-    if not future.cancelled():
-        future.exception()
-
-
 # Legacy kiro permission options omit the spec-mandated `kind` field. Only
 # synthesize a kind for these well-known literals — unknown ids stay empty
 # so we don't fabricate intent the agent didn't express.
@@ -1046,16 +1086,33 @@ _RE_SESSION_EXPIRED = re.compile(
     r"|re-?authenticate|login\s+required|auth(?:entication)?\s+required)\b",
     re.IGNORECASE,
 )
+# Credential REJECTED rather than expired. Switching the active Kiro account
+# invalidates the credential a long-lived kiro-cli child still holds, and the
+# upstream rejection reports only that the bearer token is invalid: it carries
+# no status code and never uses expiry wording, so neither _RE_AUTH_STATUS nor
+# _RE_SESSION_EXPIRED matches it and the failure reaches the user as the raw
+# upstream string with no sign-in affordance. Grouped with session expiry
+# because the remedy is identical — sign in again; no retry can make a rejected
+# credential valid. The gap between the two words is fenced to one sentence and
+# one line so the pattern cannot span unrelated errors in a combined haystack.
+_RE_INVALID_BEARER = re.compile(
+    r"\b(?:bearer\s+token\b[^.\n]{0,80}?\binvalid|invalid\s+bearer\s+token)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_session_expired(haystack: str) -> bool:
-    """True when the failure is an expired session rather than a backend fault.
+    """True when the session credential is expired or rejected, not a backend fault.
 
-    Both signals are terminal: retrying cannot refresh a login. Checked before
-    the 5xx family so an aborted request's transport error does not shadow the
-    real cause.
+    All three signals are terminal: retrying can neither refresh a login nor
+    revive a credential the upstream has rejected. Checked before the 5xx family
+    so an aborted request's transport error does not shadow the real cause.
     """
-    return bool(_RE_AUTH_STATUS.search(haystack) or _RE_SESSION_EXPIRED.search(haystack))
+    return bool(
+        _RE_AUTH_STATUS.search(haystack)
+        or _RE_SESSION_EXPIRED.search(haystack)
+        or _RE_INVALID_BEARER.search(haystack)
+    )
 
 
 # Account/plan capacity is EXHAUSTED — terminal. Distinct from a throttle: a
@@ -1729,6 +1786,92 @@ def _get_start_time(pid: int) -> int | None:
         return None
 
 
+def finish_suspended_spawn(process: asyncio.subprocess.Process, pid: int, *, label: str) -> None:
+    """Apply the Windows resource ceiling to a just-spawned child, then resume it.
+
+    **Call this from an executor, never inline on the event loop.** On Windows it
+    reads the config file (through ``apply_windows_resource_ceiling``) and walks
+    two Toolhelp snapshots — the process table for the ownership check and the
+    system-wide THREAD table to resume — so a slow config store or a loaded
+    machine would otherwise stall every other session on that loop. Both ACP
+    spawn sites wrap it in ``run_in_executor(subprocess_executor(), ...)``. It
+    stays synchronous rather than becoming a coroutine because every step is
+    blocking ctypes work with no await point to offer.
+
+    Both ACP spawn sites (:meth:`AcpClient._spawn` and ``AcpRuntime._spawn``)
+    create the session host with ``creationflags |=
+    platform_compat.CREATE_SUSPENDED`` and call this immediately afterwards. On
+    POSIX every step is a no-op — ``CREATE_SUSPENDED`` is 0 there, so the child
+    was never suspended — which keeps one code path for both platforms.
+
+    Why suspended: ``cgroup_scope_argv`` is a no-op on Windows (no systemd), so
+    without this the agent and every MCP server it spawns would run with NO
+    fork-bomb and NO memory-DoS ceiling. A Job object cannot be an argv prefix,
+    so it must be attached to a live pid — and job membership covers a member's
+    FUTURE descendants only. Attaching to an already-running kiro-cli would
+    therefore leave a window in which it could spawn an MCP server that escapes
+    the ceiling. ``CREATE_SUSPENDED`` closes that window by construction: the
+    child has not executed a single instruction, so it provably has no
+    descendants. Assign the job, then resume.
+
+    A resume failure is FATAL, but only when the child is actually there: a
+    process that exists yet cannot be resumed is alive-but-frozen, and letting it
+    masquerade as a running agent would hang the session on the ACP handshake
+    with no diagnosis. Kill it and raise instead. If the pid is already gone
+    there is nothing frozen to worry about — it exited on its own — so note it
+    and let the handshake surface the real error.
+
+    The ceiling itself fails SOFT (``apply_windows_resource_ceiling`` logs a
+    SECURITY warning and returns False): a missing ceiling must not break the
+    gateway. Only the resume may abort the spawn, which is why it runs from a
+    ``finally`` — a raising ceiling must still leave the child resumed or killed,
+    never frozen.
+
+    The two DESTRUCTIVE steps are gated on confirmed ownership: the pid's parent
+    must be this process. A Job object would impose a process and memory ceiling
+    on a stranger, and the unresumable branch KILLS what it is holding, so
+    neither may ever act on a pid we did not create. The resume itself is NOT
+    gated, because ``ResumeThread`` on a thread that is not suspended is a
+    documented no-op (its suspend count is already 0) — and leaving our own child
+    frozen would hang the session forever on the handshake with no diagnosis.
+    That asymmetry is deliberate: an unconfirmed pid loses only its ceiling,
+    which already fails soft by contract, while nothing can wedge or die by
+    mistake.
+    """
+    owned = not platform_compat.IS_WINDOWS or platform_compat.get_ppid(pid) == os.getpid()
+    try:
+        if owned:
+            apply_windows_resource_ceiling(pid)
+        else:
+            logger.debug(
+                "PID %d is not a confirmed child of this process; skipping the Windows "
+                "resource ceiling rather than bounding a foreign process",
+                pid,
+            )
+    finally:
+        if platform_compat.IS_WINDOWS and not platform_compat.resume_process_main_thread(pid):
+            if owned and platform_compat.pid_exists(pid):
+                logger.error(
+                    "Could not resume suspended %s (PID %d); killing it rather than "
+                    "leaving a frozen process that looks like a live agent",
+                    label,
+                    pid,
+                )
+                try:
+                    process.kill()
+                except Exception:
+                    logger.debug("kill of unresumable child failed", exc_info=True)
+                raise AcpError(
+                    f"failed to resume {label} (PID {pid}) after applying Windows "
+                    f"Job object resource limits"
+                )
+            logger.debug(
+                "Nothing to resume for PID %d — it is gone, or not ours to kill; the "
+                "handshake will report the real failure",
+                pid,
+            )
+
+
 def _read_basename(pid: int) -> bytes | None:
     """Read the executable basename for a PID (platform-aware).
 
@@ -1855,30 +1998,58 @@ def _kill_escaped_children(child_pids: dict[int, int | None] | dict[int, ChildRe
             pass
 
 
-def _make_unified_diff(old: str, new: str, path: str, max_len: int = 6000) -> str:
-    """Generate a unified diff string from old/new text, handling empty inputs."""
-    old_lines = (old if old.endswith("\n") else old + "\n").splitlines(keepends=True) if old else []
-    new_lines = (new if new.endswith("\n") else new + "\n").splitlines(keepends=True) if new else []
-    udiff = difflib.unified_diff(old_lines, new_lines, fromfile=path, tofile=path, n=3)
-    return "".join(udiff).rstrip()[:max_len]
+def _make_unified_diff(old: str, new: str, path: str, max_len: int = 65536) -> str:
+    """Generate a unified diff string from old/new text, handling empty inputs.
+
+    Thin delegate to :func:`kiro_crew.acp._dispatch.make_unified_diff`, kept as
+    a module-level name for this file's call sites and tests; the truncation
+    semantics (line-boundary cut + ``DIFF_TRUNCATION_MARK``) live in one place.
+    """
+    return make_unified_diff(old, new, path, max_len=max_len)
 
 
-def _select_tool_title(title: object, raw_input: object) -> str | None:
+def _select_tool_title(
+    title: object,
+    raw_input: object,
+    kind: object = None,
+    *,
+    is_shell: bool | None = None,
+) -> str | None:
     """Pick the pill label, preferring a human-readable `description` when present.
 
     Some backends' Bash tool emits a `description` field alongside `command`
     (e.g. "List KiroCrew ACP module files" rather than `ls /workplace/...`).
-    We surface it on the pill when supplied; otherwise we fall back to the
-    SDK-provided `title` (the literal tool invocation). Used by both
+    We surface it on the pill when supplied, then the literal shell command for
+    a shell tool, and only then the SDK-provided `title`. Used by both
     `_extract_tool_event` (initial tool_call) and
     `_extract_tool_call_refinement` (the second-phase tool_call_update from
     claude-agent-acp) so the title rule stays consistent across both events.
+
+    The command outranks `title` because backends disagree on what `title`
+    holds for a shell call: some send the invocation itself, others a generic
+    kind label ("Run Command") that names no command at all. A genuinely
+    human-readable label arrives as `description`, which still wins.
+
+    `is_shell` overrides the kind-derived classification for a caller holding a
+    RESOLVED signal — a tool_call_update may omit `kind` entirely, and reading
+    that absence as non-shell would put the generic title back on a pill the
+    initial tool_call had already labelled with its command.
     """
     if isinstance(raw_input, dict):
         desc = raw_input.get("description")
         if isinstance(desc, str) and desc.strip():
             return desc
-    if isinstance(title, str) and title:
+    kind_str = kind if isinstance(kind, str) else None
+    shell = _is_shell_kind(kind_str) if is_shell is None else is_shell
+    # Shell kinds only, so an fs tool's operation name ("strReplace") is never
+    # mistaken for a command.
+    if shell and isinstance(raw_input, dict):
+        cmd = raw_input.get("command")
+        if isinstance(cmd, str) and cmd.strip():
+            return cmd
+    # The flat title field defaults to an "unknown" sentinel when a backend
+    # omits it; treat that (and blanks) as absent rather than surfacing it.
+    if isinstance(title, str) and title and title != "unknown":
         return title
     return None
 
@@ -2569,9 +2740,9 @@ class AcpClient:
         # foreign MCP subprocesses (which bundle their own interpreter + deps).
         # is_kiro_cli is membership in ACP_BACKENDS_INTERNAL_SANDBOX
         # (harness-parity H7), not "not claude": the flag makes wrap_argv SKIP
-        # Crew's seatbelt on macOS in favour of the harness's own internal
-        # sandbox, so a harness without one must never be granted it by the
-        # absence of another harness.
+        # Crew's seatbelt on macOS and grants Windows's Kiro-only delegation in
+        # favour of the harness's own internal sandbox, so a harness without one
+        # must never be granted it by the absence of another harness.
         argv, self._sandbox_cleanup = wrap_argv(
             argv,
             mode=self._sandbox_mode,
@@ -2593,14 +2764,6 @@ class AcpClient:
         env = {**os.environ}
         if self._extra_env:
             env.update(self._extra_env)
-        # Parent-level scrub of gateway-owned channel credentials. The default
-        # auto/standard sandbox launcher strips _AGENT_DENIED_ENV_KEYS only for
-        # cc/strict, and this path copies a raw os.environ + wrap_argv (not
-        # sandboxed_spawn_argv), so without this the Slack/WeCom/Telegram tokens
-        # seeded into os.environ by load_credentials() would be inherited by the
-        # agent subprocess on the default tier. Leaves the AWS/SSH env the
-        # standard sandbox intentionally exposes untouched.
-        env = scrub_agent_denied_env(env)
         env["PATH"] = augmented_path(env.get("PATH", ""))
         if self._is_claude and not env.get("CLAUDE_CODE_EXECUTABLE"):
             # Dormant seam (see _spawn docstring): the adapter's SDK needs a
@@ -2641,10 +2804,30 @@ class AcpClient:
         env = await self._to_thread_guarding_sandbox(
             functools.partial(_resolve_spawn_env, kiro_api_key=self._is_kiro), env
         )
+        # Match the OS launchers' sensitive + Python env scrub in the parent.
+        # Windows Kiro delegation has no POSIX `env -u` wrapper, so this is the
+        # enforcement point there. Keep it after _resolve_spawn_env so SSH repair
+        # cannot reintroduce a denied pointer; KIRO_API_KEY remains available only
+        # to the positively identified Kiro backend.
+        env = scrub_agent_subprocess_env(env)
         # Positive-identity marker for the orphan sweep: kiro-cli and every MCP
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
         env[KIROCREW_SPAWNED_ENV] = KIROCREW_SPAWNED_VALUE
+        # Per-process scratch containment (#5063) -- see acp/runtime.py's
+        # twin block. Allocated off-loop, fail-open; owner recorded after
+        # spawn; reclamation is liveness-keyed, never age-keyed.
+        self._scratch_dir = None
+        try:
+            self._scratch_dir = await asyncio.to_thread(
+                agent_scratch.allocate_scratch, self._session_key or "session"
+            )
+            env.update(agent_scratch.scratch_env(self._scratch_dir))
+        except OSError:
+            logger.warning(
+                "agent-scratch: could not allocate; spawning with inherited temp",
+                exc_info=True,
+            )
         # Memory-aware cap for pytest-xdist's ``-n auto``: xdist sizes auto to
         # the CPU count, ignoring memory, so a full-suite run in an agent turn
         # can spawn cpu_count workers x ~1 GB each and exhaust the host. xdist
@@ -2679,16 +2862,36 @@ class AcpClient:
             creationflags=(
                 platform_compat.CREATE_NEW_PROCESS_GROUP
                 | platform_compat._SUBPROCESS_NO_WINDOW
+                | platform_compat.CREATE_SUSPENDED
             ),
             profile=RLIMIT_PROFILE_SESSION_HOST,
         )
         self._pid = self._process.pid
-        self._start_time = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), _get_start_time, self._pid
-        )
         _spawn_label = (
             "claude-agent-acp" if self._is_claude else f"{KIRO_CLI_BIN} {KIRO_CLI_SUBCMD}"
         )
+        # Windows resource ceiling, applied while the child is still SUSPENDED,
+        # then resumed. No-op on POSIX (CREATE_SUSPENDED is 0 there). OFFLOADED
+        # because the Windows path reads the config file and walks the process
+        # and thread tables (see the note on finish_suspended_spawn); the child
+        # is frozen until it returns, so this is the one await the spawn cannot
+        # skip.
+        await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(),
+            functools.partial(
+                finish_suspended_spawn, self._process, self._pid, label=_spawn_label
+            ),
+        )
+        self._start_time = await asyncio.get_running_loop().run_in_executor(
+            subprocess_executor(), _get_start_time, self._pid
+        )
+        if self._scratch_dir is not None:
+            # Liveness anchor for the scratch sweeps -- see acp/runtime.py's
+            # twin block. Off-loop, fail-open.
+            await asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(),
+                functools.partial(agent_scratch.record_owner, self._scratch_dir, self._pid),
+            )
         logger.info("Spawned %s (PID %d)", _spawn_label, self._pid)
         # Track root PID and do an early descendant scan.  kiro-cli forks
         # child processes quickly after launch.  Recording them here means
@@ -3324,8 +3527,28 @@ class AcpClient:
 
     async def shutdown(self) -> None:
         """Gracefully stop the ACP process."""
-        await self._kill_process(force=True)
-        self._reset_state()  # untracks all PIDs (root + children)
+        # `_reset_state` in a `finally`, because `_kill_process` can leave
+        # through several doors: it awaits four `run_in_executor` calls (child
+        # scan, record capture, escaped-child sweep) that are not individually
+        # guarded, `subprocess_executor()` refuses new work once the loop is
+        # tearing down, and `asyncio.CancelledError` is a `BaseException` --
+        # shutdown being exactly when cancellation arrives.
+        #
+        # Nothing retries. Every caller treats this as terminal and drops the
+        # client immediately afterwards (`AcpWorker` and `_shutdown_quietly`
+        # both `except Exception: log` and then set their reference to None), so
+        # a skipped reset is permanent: the pipes stay open, the sandbox temp
+        # files stay on disk, and for the claude backend
+        # `.claude/settings.local.json` -- written to hold `bypassPermissions`
+        # for the session -- survives the process it belonged to.
+        #
+        # Running it after a failed kill is safe by construction: `_reset_state`
+        # untracks only PIDs it confirms dead and deliberately RETAINS tracking
+        # for survivors so the orphan sweep still reaps them.
+        try:
+            await self._kill_process(force=True)
+        finally:
+            self._reset_state()  # untracks all PIDs (root + children)
 
     # ── JSON-RPC Transport ──
 
@@ -3925,45 +4148,21 @@ class AcpClient:
           path has it too); tighter per-branch attribution belongs in
           ``liveness.py``, shared by both callers, not here.
 
-        A timed-out await does not stop its executor thread. Keep that future
-        until the /proc walk finishes and return UNKNOWN on intervening polls,
-        bounding this client to one outstanding consult job per turn.
-        ``_prompt_loop`` retires it at turn start under ``_turn_lock``, so a walk
-        abandoned by one turn never gates the next (at the cost of one abandoned
-        worker per turn, versus one per silent read before this guard existed).
+        A timed-out await does not stop its executor thread. The one-outstanding-
+        walk bound, the refused-submission-reads-UNKNOWN contract, and exception
+        retrieval all live in the shared :func:`consult_offloaded` guard.
+        ``_prompt_loop`` retires the tracked future at turn start under
+        ``_turn_lock``, so a walk abandoned by one turn never gates the next (at
+        the cost of one abandoned worker per turn, versus one per silent read
+        before this guard existed).
         """
-        prior = self._consult_future
-        if prior is not None:
-            if not prior.done():
-                return VERDICT_UNKNOWN, "prior consult still in flight"
-            # wait_for cancels shield's outer future, and shield detaches its
-            # inner-done callback in exactly that case. The submission-time
-            # callback below handles that normal path; this consume additionally
-            # covers an already-completed future that never went through it.
-            _consume_future_exception(prior)
-
-        try:
-            # Submission stays inside the guard: the caller is a silent-read poll
-            # in _prompt_loop, so a refused executor job (shut down during
-            # teardown, thread creation refused under load) must read as UNKNOWN
-            # rather than abort the live turn.
-            loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(
-                subprocess_executor(),
-                self._liveness_oracle.check_model_wait,
-                getattr(self, "_pid", None),
-            )
-            # Attach at SUBMISSION, not only where a later poll or _reset_state
-            # observes it: a turn that reaches the stale cutoff returns with this
-            # walk still running, and an idle client may never look again.
-            # Retrieval is not destructive, so the await below still sees the
-            # result.
-            future.add_done_callback(_consume_future_exception)
-            self._consult_future = future
-            return await asyncio.wait_for(asyncio.shield(future), timeout=10.0)
-        except Exception:
-            logger.debug("liveness consult failed/timed out", exc_info=True)
-            return VERDICT_UNKNOWN, "oracle offload error"
+        return await consult_offloaded(
+            self,
+            self._liveness_oracle.check_model_wait,
+            (getattr(self, "_pid", None),),
+            executor_factory=subprocess_executor,
+            log_label="liveness consult",
+        )
 
     # ── Public API ──
 
@@ -4104,7 +4303,7 @@ class AcpClient:
                 if extract_agent_from_result and isinstance(result, dict):
                     # commands/execute returns output in result fields,
                     # not via session/update chunks — yield as text.
-                    text = self._format_command_result(result)
+                    text = format_command_result(result)
                     if text:
                         yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=text)
                     if not saw_agent_switch:
@@ -4239,6 +4438,9 @@ class AcpClient:
                     len(_subs) if isinstance(_subs, list) else "n/a",
                 )
                 if isinstance(_subs, list):
+                    # No runtime_global marking here: AcpClient owns a dedicated
+                    # process with a single session, so an ownerless frame from
+                    # it is this session's own roster, never a co-tenant's.
                     yield AcpEvent(kind=EVENT_SUBAGENT_LIST, subagents=_subs)
             elif action == "subagent_activity":
                 # _kiro.dev/session/update: a sub-agent session's own update,
@@ -4465,7 +4667,7 @@ class AcpClient:
         self._cancelled = False
         await self.ensure_ready()
 
-        cmd_name, cmd_args = self._parse_slash_command(command)
+        cmd_name, cmd_args = parse_slash_command(command)
         req_id = await self._send_request(
             METHOD_COMMANDS_EXECUTE,
             {
@@ -4475,34 +4677,6 @@ class AcpClient:
         )
         async for event in self._dispatch_events(req_id, timeout, extract_agent_from_result=True):
             yield event
-
-    @staticmethod
-    def _format_command_result(result: dict) -> str:
-        """Extract displayable text from a commands/execute response."""
-        import json as _json
-
-        data = result.get("data")
-        message = result.get("message", "")
-        # Structured data — format as readable JSON block
-        if isinstance(data, dict) and data:
-            # Filter out agent/model metadata (handled separately)
-            display = {k: v for k, v in data.items() if k not in ("agent", "model")}
-            if display:
-                return (
-                    f"{message}\n```json\n{_json.dumps(display, indent=2)}\n```"
-                    if message
-                    else f"```json\n{_json.dumps(display, indent=2)}\n```"
-                )
-        return message or ""
-
-    @staticmethod
-    def _parse_slash_command(command: str) -> tuple[str, dict]:
-        """Parse ``/foo bar baz`` into TuiCommand ``(name, args)``."""
-        parts = command.strip().split(None, 1)
-        name = parts[0].lstrip("/") if parts else command.lstrip("/")
-        value = parts[1] if len(parts) > 1 else None
-        args: dict = {"value": value} if value else {}
-        return name, args
 
     async def cancel_session(self, grace_secs: float = 0.0) -> None:
         """Cancel the current in-flight operation via ACP session/cancel.
@@ -4564,7 +4738,19 @@ class AcpClient:
         await self._send_request(
             "_session/steer", {"sessionId": self._session_id, "message": wrapped}
         )
+        # See AcpSessionHandle.steer for why the stamp is taken at the write.
+        self._last_steer_monotonic = time.monotonic()
         return True
+
+    # Monotonic stamp of the last steer handed to the backend, 0.0 when never
+    # steered. Mirrors AcpSessionHandle.last_steer_monotonic — the dashboard's
+    # keepalive route reads whichever of the two backs the live session.
+    _last_steer_monotonic: float = 0.0
+
+    @property
+    def last_steer_monotonic(self) -> float:
+        """Monotonic time of the last steer written to the backend (0.0 if none)."""
+        return self._last_steer_monotonic
 
     @property
     def supports_steer(self) -> bool:
@@ -4699,7 +4885,7 @@ class AcpClient:
         if msg.id is None:
             return
         logger.warning("ACP: rejecting unknown server request: method=%s id=%s", msg.method, msg.id)
-        await self._send_error(msg.id, _JSONRPC_METHOD_NOT_FOUND, f"Method not found: {msg.method}")
+        await self._send_error(msg.id, JSONRPC_METHOD_NOT_FOUND, f"Method not found: {msg.method}")
 
     def _extract_text_chunk(self, msg: JsonRpcMessage) -> tuple[str | None, bool]:
         """Extract text from an agent_message_chunk or agent_thought_chunk update.
@@ -5079,19 +5265,16 @@ class AcpClient:
                             input_str = diff_str
                             found_diff = True
                         break
-            # Fallback for strReplace when no diff content block was found
-            if (
-                not found_diff
-                and isinstance(raw_input, dict)
-                and raw_input.get("command") == "strReplace"
+            # Fallback when no diff content block was found: derive from the
+            # edit args (strReplace pair, create/insert content). Gated on
+            # the EDIT kind — "content"-shaped args exist on non-edit tools.
+            if not found_diff and (
+                kind == "edit"
+                or (isinstance(raw_input, dict) and raw_input.get("command") == "strReplace")
             ):
-                old = raw_input.get("oldStr") or ""
-                new = raw_input.get("newStr") or ""
-                path = raw_input.get("path") or ""
-                if old or new:
-                    diff_str = _make_unified_diff(old, new, path)
-                    if diff_str:
-                        input_str = diff_str
+                diff_str = derive_edit_diff(raw_input)
+                if diff_str:
+                    input_str = diff_str
             # Redact sensitive content before caching/displaying
             if input_str:
                 input_str, _ = redact_exfiltration_urls(input_str)
@@ -5129,7 +5312,7 @@ class AcpClient:
                 # Cache the trusted tool name too, so the permission event can
                 # rebuild mcp__<server>__<tool> for per-tool governance.
                 self._tool_call_tool_name[tool_call_id] = _kiro_tool_name(update)
-            title = _select_tool_title(title, raw_input) or ""
+            title = _select_tool_title(title, raw_input, kind, is_shell=is_shell) or ""
             if title:
                 title, _ = redact_exfiltration_urls(title)
                 title, _ = redact_credentials(title)
@@ -5283,10 +5466,26 @@ class AcpClient:
             input_str, _ = redact_exfiltration_urls(input_str)
             input_str, _ = redact_credentials(input_str)
             self._tool_call_inputs[tool_use_id] = input_str
+        # Refresh the cached shell signal only when this refinement carries a
+        # kind. A refinement that omits kind must NOT clobber a True cached by
+        # the initial tool_call notification (kind is optional on updates).
+        # Cache off the RAW kind, not the redacted kind_str. Resolved BEFORE the
+        # title so the label rule sees the real classification rather than a
+        # missing kind.
+        if isinstance(kind, str) and kind:
+            self._tool_call_is_shell[tool_use_id] = _is_shell_kind(kind)
+        is_shell = self._tool_call_is_shell.get(tool_use_id, False)
         # Prefer rawInput.description over the SDK-supplied title (e.g.
         # Bash's "List KiroCrew ACP module files" rather than `ls /workplace/...`).
         # Same helper as `_extract_tool_event` so the rule is consistent.
-        title_source = _select_tool_title(title, raw_input)
+        # A refinement carrying a title but no rawInput still overwrites the
+        # pill, so the command has to be recoverable from the params the initial
+        # tool_call cached — otherwise a backend that sends a generic title on
+        # both events lands that label on a pill the first event got right.
+        _title_params: object = raw_input
+        if not (isinstance(raw_input, dict) and raw_input):
+            _title_params = self._tool_call_params.get(tool_use_id)
+        title_source = _select_tool_title(title, _title_params, kind, is_shell=is_shell)
         title_str = ""
         if title_source:
             title_str, _ = redact_exfiltration_urls(title_source)
@@ -5305,13 +5504,6 @@ class AcpClient:
         if purpose:
             purpose, _ = redact_exfiltration_urls(purpose)
             purpose, _ = redact_credentials(purpose)
-        # Refresh the cached shell signal only when this refinement carries a
-        # kind. A refinement that omits kind must NOT clobber a True cached by
-        # the initial tool_call notification (kind is optional on updates).
-        # Cache off the RAW kind, not the redacted kind_str.
-        if isinstance(kind, str) and kind:
-            self._tool_call_is_shell[tool_use_id] = _is_shell_kind(kind)
-        is_shell = self._tool_call_is_shell.get(tool_use_id, False)
         return AcpEvent(
             kind=EVENT_TOOL_CALL_UPDATE,
             title=title_str,
@@ -5443,12 +5635,15 @@ class AcpClient:
         # Record optionIds the agent advertised so approve_tool / reject_tool
         # can echo the exact ids. We record when EITHER an allow option (for
         # approve) OR a reject option (for a clean reject) was advertised.
-        # claude-agent-acp advertises a {kind:"reject_once", optionId:"reject"}
-        # option whose selection yields behavior:"deny" — sending that is far
-        # better than a "cancelled" outcome, which the adapter turns into the
-        # cryptic "Tool use aborted". kiro-cli advertises no reject option, so
-        # reject_tool falls back to "cancelled" there (handled as a clean
-        # rejection by kiro).
+        # Both backends advertise a reject option — claude-agent-acp as
+        # {kind:"reject_once", optionId:"reject"}, kiro-cli as
+        # {kind:"reject_once", optionId:"reject_once"} — and sending it is far
+        # better than a "cancelled" outcome: kiro-cli resolves a clean reject to
+        # a FAILED tool call and lets the turn continue to a model-inference
+        # boundary, whereas "cancelled" ends the turn outright with
+        # stopReason:"refusal" (and the claude adapter turns it into the cryptic
+        # "Tool use aborted"). reject_tool falls back to "cancelled" only for a
+        # backend that advertised no reject option at all.
         any_allow = kind_to_id.get("allow_once") or kind_to_id.get("allow_always")
         any_reject = kind_to_id.get("reject_once") or kind_to_id.get("reject_always")
         if request_id != "" and (any_allow is not None or any_reject is not None):
@@ -5553,66 +5748,29 @@ class AcpClient:
         )
 
     def _backfill_context_window(self, pct: float) -> None:
-        """Derive window/used tokens when kiro-cli 2.10+ metadata gives only a
-        percentage (no usage_update {used, size}).
+        """Derive window/used tokens from a percentage-only reading.
 
-        Resolves the window through the central ``model_registry.model_window``
-        authority (kiro-list cache > static registry > [1m] heuristic). This now
-        works for non-Anthropic kiro models too (GPT 272k, DeepSeek 164k, …) once
-        the kiro-list cache is seeded, instead of no-op'ing. Only backfills a
-        window from a KNOWN source (``has_known_window``): a genuinely-unknown
-        model returns None and we leave the window 0 so the frontend's own
-        authoritative window (from /api/models) drives the meter rather than a
-        guess. kiro's real ``usage_update.size`` always wins when present (this
-        no-ops once it has set the window).
-
-        A surviving ``context_window_tokens`` outranks the registry: after a
-        compaction reset the counts are dropped but the SERVED window is kept
-        (the model did not change), and the served size can differ from the
-        registry's static entry (e.g. opus served at [1m] vs a 200K registry
-        row). Deriving against the kept window keeps the post-compaction
-        numbers consistent with what the adapter actually serves.
+        Thin wrapper binding this client's resolved model id; the shared logic
+        lives on ``AcpPromptStats.backfill_context_window`` (the AcpSessionHandle
+        path delegates to the same method, so the two can no longer drift).
         """
-        if self.last_prompt_stats.context_tokens_from_usage:
-            return  # a real usage_update already set authoritative counts
-        win = self.last_prompt_stats.context_window_tokens
-        if not win or win <= 0:
-            model_id = self._resolved_model_id or self._model
-            if not model_id or not model_registry.has_known_window(model_id):
-                return
-            reg_win = model_registry.model_window(model_id)
-            if not reg_win or reg_win <= 0:
-                return
-            win = int(reg_win)
-            self.last_prompt_stats.context_window_tokens = win
-        # A malformed metadata percentage (NaN, ±inf, or a huge finite value
-        # like 1e308) would overflow ``round(win * pct / 100)`` and abort the
-        # turn. Sanitize to a sane [0, 100] before deriving used tokens (NaN
-        # -> 0); this also keeps used <= window.
-        safe_pct = 0.0 if pct != pct else min(max(pct, 0.0), 100.0)
-        self.last_prompt_stats.context_used_tokens = round(win * safe_pct / 100.0)
+        self.last_prompt_stats.backfill_context_window(
+            pct, self._resolved_model_id or self._model
+        )
 
     def _track_metadata(self, msg: JsonRpcMessage) -> None:
         params = msg.params or {}
-        pct = params.get("contextUsagePercentage")
         # A real usage_update is authoritative for both the token counts AND the
         # pct derived from them. kiro's metadata percentage can measure a
         # different window, so applying it here would desync the headline % from
         # the "used / total" token text (e.g. 73% shown next to 408K / 1000K).
-        if pct is not None and not self.last_prompt_stats.context_tokens_from_usage:
-            try:
-                pct_f = float(pct)
-                # Sanitize a malformed metadata percentage (NaN/±inf/out-of-range,
-                # e.g. 1e308) at the source so context_pct is always a real
-                # [0, 100] value: keeps compaction comparisons sane and the
-                # diagnostic /api/sessions JSON standard (Infinity/NaN are not
-                # valid JSON). NaN is caught by its self-inequality.
-                pct_f = 0.0 if pct_f != pct_f else min(max(pct_f, 0.0), 100.0)
-                self.last_prompt_stats.context_pct = pct_f
-                self.last_prompt_stats.note_pct_reported()
-                self._backfill_context_window(pct_f)
-            except (TypeError, ValueError):
-                pass
+        # sanitize_pct is the shared coercion (the KAS usagePercentage path uses
+        # it too): it clamps NaN/±inf/out-of-range and returns None when absent.
+        pct_f = self.last_prompt_stats.sanitize_pct(params.get("contextUsagePercentage"))
+        if pct_f is not None and not self.last_prompt_stats.context_tokens_from_usage:
+            self.last_prompt_stats.context_pct = pct_f
+            self.last_prompt_stats.note_pct_reported()
+            self._backfill_context_window(pct_f)
         # kiro streams per-turn billing as meteringUsage entries (unit="credit").
         # Accumulate across the turn's metadata notifications; reset per turn by
         # the AcpPromptStats re-init in _dispatch_events/send_message_stream.

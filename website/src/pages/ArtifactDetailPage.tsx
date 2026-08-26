@@ -1,4 +1,6 @@
 import { safeSetItem } from '../utils/safeStorage'
+import { useIsMobile } from '../hooks/useIsMobile'
+import { useImeGuard } from '../hooks/useImeGuard'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import WebAppArtifactCard from '../components/WebAppArtifactCard'
 import { useNavigate, useParams } from 'react-router-dom'
@@ -16,6 +18,7 @@ import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
 import { api } from '../api/client'
 import { PageHeader, Card, Badge, Btn, Input } from '../components/ui'
 import SimpleSelect from '../components/SimpleSelect'
+import { useConfirm } from '../components/ConfirmDialog'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem } from '../components/ui/dropdown-menu'
 import ReadingWidthToggle from '../components/ReadingWidthToggle'
 import { useReadingWidth } from '../hooks/useReadingWidth'
@@ -43,6 +46,7 @@ import type { Artifact, ArtifactEvent, ArtifactComment, CommentAnchor, ChatSlot 
 import { i18nT } from '../i18n/t'
 import { fmtDateFields } from '../i18n/format'
 import ErrorNotice from '../components/ErrorNotice'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /**
  * The artifact's active companion session: the bound slot for `slug`, or the most
  * recently active one if a race or a History-page resume left more than one.
@@ -129,6 +133,7 @@ const ActivityTimeline = memo(function ActivityTimeline({
   events: ArtifactEvent[]
   navigateToSlot: (slotKey: string) => void
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   if (!events.length) {
     return (
       <div className="text-[12px] text-muted">{i18nT('pages.artifactDetailPage.no_lifecycle_events_yet')}</div>
@@ -276,6 +281,7 @@ function ArtifactPopoutControl({ slug, name }: { slug: string; name: string }) {
 export default function ArtifactDetailPage({ popout = false }: { popout?: boolean } = {}) {
   const { slug = '' } = useParams<{ slug: string }>()
   const navigate = useNavigate()
+  const { confirm, confirmDialog, confirmOpen } = useConfirm()
   // Claimed once from the library's "New Artifact" action, which creates the
   // document empty and hands it over here. Two behaviours hang off it: the editor
   // opens focused (so the user starts typing rather than hunting for an Edit
@@ -351,6 +357,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // posts metadata-only (no version bump). Removing a tag works the same way.
   const [addingTag, setAddingTag] = useState(false)
   const [newTag, setNewTag] = useState('')
+  const ime = useImeGuard()
   // ── Inline-comment state (durable via /api/artifacts/:slug/comments) ──
   const commentsQuery = useQuery<{ comments: ArtifactComment[]; remote_sync_error?: string | null }>({
     queryKey: ['artifact-comments', slug],
@@ -369,6 +376,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   // show/hide applies to the current view only; we intentionally do NOT persist
   // it, so every artifact independently does the right thing instead of a
   // global pin re-opening empty panels everywhere.
+  const isMobile = useIsMobile()
   const [panel, setPanel] = useState<'none' | 'comments' | 'chat'>('none')
   // Flipped once the user manually toggles, so the comment-driven auto-reveal
   // below stops overriding an explicit choice — but only for the current
@@ -397,9 +405,15 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     if (sidebarUserToggledRef.current) return
     setPanel(p => {
       if (p === 'chat' && !navigated) return p
-      return commentCount > 0 ? 'comments' : 'none'
+      // NOT while narrow. There the panel takes the whole pane and the artifact
+      // body steps aside, so auto-revealing lands every commented artifact on
+      // comments about content the reader cannot see, with a close button to
+      // find first. Auto-reveal was written for the side-by-side layout, where
+      // the body stayed visible beside it. A manual open still survives, via the
+      // user-toggled override this effect returns on above.
+      return commentCount > 0 && !isMobile ? 'comments' : 'none'
     })
-  }, [slug, commentCount])
+  }, [slug, commentCount, isMobile])
   const [popover, setPopover] = useState<{ x: number; y: number; anchor: string; line?: number; column?: number; prefix?: string; suffix?: string; startOffset?: number; endOffset?: number } | null>(null)
   // Bidirectional anchor↔comment linking: flash a sidebar row when
   // its in-iframe highlight is clicked; scroll the iframe highlight when a
@@ -683,13 +697,16 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     }
   }, [justCreatedBlank, queryClient])
 
-  const cancelEditing = useCallback(() => {
-    if (dirty && !window.confirm(i18nT('pages.artifactDetailPage.discard_unsaved_changes'))) return
+  const cancelEditing = useCallback(async () => {
+    if (dirty && !(await confirm({
+      title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
+      confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
+    }))) return
     setEditing(false)
     setEditedContent('')
     setSaveError(null)
     setPreviewDuringEdit(false)
-  }, [dirty])
+  }, [dirty, confirm])
 
   const handleSave = useCallback(async (snapshot = false) => {
     if (!artifact || !dirty) return
@@ -804,6 +821,12 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
   useEffect(() => {
     if (!editing) return
     const h = (e: KeyboardEvent) => {
+      // While the discard-confirm dialog is open, the keyboard belongs to it.
+      // Escape dismisses it via the dialog's own handler (re-running the guard
+      // here would re-open the dialog the same keystroke just closed), and the
+      // save shortcut must not fire — a mid-dialog Cmd+S would persist the very
+      // draft the user is about to confirm discarding.
+      if (confirmOpen) return
       if ((e.metaKey || e.ctrlKey) && e.key === 's' && dirty) {
         e.preventDefault()
         // Cmd+Shift+S → snapshot (creates a new version), Cmd+S → silent save.
@@ -813,7 +836,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     }
     document.addEventListener('keydown', h)
     return () => document.removeEventListener('keydown', h)
-  }, [editing, dirty, cancelEditing])
+  }, [editing, dirty, cancelEditing, confirmOpen])
 
   // Tell the WS transport this artifact is being edited, so a live
   // `artifact_update` does not refetch the content out from under the editor and
@@ -971,11 +994,16 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
     // would yank the conversation out from under the user. The toolbar's comment
     // badge already increments, so the add is still visibly acknowledged. Same
     // rationale as the auto-reveal guard in the panel effect above.
-    sidebarUserToggledRef.current = false
+    // Narrow: keep the override SET. Clearing it hands control back to the
+    // auto-reveal effect, which is gated off while narrow -- so the panel the
+    // user just posted into would be closed again the moment `commentCount`
+    // changes. Revealing it here is a user-initiated open, which is exactly what
+    // the override means.
+    sidebarUserToggledRef.current = isMobile
     setPanel(p => (p === 'chat' ? p : 'comments'))
     setPopover(null)
     window.getSelection()?.removeAllRanges()
-  }, [popover, postCommentMut])
+  }, [popover, postCommentMut, isMobile])
 
   // Doc-level add (from the sidebar) — works for ALL kinds, including
   // HTML/widget where in-iframe text selection isn't reachable.
@@ -1403,7 +1431,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         <div className="sticky top-0 z-10 bg-bg border-b border-border">
           <PageHeader title={i18nT('pages.artifactDetailPage.artifact')} subtitle={slug} />
         </div>
-        <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+        <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
           <Card>
             <div className="flex items-start gap-3">
               <AlertTriangle className="lucide-inline text-danger" />
@@ -1452,11 +1480,11 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               value={nameDraft}
               aria-label={i18nT('pages.artifactDetailPage.artifact_name')}
               onChange={(e) => setNameDraft(e.target.value)}
-              onBlur={commitRename}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') { e.preventDefault(); void commitRename() }
-                else if (e.key === 'Escape') { e.preventDefault(); setRenaming(false) }
-              }}
+              {...ime.bindEnter({
+                onEnter: () => void commitRename(),
+                onEscape: () => setRenaming(false),
+                onBlur: () => void commitRename(),
+              })}
               className="px-2 py-0.5 text-2xl font-bold tracking-tight text-text-strong w-full max-w-[36rem]"
             />
           ) : (
@@ -1472,10 +1500,13 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
           )}
           subtitle={i18nT('pages.artifactDetailPage.artifact_slug', { slug: artifact.slug })}
         />
-        <div className="px-6 py-2 flex flex-wrap items-center gap-2">
+        <div className="px-4 md:px-6 py-2 flex flex-wrap items-center gap-2">
           {!popout && (
-            <Btn onClick={() => {
-              if (dirty && !window.confirm(i18nT('pages.artifactDetailPage.discard_unsaved_changes'))) return
+            <Btn onClick={async () => {
+              if (dirty && !(await confirm({
+                title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
+                confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
+              }))) return
               navigate('/artifacts')
             }} className="flex items-center gap-1">
               <ArrowLeft size={13} /> {i18nT('pages.artifactDetailPage.back')}
@@ -1548,20 +1579,31 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               value={newTag}
               onChange={e => setNewTag(e.target.value)}
               onKeyDown={e => {
-                if (e.key === 'Enter') addTag(newTag)
-                if (e.key === ',' || e.key === ' ') {
-                  e.preventDefault()
-                  if (newTag.trim()) addTag(newTag)
+                if (e.key === 'Enter') {
+                  // Rule 2 shape: this handler carries more than Enter (comma/space
+                  // also commit), so only the Enter path is gated. Rule 1: single-line
+                  // input, so the guard alone is enough.
+                  if (ime.isComposing(e)) return
+                  addTag(newTag)
                 }
-                if (e.key === 'Escape') { setNewTag(''); setAddingTag(false) }
+                if (e.key === ',' || e.key === ' ') {
+                  // Space cycles IME candidates mid-composition; committing here
+                  // would post the composing buffer and kill candidate selection.
+                  // The claim is key-agnostic: it consumes the separator only
+                  // when the IME is not itself using the keypress.
+                  if (ime.claimEnter(e) && newTag.trim()) addTag(newTag)
+                }
+                if (e.key === 'Escape') { ime.reset(); setNewTag(''); setAddingTag(false) }
               }}
-              onBlur={() => {
-                if (newTag.trim()) addTag(newTag)
-                else setAddingTag(false)
-              }}
+              {...ime.bindComposition({
+                onBlur: () => {
+                  if (newTag.trim()) addTag(newTag)
+                  else setAddingTag(false)
+                },
+              })}
               autoFocus
               placeholder={i18nT('pages.artifactDetailPage.tag')}
-              className="text-[11px] px-1.5 py-0.5 rounded bg-bg-elevated border border-accent text-text outline-none"
+              className="text-[11px] px-1.5 py-0.5 rounded bg-bg-elevated border border-accent text-text outline-none focus-ring"
               style={{ width: '90px' }}
               aria-label={i18nT('pages.artifactDetailPage.add_a_tag')}
             />
@@ -1591,8 +1633,11 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
               options={versionOptions}
               optionLabels={versionOptionLabels}
               value={selectedVersion === null ? 'live' : String(selectedVersion)}
-              onChange={(raw) => {
-                if (dirty && !window.confirm(i18nT('pages.artifactDetailPage.discard_unsaved_changes'))) return
+              onChange={async (raw) => {
+                if (dirty && !(await confirm({
+                  title: i18nT('pages.artifactDetailPage.discard_unsaved_changes'),
+                  confirmLabel: i18nT('pages.artifactDetailPage.discard_changes_button'),
+                }))) return
                 setEditing(false)
                 setEditedContent('')
                 if (raw === 'live') {
@@ -1763,7 +1808,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
         </div>
       </div>
 
-      <div className="px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+      <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
         {artifact.description && (
           <div className="mb-3 text-sm text-muted italic">{artifact.description}</div>
         )}
@@ -1822,7 +1867,12 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
             would let a click on a webapp artifact create/activate a session with
             nowhere to display. */}
         <div className="flex gap-4 items-start">
-          <div className="flex-1 min-w-0">
+          {/* An open panel owns the width while narrow, so the artifact body
+              steps aside -- giving the panel `w-full` alone would still leave the
+              two of them splitting 390px. Hidden rather than unmounted: the body
+              holds scroll position and, for markdown, an in-progress anchored
+              comment selection, and rotating a phone crosses the breakpoint. */}
+          <div className={`flex-1 min-w-0 ${isMobile && panel !== 'none' ? 'hidden' : ''}`}>
             {/* Copy raw source — its own right-aligned slot ABOVE the body (not
                 the header toolbar, which must not grow; not an overlay, which
                 could obscure a heading's trailing text or cover a top-right
@@ -1990,6 +2040,7 @@ export default function ArtifactDetailPage({ popout = false }: { popout?: boolea
           />
         </div>
       </div>
+      {confirmDialog}
     </>
   )
 }

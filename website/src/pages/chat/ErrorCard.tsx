@@ -2,6 +2,7 @@ import { memo } from 'react'
 import { Loader2, Play } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 
 export interface ErrorCardProps {
   /** Server- or client-authored error prose, rendered verbatim. */
@@ -30,10 +31,11 @@ export interface ErrorCardProps {
  * feature, and there is no state the user could reach that would enable it.
  */
 export const ErrorCard = memo(function ErrorCard({ content, onContinue, continuing }: ErrorCardProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   if (!onContinue) {
     return (
       <div
-        className="bg-danger-subtle text-danger text-[13px] px-3 py-2 rounded-md border border-danger/15 self-center animate-scale-in"
+        className="bg-danger-subtle text-danger text-[13px] leading-5 px-3 py-2 rounded-md ring-1 ring-inset forced-colors:border ring-danger/15 self-center animate-scale-in"
         data-testid="error-card"
       >
         {content}
@@ -42,18 +44,18 @@ export const ErrorCard = memo(function ErrorCard({ content, onContinue, continui
   }
   return (
     <div
-      className="bg-danger-subtle border border-danger/20 rounded-md self-center w-full max-w-full min-w-0 px-3 py-2 flex items-center gap-3 animate-scale-in"
+      className="bg-danger-subtle ring-1 ring-inset forced-colors:border ring-danger/20 rounded-md self-center w-full max-w-full min-w-0 px-3 py-2 flex items-center gap-3 animate-scale-in"
       data-testid="error-card"
       data-continuable="true"
     >
-      <div className="text-danger text-[13px] flex-1 min-w-0" style={{ overflowWrap: 'anywhere' }}>
+      <div className="text-danger text-[13px] leading-5 flex-1 min-w-0" style={{ overflowWrap: 'anywhere' }}>
         {content}
       </div>
       <button
         type="button"
         onClick={onContinue}
         disabled={continuing}
-        className="shrink-0 inline-flex items-center gap-1.5 text-[12px] font-medium px-2.5 py-1 rounded-md bg-accent text-accent-fg border-none cursor-pointer hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        className="shrink-0 inline-flex items-center gap-2 text-[12px] leading-5 font-medium px-3 py-1 rounded-md bg-accent text-accent-fg border-none cursor-pointer hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         title={i18nT('pages.chat.errorCard.continue_hint')}
         data-testid="error-card-continue"
       >

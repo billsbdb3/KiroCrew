@@ -1,4 +1,5 @@
 import { memo, useMemo, useRef, useState, useCallback, useEffect } from 'react'
+import { useIsMobile } from '../hooks/useIsMobile'
 import {
   MessageSquare, X, RefreshCw, Send, Bot, CheckCircle2, Eye, CornerDownRight,
   AlertTriangle, ChevronRight, Sparkles, Plus, RotateCcw, Link2, Pencil,
@@ -9,6 +10,7 @@ import { useAutoGrowTextarea } from '../hooks/useAutoGrowTextarea'
 
 import { i18nT } from '../i18n/t'
 import { fmtDateFields } from '../i18n/format'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /** Short relative-ish timestamp for a comment row. */
 function fmtTs(ts: string): string {
   if (!ts) return ''
@@ -82,10 +84,12 @@ export function ReplyBox({ onSubmit, onCancel }: { onSubmit: (text: string) => v
         rows={2}
         placeholder={i18nT('components.commentsSidebar.reply')}
         onChange={e => setText(e.target.value)}
-        {...ime.composition}
+        {...ime.bindComposition()}
         onKeyDown={e => {
-          if (e.key === 'Enter' && !e.shiftKey && !ime.isComposing(e) && text.trim()) {
-            e.preventDefault(); onSubmit(text.trim())
+          // The emptiness test stays OUTSIDE the claim: on a blank box this Enter is not
+          // a submit at all, and taking it would cost the newline it means there.
+          if (e.key === 'Enter' && !e.shiftKey && text.trim()) {
+            if (ime.claimEnter(e)) onSubmit(text.trim())
           }
           if (e.key === 'Escape') { e.preventDefault(); onCancel() }
         }}
@@ -125,10 +129,10 @@ export function EditBox({ initial, onSubmit, onCancel }: { initial: string; onSu
         rows={2}
         placeholder={i18nT('components.commentsSidebar.edit_comment')}
         onChange={e => setText(e.target.value)}
-        {...ime.composition}
+        {...ime.bindComposition()}
         onKeyDown={e => {
-          if (e.key === 'Enter' && !e.shiftKey && !ime.isComposing(e) && text.trim()) {
-            e.preventDefault(); e.stopPropagation(); onSubmit(text.trim())
+          if (e.key === 'Enter' && !e.shiftKey && text.trim()) {
+            if (ime.claimEnter(e)) { e.stopPropagation(); onSubmit(text.trim()) }
           }
           if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); onCancel() }
         }}
@@ -346,6 +350,7 @@ export interface CommentsSidebarProps {
 }
 
 const SIDEBAR_DEFAULT_CLASS = 'w-[340px] shrink-0 flex flex-col rounded-xl border border-border bg-card overflow-hidden'
+const SIDEBAR_NARROW_CLASS = 'w-full flex flex-col rounded-xl border border-border bg-card overflow-hidden'
 const SIDEBAR_DEFAULT_STYLE: React.CSSProperties = { height: 'calc(100vh - 240px)', minHeight: 480 }
 
 /** Collapsible right-hand comment sidebar. Threaded one level deep, with
@@ -354,6 +359,8 @@ const SIDEBAR_DEFAULT_STYLE: React.CSSProperties = { height: 'calc(100vh - 240px
  *  widget, where text-selection anchoring isn't available inside the
  *  sandboxed iframe — comments degrade to whole-artifact). */
 export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSidebarProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const isMobile = useIsMobile()
   const {
     comments, loading, remoteSyncError, onAdd, onReply, onResolve,
     onMarkReview, onDelete, onRefresh, onAskAgent, onClose, restrictActions, hideResolve, hideDelete,
@@ -440,7 +447,9 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
   const visibleRoots = showResolved ? roots : roots.filter(r => r.status !== 'resolved')
 
   return (
-    <aside className={containerClassName ?? SIDEBAR_DEFAULT_CLASS} style={containerStyle ?? SIDEBAR_DEFAULT_STYLE}>
+    // A caller-supplied class still wins. Absent one, the default 340px leaves
+    // the artifact body 34px at 390px, so the panel takes the width instead.
+    <aside className={containerClassName ?? (isMobile ? SIDEBAR_NARROW_CLASS : SIDEBAR_DEFAULT_CLASS)} style={containerStyle ?? SIDEBAR_DEFAULT_STYLE}>
       {/* header */}
       <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-bg-elevated shrink-0">
         <MessageSquare size={14} className="text-accent" />
@@ -550,10 +559,10 @@ export const CommentsSidebar = memo(function CommentsSidebar(props: CommentsSide
               rows={2}
               placeholder={i18nT('components.commentsSidebar.add_a_comment_on_the_whole_artifact')}
               onChange={e => setAddText(e.target.value)}
-              {...ime.composition}
+              {...ime.bindComposition()}
               onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey && !ime.isComposing(e) && addText.trim()) {
-                  e.preventDefault(); submitAdd()
+                if (e.key === 'Enter' && !e.shiftKey && addText.trim()) {
+                  if (ime.claimEnter(e)) submitAdd()
                 }
                 if (e.key === 'Escape') { e.preventDefault(); setAdding(false); setAddText('') }
               }}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 
 import pytest
 
@@ -376,6 +377,40 @@ class TestCloudLogin:
         assert rc == 1
         assert "not detected yet" in capsys.readouterr().out
 
+    def test_logout_signs_out_and_points_at_login(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli_cloud, "_resolve", lambda _a: ("dev", "us-east-1"))
+        monkeypatch.setattr(cli_cloud, "_resolve_tag", lambda _a: "kc-1")
+        monkeypatch.setattr(
+            ec2, "describe", lambda *a, **k: {"exists": True, "instance_id": "i-0abc"}
+        )
+        monkeypatch.setattr(cli_cloud.login_mod, "logout", lambda *a, **k: True)
+        rc = cli_cloud._cloud_logout(_args(profile="", region="", tag="kc-1"))
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "Signed out" in out
+        assert "kirocrew cloud login" in out
+
+    def test_logout_fails_when_session_survives(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli_cloud, "_resolve", lambda _a: ("dev", "us-east-1"))
+        monkeypatch.setattr(cli_cloud, "_resolve_tag", lambda _a: "kc-1")
+        monkeypatch.setattr(
+            ec2, "describe", lambda *a, **k: {"exists": True, "instance_id": "i-0abc"}
+        )
+        monkeypatch.setattr(cli_cloud.login_mod, "logout", lambda *a, **k: False)
+        rc = cli_cloud._cloud_logout(_args(profile="", region="", tag="kc-1"))
+        assert rc == 1
+        assert "Could not confirm the instance is signed out" in capsys.readouterr().out
+
+    def test_logout_no_instance(self, monkeypatch, capsys):
+        monkeypatch.setattr(cli_cloud, "_resolve", lambda _a: ("dev", "us-east-1"))
+        monkeypatch.setattr(cli_cloud, "_resolve_tag", lambda _a: "kc-1")
+        monkeypatch.setattr(ec2, "describe", lambda *a, **k: {"exists": False})
+        assert cli_cloud._cloud_logout(_args(profile="", region="", tag="kc-1")) == 1
+        assert "No running instance" in capsys.readouterr().out
+
+    def test_logout_is_dispatched(self):
+        assert cli_cloud._DISPATCH["logout"] is cli_cloud._cloud_logout
+
     def test_login_is_dispatched(self, monkeypatch):
         called = {}
 
@@ -389,3 +424,32 @@ class TestCloudLogin:
 
     def test_tunnel_is_alias_of_connect(self):
         assert cli_cloud._DISPATCH["tunnel"] is cli_cloud._DISPATCH["connect"]
+
+
+class TestDoctor:
+    def test_doctor_probes_resolved_aws_binary(self, monkeypatch, capsys):
+        """The doctor probes the binary resolved spawns execute, never the
+        bare name — a bare-name probe disagrees with resolved spawn sites
+        under a GUI-launched gateway's minimal PATH."""
+        resolved = "/opt/aws-cli/aws"
+        probed: list[str] = []
+
+        def fake_which(name, *args, **kwargs):
+            probed.append(name)
+            return name if name == resolved else None
+
+        monkeypatch.setattr(cli_cloud, "resolve_aws_bin", lambda: resolved)
+        monkeypatch.setattr(shutil, "which", fake_which)
+        monkeypatch.setattr(cli_cloud, "_resolve", lambda _args: ("dev", "us-west-2"))
+        monkeypatch.setattr(cli_cloud.ssm, "session_manager_plugin_installed", lambda: True)
+        monkeypatch.setattr(
+            cli_cloud.iam,
+            "reachability_check",
+            lambda profile, region: {"reachable": False, "note": ""},
+        )
+
+        assert cli_cloud.handle_cloud(_args(cloud_action="doctor")) == 0
+        out = capsys.readouterr().out
+        assert "aws CLI found" in out
+        assert resolved in probed
+        assert "aws" not in probed  # the bare-name probe is the defect

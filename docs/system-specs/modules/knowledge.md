@@ -14,6 +14,82 @@ files / uploads / artifacts / URLs
    → local_knowledge_search (MCP) / dashboard Knowledge tab
 ```
 
+### LLM worker-pool policy
+
+Knowledge ingestion and URL-content acquisition use separate long-lived worker
+pools. The extraction pool uses `knowledge.extraction_pool_size` and requests
+Knowledge-specific reasoning effort `high`; the URL-fetch pool has one worker and
+sends no explicit effort, so it retains the provider default. Both pools drive the
+same `kirocrew-knowledge` agent and preserve the existing model resolution:
+`knowledge.extraction_model` → `agent.model` → provider/`auto`.
+
+The extraction effort is a Knowledge policy, independent of
+`agent.role_efforts.background`, which controls other background workers. For the
+Kiro ACP backend, the worker applies the requested level through the `/effort`
+command; Claude ACP uses its advertised session config option. Capability
+negotiation may select the highest supported level at or below `high`, while an
+unsupported model or rejected command falls back to provider default.
+
+Separate pools make the different workload policies structural for long-lived
+sessions rather than relying on a worker being reused by only one workload by
+convention.
+
+## Role & boundary
+
+The Knowledge Library is the agent's **precise-recall complement to memory** — it is defined as much by the two things it is *not*:
+
+- **Not memory.** The memory subsystem (see `memory-skills-hooks.md`) carries the small, distilled, always-on picture and is **injected into every prompt** by `ContextBuilder`; it is lossy by design (it dedups, decays, and paraphrases). The Knowledge Library instead holds the durable, **verbatim, cited** detail that memory can only approximate, and it is **pulled on demand**: the LLM reaches it only through the `local_knowledge_search` MCP tool, never as per-turn context injection (§4). Its job is to surface the exact chunk — with a citation back to source (§4, "Citation enrichment") — precisely when memory's recall is imprecise or absent.
+- **Not a workspace.** It is not scratch space for the current task's files or state; it is the durable, source-owned record that outlives any single task or session. A live project directory is *ingested* as a read-only `local_folder` source by `project_docs.py` (§2b), not adopted as a working set.
+
+This is the boundary the two automatic write paths (§2b) capture against: verbatim, long-tail durable detail that memory would only paraphrase belongs here; small, always-shaping, distilled knowledge belongs in memory; transient current-task state belongs in neither. How well the KB fills that role is measured against the criteria in "Success criteria" below.
+
+## Success criteria
+
+The Knowledge Library's job — surface the exact, cited chunk when memory's recall falls short — is judged on **two tiers**. No dedicated harness for either exists in-tree yet (see "What is measured today"); this section defines the target so a retrieval change (recency weighting, a reranker, content-typed TTL) can be judged against a fixed bar rather than by eye.
+
+### Tier 1 — intrinsic retrieval quality
+
+Against a **frozen golden set** of `(query → the chunk(s) that should answer it)`, does retrieval fetch the right chunk and rank it high? Definitions follow the IR / RAG canon:
+
+| Metric | Definition | Reads |
+|--------|------------|-------|
+| **recall@k** | `|relevant ∩ retrieved@k| / |relevant|` — fraction of relevant chunks that land in the top-k | coverage / completeness |
+| **precision@k** | `|relevant ∩ retrieved@k| / k` — fraction of the top-k that is relevant | signal-to-noise |
+| **MRR** | mean of `1 / rank_of_first_relevant` over queries | how early the first hit lands |
+| **nDCG@k** | graded relevance with a log-rank discount, normalized to the ideal ordering | rank quality when relevance is graded, not binary |
+| **hit@k** | binary: did *any* relevant chunk make the top-k | cheap "did retrieval work at all" gate |
+
+RAGAS names the rank-aware pair **context precision** / **context recall** (the latter needs a reference answer); they are the same two ideas applied to the retrieved context.
+
+### Tier 2 — extrinsic task-lift
+
+Does that recall change the outcome? Measured A/B — the same task set run with the KB **on** vs **off** (or vs a baseline), scored on **task success**, not retrieval position. Recall without task-lift means the KB retrieves the wrong thing well. This mirrors how mature agent harnesses gate on outcome rather than retrieval — GAIA2 (pass@1 against a write-action verifier), SWE-bench (fail-to-pass test execution), τ-bench (grounded end-state diff) — and π-Bench's practice of scoring "used the right context" as an axis distinct from "task completed." A companion generation check, **faithfulness** (fraction of the answer's claims actually supported by the retrieved chunk; RAGAS, reference-free), guards against a cited-but-unsupported answer.
+
+### Query classes the golden set must cover
+
+A clean teach→recall set overstates quality: memory/KB systems break on the *hard* classes. The set must enumerate them explicitly (taxonomy adapted from the LobsterAIAgent memory harness and LongMemEval):
+
+- **Clean-fact recall** — baseline single-hop lookup.
+- **Multi-hop** — the answer requires joining two or more chunks (the entity graph's reason to exist, §4).
+- **Time-bound / freshness** — a fact true only "as of" a date; the correct *version* must win.
+- **Correction** — a later chunk fixes an earlier stated fact; the corrected value must be surfaced.
+- **Contradiction** — two chunks conflict; retrieval must surface the conflict, not silently pick one.
+- **Retraction** — a withdrawn fact must stop being recalled.
+- **Reinforcement / corroboration** — repeated independent sources should raise confidence, not merely duplicate.
+- **Hypothetical-exclusion** — speculative or conditional statements must NOT return as settled fact.
+- **Abstention** — when the answer is genuinely absent, retrieval should return nothing above the score floor rather than a false near-match (LongMemEval scores this explicitly).
+- **Citation-fidelity** — the returned chunk must actually support the claim it is cited for (§4, "Citation enrichment").
+
+### What is measured today
+
+The code computes and floors a retrieval **score**, but no Tier-1/Tier-2 metric and none of the hard query classes above:
+
+- `HybridRetriever.search` fuses the keyword + graph + vector legs by RRF (`_rrf_fuse`, k=60; vector leg weighted `VECTOR_RRF_WEIGHT = 2.0`), tie-broken by `updated_at` recency — a secondary sort key, **not** a decay weight (`retrieval.py`, §4).
+- Results below `min_score = 0.012` are dropped by the tool caller (`mcp_tools/knowledge.py`), not inside the retriever.
+- `kirocrew eval` ships four scenarios (`smoke_test`, `memory_recall_basic`, `lesson_application`, `context_accumulation`) scored per-assertion (`contains` / `regex` / `judge`) with an optional 1–5 LLM judge (`eval/judge.py`, pass ≥ 3.0). All four are clean single-fact teach→recall or accumulate→summarize flows; none exercises correction / contradiction / retraction / time-bound / reinforcement / hypothetical, and none reports recall@k, MRR, or task-lift.
+
+The gap is therefore a **KB-scoped golden set over the query classes above, plus an A/B task-lift harness** — the precondition for tuning recency, adding a reranker, or content-typed TTL against evidence rather than intuition.
+
 ## Key Files
 
 | File | Responsibility |
@@ -64,12 +140,12 @@ files / uploads / artifacts / URLs
 ```
 '', '.md', '.txt', '.org', '.py', '.java', '.ts', '.js', '.rs', '.go',
 '.html', '.htm', '.docx', '.pdf',
-'.csv', '.log', '.json', '.yaml', '.yml', '.sh', '.rb', '.c', '.cpp', '.h'
+'.csv', '.log', '.json', '.jsonl', '.ndjson', '.yaml', '.yml', '.sh', '.rb', '.ps1', '.psm1', '.psd1', '.c', '.cpp', '.h'
 ```
 
 It includes markdown/plain-text (`.md`/`.txt`/`.org`), source-code extensions, and the two binary formats with declared optional deps (`.pdf` → pdfplumber, `.docx` → python-docx).
 
-**Dispatch (`_DISPATCH`, `readers.py`)** routes only `.pdf`/`.pptx`/`.docx`/`.html`/`.htm` to specialized readers. Anything else — including `.org`, `.txt`, `.md`, and every source-code extension — falls through to the generic `_read_text` path (UTF-8 with a latin-1 fallback) and into the generic chunker downstream. So `.org` is treated as plain text; there is no Org-mode-specific parser.
+**Dispatch (`_DISPATCH`, `readers.py`)** routes only `.pdf`/`.pptx`/`.docx`/`.html`/`.htm` to specialized readers. Anything else — including `.org`, `.txt`, `.md`, and every source-code extension — falls through to the generic `_read_text` path and into the generic chunker downstream. So `.org` is treated as plain text; there is no Org-mode-specific parser. Text decoding (shared by `_read_text` and `_read_html` via `_decode_text_bytes`) is a single-open buffer decode: BOM-sniffed UTF-16 LE/BE first, otherwise UTF-8 with a latin-1 fallback. The UTF-16 branch is extension-agnostic — any text format arriving as BOM'd UTF-16 decodes correctly, not only the PowerShell files (Windows tooling writes UTF-16LE) that motivated it.
 
 **`.pptx` is intentionally out of `SUPPORTED`** even though `_read_pptx` exists: python-pptx is not declared in `setup.cfg`, so the format is kept off the allowlist (the comment at `readers.py` documents this). Reachable only if `.pptx` were re-added to `SUPPORTED`.
 
@@ -103,6 +179,9 @@ Base metadata always carries `format`, `title` (file stem), `file_size`, `extens
 - Discovered files above `props["max_files"]` (default `DEFAULT_MAX_FILES` = 5000) are capped **newest-first** (sort by mtime desc); the surplus count is reported as `capped`.
 - Deletion detection uses the **full** discovered set (pre-cap) so capping never triggers false deletions; a vanished file's items are archived via `_handle_deleted` → `store.delete_items_batch`.
 - Change detection is mtime-then-content-hash: unchanged mtime → `last_seen` bump only; changed mtime but identical SHA-256 → state refresh, no re-ingest.
+- Batched `last_seen` flush/commit and stale-claim release run off the asyncio
+  event loop; each flush and its commit stay within one worker hop so they share
+  the thread-local SQLite connection.
 - Per-file state lives in the `folder_file_state` table with `status` ∈ `{done, scanning, skipped, failed, deduped}`. `scanning` is written **before** ingest so a crash mid-file is recoverable; `skipped`/`failed`/`deduped` files are not auto-retried (user must retry).
 - **TOCTOU defense**: `_ingest_file` re-resolves symlinks and re-checks `is_sensitive_path` at ingest time; a block writes `status='failed'` and emits an SEL `knowledge.source.file.ingest_denied` (`outcome="denied"`, `reason=sensitive_path_toctou`) audit event.
 - After a successful scan, each newly ingested/changed file gets a **targeted** cross-source dedup (`dedup_document(..., apply=True)`) — O(k·n) over the k changed files rather than a full O(n²) corpus sweep — so a folder copy collapses any matching one-shot upload.
@@ -280,7 +359,9 @@ Both entity extraction (`EntityExtractor`) and internal-URL fetch (`agent_fetch.
 The LLM reaches retrieval through the `kirocrew-core` MCP tool `local_knowledge_search`:
 - DB path: `config_dir()/workspace/knowledge/knowledge.db`; a missing DB returns "Knowledge Library is not configured…" (SEL `not_configured`).
 - `_get_knowledge_search` caches the `(KnowledgeStore, embedder)` pair across calls and rebuilds only when the knowledge DB (or its `-wal`) or `config.json` changes — avoiding the per-call schema DDL / migrate / graph-load and the Ollama availability probe.
-- Default `limit` is 3; results below `min_score = 0.012` are dropped. Output is run through `redact_exfiltration_urls()` + `redact_credentials()` before returning, and every call emits an SEL audit event (`success` / `no_results` / `not_configured`). Input is validated against `LOCAL_KNOWLEDGE_SEARCH_SCHEMA` (`validation.py`).
+- Default `limit` is 3; results below `min_score = 0.012` are dropped. Output is run through `redact_exfiltration_urls()` + `redact_credentials()` before returning, and every call emits an SEL audit event (`success` / `no_results` / `not_configured` / `unknown_source`). Input is validated against `LOCAL_KNOWLEDGE_SEARCH_SCHEMA` (`validation.py`).
+- Optional `source_id` scopes the SEED legs only (FTS5 keyword + vector similarity, via parameterized WHERE clauses in `HybridRetriever`); the graph leg stays unfiltered so cross-source entity connections still contribute traversal context. Scope membership is ownership OR location — `items.source_id` or a `source_locations` row, so an item surviving a cross-source dedup collapse still belongs to the losing source's scope (the same rule as `/api/knowledge/graph`'s filter). Omitting it keeps the unscoped behavior. A nonexistent id returns a guidance message naming `knowledge_list_sources` (SEL `unknown_source`), not an exception.
+- The companion tool `knowledge_list_sources` (no arguments; `KNOWLEDGE_LIST_SOURCES_SCHEMA`) returns one `name — id (N item(s))` line per source, counting **active** items only (superseded/deduped copies would overstate a source's coverage) — so agents discover valid `source_id` values instead of guessing.
 - **The response is written through a private stdout descriptor, not fd 1.** The first search's availability probe (`InProcessEmbedder.is_available` → `embed`) kicks the background GGUF load, and the vendored llama-cpp wraps that load in `suppress_stdout_stderr`, which `dup2`s **fd 1 process-wide to `/dev/null`** for the duration (~0.7s) *and* rebinds the `sys.stdout` object. Because the probe returns `None` immediately, the search answers keyword-only in milliseconds — so its JSON-RPC response raced that window and was silently destroyed: no exception, no short write, SEL still logging `success`, and the client hanging until the ACP tool-stall watchdog (`acp/client.py::_TOOL_STALL_TIMEOUT`, 600s) killed the turn. `mcp_shared.run_mcp_stdio_loop` now takes an `os.dup(1)` snapshot (`snapshot_stdout_fd`) at server startup before any tool can run, and `respond()` writes through it under a lock, so responses (and `ping` / `tools/list` replies, which were equally exposed) always reach the client. Falls back to `sys.stdout` when stdout is not fd-backed. Note that "has `sys.stdout` been swapped?" is *not* a usable guard — the suppressor swaps the object too, so it reads as swapped exactly inside the window that must be survived.
 
 The dashboard Knowledge tab uses the same store via a lazily-initialized `KnowledgeStore` on `DashboardState` (`dashboard/state.py`).
@@ -307,8 +388,9 @@ Scopes the page to a single source. Composes with the existing `type`, `status`,
   (`_search_until_exhausted`: `_SCOPED_SEARCH_START` doubling to
   `_SCOPED_SEARCH_MAX`) until the retriever short-reads, so the scoped total is
   exact rather than truncated by a fixed window. At the cap the total may
-  understate; pushing `source_id` into `HybridRetriever` is the tracked
-  follow-up. Unscoped searches keep the cheap `limit * 3` window.
+  understate. `HybridRetriever.search` now accepts `source_id` (seed-scoped —
+  see §4); adopting it in this branch is the remaining follow-up. Unscoped
+  searches keep the cheap `limit * 3` window.
 
 ### `GET /api/knowledge/source-counts`
 
@@ -327,6 +409,7 @@ Returns the item count per source **under the active filters**:
 
 ## Invariants
 
+- **`sources.properties` / `entities.aliases` well-formedness is enforced at the writer** — `store.import_bundle()` validates that any present value is UTF-8-encodable JSON text parsing to an object / array of strings (absent/`null` falls back to the schema defaults `'{}'`/`'[]'`), raising `KnowledgeBundleError` before the INSERT. The dashboard import handler is the store's only production caller today; enforcing at the writer makes any future caller (MCP tool, CLI import, app backend) safe by construction. Several readers parse the raw column with `json.loads()` and no shape guard (source detail handlers index the parsed dict; `find_entity()` calls `.lower()` on each parsed alias), so a corrupt committed row would crash a later, unrelated read. The dashboard import handler maps the typed error to a 400 (`code: malformed_knowledge_bundle`).
 - **Sensitive paths never ingested** — `FileReader.read`, `FolderWatcher._walk`, `_hash_file`, and `_ingest_file` all gate on `is_sensitive_path()` (with symlink re-resolution at ingest time for TOCTOU).
 - **`.org` and unknown-but-supported extensions are plain text** — only `_DISPATCH` extensions get specialized readers; everything else in `SUPPORTED` flows through `_read_text` → generic chunker.
 - **Pool workers are long-lived and must be sweep-shielded** — any direct `AcpClient` worker that outlives a chat turn (not tracked in `SessionMap`/warm pool) must register its PID via `register_protected_pid`, or the orphan sweep will kill it mid-task.

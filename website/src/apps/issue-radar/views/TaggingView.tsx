@@ -11,7 +11,7 @@ import { asArray } from '../lib/format'
 import ReadOnlyTag from '../components/ReadOnlyTag'
 import UntaggedIssueCard from './tagging/UntaggedIssueCard'
 import LabelsPanel, { settingsKeyForCategory } from './tagging/LabelsPanel'
-import { repoScopeKey } from '../lib/links'
+import { providerTerms, readOnlyHint, repoScopeKey } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
 /** Tagging dashboard — bulk-label triage for the issues that have no labels at all.
@@ -358,12 +358,12 @@ function TaggingDashboard() {
       // Partial failure is expected (a locked or transferred issue). Report it
       // per row AND in the banner instead of pretending the batch succeeded.
       if (res.failed.length > 0) {
-        setApplyNote(
-          `Labelled ${res.applied.length} issue${res.applied.length === 1 ? '' : 's'}; `
-          + `${res.failed.length} could not be updated (see the rows below).`,
-        )
+        setApplyNote(i18nT('apps.issueRadar.views.taggingView.labelled_issue_with_failures', {
+          count: res.applied.length,
+          failed: res.failed.length,
+        }))
       } else {
-        setApplyNote(`Labelled ${res.applied.length} issue${res.applied.length === 1 ? '' : 's'}.`)
+        setApplyNote(i18nT('apps.issueRadar.views.taggingView.labelled_issue', { count: res.applied.length }))
       }
     },
     onError: (e: Error) => setApplyError(e.message),
@@ -419,8 +419,12 @@ function TaggingDashboard() {
    * opposed to the single-issue Suggest on one row. */
   const batchPending = generate.isPending && (suggestingFor === undefined || suggestingFor.length > 1)
 
+  // Narrow-first gutter — see OverviewView for why 24px at every width was
+  // wrong here. This page is denser still: the label palette and the untagged
+  // queue are both card-wrapped, so the old gutter cost 32px of the 390px
+  // available before either could start.
   return (
-    <div className="px-6 pt-4 pb-6 flex flex-col gap-4">
+    <div className="px-4 md:px-6 pt-4 pb-6 flex flex-col gap-4">
       {/* KPI strip — this is the page header. Two numbers only: the size of the
         * queue, and the vocabulary available to clear it. "Analysed" and "Ready
         * to apply" are already legible from the rows and the Apply button. */}
@@ -464,7 +468,7 @@ function TaggingDashboard() {
             )}
             {!canWrite && (
               <span className="text-[12px] text-muted inline-flex items-center gap-1">
-                <ReadOnlyTag /> {i18nT('apps.issueRadar.views.taggingView.applying_needs_write_access')}
+                <ReadOnlyTag repoRef={active} /> {i18nT('apps.issueRadar.views.taggingView.applying_needs_write_access')}
               </span>
             )}
             <button
@@ -505,14 +509,14 @@ function TaggingDashboard() {
               onClick={() => applyAll.mutate(applicable)}
               disabled={!canWrite || applyBusy || applicable.length === 0}
               title={canWrite
-                ? i18nT('apps.issueRadar.views.taggingView.write_every_staged_label_to_github')
-                : i18nT('apps.issueRadar.views.taggingView.read_only_repo_needs_triage_or_push_access')}
+                ? i18nT('apps.issueRadar.views.taggingView.write_every_staged_label_to', { provider: providerTerms(active).providerName })
+                : readOnlyHint(active, i18nT('apps.issueRadar.views.taggingView.read_only_repo_needs_triage_or_push_access'))}
               className="inline-flex items-center gap-1.5 text-[13px] px-2.5 py-1 rounded-md bg-accent text-white hover:opacity-90 disabled:opacity-40 cursor-pointer"
             >
               <Check size={12} />
               {applyAll.isPending
                 ? i18nT('apps.issueRadar.views.taggingView.applying')
-                : `Apply ${applicable.length} suggestion${applicable.length === 1 ? '' : 's'}`}
+                : i18nT('apps.issueRadar.views.taggingView.apply_suggestion', { count: applicable.length })}
             </button>
           </div>
         </div>
@@ -553,6 +557,7 @@ function TaggingDashboard() {
               <UntaggedIssueCard
                 key={iss.number}
                 issue={iss}
+                repoRef={active}
                 labels={repoLabels}
                 staged={stagedFor(iss.number)}
                 suggestions={suggestions[String(iss.number)] ?? []}

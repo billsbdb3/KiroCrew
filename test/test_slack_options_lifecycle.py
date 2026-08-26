@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from chat_test_helpers import _make_state
+from chat_test_helpers import _make_state, drain_background_tasks
 
 from kiro_crew.slack.format import (
     OPTIONS_CHECKBOXES_ACTION,
@@ -379,6 +379,7 @@ class TestLifecycleOnTheSlot:
         async with TestClient(TestServer(_slack_app(state))) as client:
             resp = await client.post("/api/chat/slots/s1/slack-link", json={})
             assert resp.status == 200
+            await drain_background_tasks(state)
             thread_ts = (await resp.json())["thread_ts"]
 
         key = effective_session_key(slot)
@@ -747,6 +748,52 @@ def _slack_app(state):
 class TestLinkTimeBackfill:
     """Replaying context into a freshly-linked thread."""
 
+    @pytest.mark.asyncio
+    async def test_the_replay_is_a_background_task_the_caller_must_await(
+        self, tmp_path, monkeypatch
+    ):
+        """Pins WHY every case below drains: the handler answers before it posts.
+
+        The endpoint returns 200 as soon as the link is persisted and hands the
+        replay to ``asyncio.create_task``, so whether the replay has run by the time
+        the response is read depends only on how the loop was scheduled. Asserting on
+        the replay without awaiting it is a load-dependent coin flip, and it failed
+        as ``'NoneType' object has no attribute 'args'`` on a DIFFERENT test each CI
+        run (#4130) — which reads as a flaky suite rather than a missing await.
+
+        If this ever fails because the handler became synchronous, delete the drains
+        rather than weakening this.
+        """
+        state = self._state(tmp_path, monkeypatch)
+        slot = state.get_or_create_slot("s1")
+        slot.append("assistant", "Your call.\n\n[OPTIONS: A | B]")
+        slot.drain()
+
+        # GATE the replay's own call, so "still pending" is a fact rather than a bet on
+        # the scheduler. Asserting it bare would be the same race inverted: it happens
+        # to hold because the replay suspends on a thread-pool hop that usually
+        # outlasts the loopback response, and it would flake on a host where the warm
+        # executor wins -- in the one test that documents why the drains exist.
+        release = asyncio.Event()
+
+        async def _gated_post_blocks(*_args, **_kwargs):
+            await release.wait()
+            return "opt_ts"
+
+        state.slack_client.post_blocks = AsyncMock(side_effect=_gated_post_blocks)
+
+        async with TestClient(TestServer(_slack_app(state))) as client:
+            resp = await client.post("/api/chat/slots/s1/slack-link", json={})
+            assert resp.status == 200
+            assert [t for t in state._background_tasks if not t.done()], (
+                "the replay must still be pending here, or these tests are not "
+                "exercising the background path the gateway takes"
+            )
+            release.set()
+            await drain_background_tasks(state)
+            assert not [t for t in state._background_tasks if not t.done()]
+        assert state.slack_client.post_blocks.await_args is not None
+
     def _state(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
@@ -779,6 +826,7 @@ class TestLinkTimeBackfill:
         async with TestClient(TestServer(_slack_app(state))) as client:
             resp = await client.post("/api/chat/slots/s1/slack-link", json={})
             assert resp.status == 200
+            await drain_background_tasks(state)
 
         texts = [c.args[1] for c in state.slack_client.post_message.await_args_list]
         assert all("[OPTIONS:" not in t for t in texts)
@@ -796,6 +844,7 @@ class TestLinkTimeBackfill:
 
         async with TestClient(TestServer(_slack_app(state))) as client:
             await client.post("/api/chat/slots/s1/slack-link", json={})
+            await drain_background_tasks(state)
 
         assert _is_live_control(state.slack_client.post_blocks.await_args.args[1])
         assert _recs(state, slot)
@@ -814,6 +863,7 @@ class TestLinkTimeBackfill:
 
         async with TestClient(TestServer(_slack_app(state))) as client:
             await client.post("/api/chat/slots/s1/slack-link", json={})
+            await drain_background_tasks(state)
 
         blocks = state.slack_client.post_blocks.await_args.args[1]
         assert not _is_live_control(blocks)
@@ -838,6 +888,7 @@ class TestLinkTimeBackfill:
 
         async with TestClient(TestServer(_slack_app(state))) as client:
             await client.post("/api/chat/slots/s1/slack-link", json={})
+            await drain_background_tasks(state)
 
         blocks = state.slack_client.post_blocks.await_args.args[1]
         assert _is_live_control(blocks)
@@ -862,6 +913,7 @@ class TestLinkTimeBackfill:
 
         async with TestClient(TestServer(_slack_app(state))) as client:
             await client.post("/api/chat/slots/s1/slack-link", json={})
+            await drain_background_tasks(state)
 
         texts = [c.args[1] for c in state.slack_client.post_message.await_args_list]
         assert any("[OPTIONS: A | B]" in t for t in texts)
@@ -878,6 +930,7 @@ class TestLinkTimeBackfill:
 
         async with TestClient(TestServer(_slack_app(state))) as client:
             await client.post("/api/chat/slots/s1/slack-link", json={})
+            await drain_background_tasks(state)
 
         posts = state.slack_client.post_blocks.await_args_list
         assert len(posts) == 2
