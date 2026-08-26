@@ -20,7 +20,7 @@ import uuid
 from collections.abc import Coroutine, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, TypeVar
 
 from aiohttp import web
 
@@ -343,7 +343,12 @@ _READ_ONLY_PIPE_RE = re.compile(
     r"^\s*(grep|egrep|fgrep|head|tail|wc|sort|uniq|cut|less|more|cat)\b"
 )
 
-# Reject redirections and command substitutions — conservative.
+# Reject redirections and command substitutions, conservatively.
+#
+# `<` is matched only as `<(` here, NOT bare. Bare `<` and word-initial `#` are
+# TOKEN ELISION rather than command execution, and they are handled per verb in
+# `_side_effect_reason` instead: see `_ELISION_SENSITIVE` for why a global refusal
+# was the wrong place for them.
 _UNSAFE_SHELL_RE = re.compile(r">|`|\$\(|<\(|(?<!&)&(?!&)")
 
 # Discard-only redirect idioms that are read-only despite containing '>'/'&':
@@ -609,17 +614,12 @@ def _is_help_probe(segment: str) -> bool:
 
 # Flags that make the program write a file named on its own command line.
 _WRITE_FLAGS: dict[str, tuple[str, ...]] = {
-    # `-T` does not name the output, it names a DIRECTORY sort writes its
-    # temporaries into — a write to a path the caller chose, one step removed,
-    # exactly like `tree -R` below. Reported by #5038.
-    "sort": ("-o", "--output", "-T", "--temporary-directory"),
     # `-R` writes without being handed a filename: tree re-runs itself in every
     # directory it descends into, adding `-o 00Tree.html` each time, so the file
     # is named by tree rather than by the command line. Same outcome as `-o`, one
     # step removed, which is why looking only for a filename-bearing flag missed
     # it.
     "tree": ("-o", "--output", "-R"),
-    "file": ("-C", "--compile"),
     "uniq": ("-o",),
     "git diff": ("--output",),
     "git show": ("--output",),
@@ -650,8 +650,6 @@ _EXEC_FLAGS: dict[str, tuple[str, ...]] = {
     # `.gitattributes`, i.e. chosen by the checkout rather than by the caller.
     # `--textconv` is the same hand-off through a different config key.
     "git cat-file": ("--filters", "--textconv"),
-    # `sort` compresses its temporary files by running this program.
-    "sort": ("--compress-program",),
     # A pager that runs a filter over its input, reachable as a pipe target.
     # `-k` is the sharper one and it is INDIRECT: it loads a lesskey file, and a
     # lesskey file can set environment variables — including `LESSOPEN`, which less
@@ -664,6 +662,95 @@ _EXEC_FLAGS: dict[str, tuple[str, ...]] = {
     # keyfile, while uppercase `-K` is `--quit-on-intr` and an ordinary read.
     "less": ("--filter", "-k", "--lesskey-file", "--lesskey-src"),
 }
+
+# Flags that name a file which in turn NAMES THE PATHS the program opens. This is
+# an INDIRECTION, not a write, which is why a write-flag table could not hold it:
+# the hook layer applies `is_sensitive_path` to the command text, so it sees the
+# list file and nothing else while the program reads every path inside.
+#
+# Measured on coreutils, with a NUL-separated list containing `/etc/hostname`:
+# `wc --files0-from=list0` and `du --files0-from=list0` both read `/etc/hostname`,
+# a path that never appears in argv.
+#
+# Scoped to the heads that HAVE the flag and are not already covered, and
+# deliberately spelled in full: `--file` is a prefix of `--files0-from`, so a
+# shorter entry would be reached by the abbreviation walk in `_glob_reaches` and
+# cost `grep --file=PATTERNS` and `stat --file` for no gain.
+#
+# `sort` HAS the flag (checked against `--help`) and is deliberately NOT here.
+# It is already refused by `_OPTION_ACCEPT_LISTS`, which admits an option only if
+# it is listed, and `--files0-from` is not in `_SORT_READONLY_LONG`. Listing it
+# twice would change nothing but the reason string, while making a reader think
+# this table is what closes it. The glob defence is unaffected: it derives
+# `--files0-from` from the entries below, not from the key it appears under.
+_INDIRECT_LIST_FLAGS: tuple[str, ...] = ("--files0-from",)
+
+_INDIRECT_LIST_FLAGS_BY_PREFIX: dict[str, tuple[str, ...]] = {
+    prefix: _INDIRECT_LIST_FLAGS for prefix in ("wc", "du")
+}
+
+# Pagers take a `+` argument that is not an option but a string in the pager's OWN
+# command language, and that language contains a shell escape. Measured under a
+# real pty: `git log | less '+!touch FILE'` CREATED the file.
+#
+# Two things about that measurement decide the shape of this rule.
+#
+# It did NOT fire when stdout was a pipe -- less degrades to `cat` with no tty and
+# never runs the startup command. So this is not unconditional code execution; it
+# depends on whether whatever executes the command supplies a tty. The classifier
+# cannot know that (the gate at `hooks.on_tool_call` hands the string to an agent
+# runtime, it does not run it), so it must fail closed on the spelling.
+#
+# `more` did NOT fire on util-linux, which has no `+command`. It is listed anyway
+# because on the BSDs `more` is not a separate program: FreeBSD's
+# `usr.bin/less/Makefile` installs it as a link (`LINKS= ${BINDIR}/less
+# ${BINDIR}/more`), and Apple's `less/main.c` detects the name at startup:
+#
+#     if (strcmp(last_component(progname), "more") == 0)
+#             less_is_more = 1;
+#
+# `less_is_more` changes defaults, not the `+` startup-command path, so `more '+!cmd'`
+# reaches the same shell escape there. This module ships to macOS, and the name a
+# binary is invoked under does not tell the classifier which implementation answers,
+# so both names are listed rather than branching on `sys.platform`.
+#
+# The whole `+` prefix is refused rather than the dangerous letters (`!` shell,
+# `|` pipe-to-shell, `v` editor, `s` save-to-file), because enumerating them is the
+# denylist this PR exists to argue against: the set is the pager's command
+# language, and it grows without asking.
+_PAGER_STARTUP_VERBS: frozenset[str] = frozenset(("less", "more"))
+
+# Words bash DELETES before exec, which `shlex.split` keeps. The token list this
+# module reads is therefore a strict SUPERSET of the real argv, and a phantom word
+# can make a segment look like something it is not. Measured on a scratch repo,
+# with an empty file named `--list` present for the redirect form:
+#
+#     git branch injected # --list     -> CREATED the branch
+#     git tag forged # --list          -> CREATED the tag
+#     git branch injected < --list     -> CREATED the branch
+#     git branch injected <<< --list   -> CREATED the branch
+#
+# In each case `shlex` supplied a `--list` that put the segment in list mode, so
+# the operand walk read `injected` as a pattern instead of a ref to create.
+#
+# WHY THIS IS PER VERB AND NOT A GLOBAL REFUSAL. A phantom word can only ADD to the
+# token list. For a verb decided by its FLAGS, an added word is either inert or gets
+# read as a flag it does not have, so the worst case is an extra prompt: safe. Only a
+# verb decided by POSITION or MODE can be flipped, because there the count and the
+# order of the words carry the decision. Refusing globally cost five ordinary reads
+# that no phantom word could have made unsafe (`wc -l < f`, `grep TODO < f`,
+# `cat < f`, `wc -l <f`, `head -20 < log.txt`), which is a worse trade than the
+# narrower rule.
+#
+# WHY REFUSE RATHER THAN STRIP THE REDIRECT. Stripping the operator and its target
+# looks equivalent and is not: `shlex` has already discarded the quoting, so a token
+# beginning with `<` is indistinguishable from a QUOTED argument that begins with
+# `<`. Stripping would drop a word bash keeps, and for exactly these verbs that
+# opens a hole rather than closing one: `git branch '<new'` reaches `shlex` as
+# `[git, branch, <new]`, and dropping `<new` leaves a bare `git branch` that reads
+# as a listing while bash creates the ref. Refusing fails closed without
+# reimplementing bash's quoting rules, which this module deliberately does not do.
+_ELISION_SENSITIVE_RE = re.compile(r"(?:^|\s)#|<")
 
 # `git branch` and `git tag` each carry a read mode and a write mode under one
 # subcommand, so the prefix match admits the destructive spellings. Some of
@@ -744,7 +831,7 @@ def _consumes_next_word(token: str) -> bool:
     and licensed the bare operand that created the branch.
 
     This is the fourth site on this guard to need the abbreviation axis — after
-    `_matched_flag`, `_system_set_flag` and `_glob_reaches` — which is why it is a
+    `_matched_flag`, `_option_accept_list_violation` and `_glob_reaches` — which is why
     named helper rather than a fourth inline prefix test.
 
     An ATTACHED value (`--format=x`) takes nothing from the next word, so it is
@@ -867,105 +954,373 @@ _EXACT_ONLY_BASH_PREFIXES: frozenset[str] = frozenset(
     )
 )
 
-# Flags that change SYSTEM state rather than writing a file: `hostname` renames
-# the host, `date` sets the clock. Both entries are on the read-only allowlist
-# for their bare listing form, and both carry a setter under the same verb.
+# `sort` is vetted POSITIVELY: every option token must be a recognised read-only
+# flag, and anything unrecognised goes to the human prompt.
 #
-# Kept out of `_WRITE_FLAGS` because they must NOT go through `_matched_flag`'s
-# short-option CLUSTER scan, and `date` is the worked example of why: `-s` sets
-# the clock, while `date -Iseconds` is an ordinary read whose attached VALUE
-# contains an `s`. A cluster scan reads that `s` as `-s` and denies the read.
-# `_system_set_flag` prefix-matches the token instead, which `-Iseconds` (a
-# token starting `-I`) cannot satisfy. Reported by #5038, whose comment names
-# the same trap.
-_SYSTEM_SET_FLAGS: dict[str, tuple[str, ...]] = {
-    # `-b`/`--boot` and `-F`/`--file` set the name with no operand at all.
-    # Case is load-bearing: `-F` sets from a file, `-f` prints the FQDN.
-    "hostname": ("-b", "--boot", "-F", "--file"),
-    "date": ("-s", "--set"),
-}
-
-# Verbs whose bare OPERAND changes system state, with no flag involved:
-# `hostname evil-host` renames the host and `date 08221200` sets the clock.
-# `date`'s one legitimate operand is a `+FORMAT` string, which is why the two
-# need different predicates rather than one shared "no operands" rule.
+# The inversion is here because the denylist demonstrably did not converge on this
+# one tool. Five review rounds produced six distinct spellings of the same escape:
+# `-o FILE`, `--output=FILE`, attached `-oFILE`, bundled `-uo FILE`, abbreviated
+# `--o FILE`, and finally `--compress-program=PROG` -- which is not a write at all
+# but arbitrary CODE EXECUTION. Verified: with the input large enough to spill to
+# temporaries, `sort -S 1k --compress-program=./payload big.txt` ran the payload and
+# exited 0. Enumerated from this box's own `sort --help`, so it is complete for that
+# release rather than for a guess.
 #
-# The flags here take their value from the FOLLOWING word, so that word is not
-# an operand — without them `date -d yesterday` and `date -r FILE`, both reads,
-# would be denied.
-_SYSTEM_OPERAND_VALUE_FLAGS: dict[str, frozenset[str]] = {
-    "hostname": frozenset(),
-    "date": frozenset(("-d", "--date", "-r", "--reference", "-f", "--file")),
-}
+# Deliberately NOT read-only: `-o/--output` (writes), `-T/--temporary-directory`
+# (writes temporaries into a caller-named directory), `--compress-program`
+# (executes), and `--random-source` / `--files0-from` (open a caller-named path).
+# An unlisted flag costs a prompt, so omission is the safe direction.
+# `k`, `t` and `S` are value-taking AND read-only (key, field separator, buffer
+# size); `o` and `T` are value-taking and NOT read-only, which is what makes the
+# value branch below refuse them while `-k2n` and `-S1k` pass.
+_SORT_READONLY_SHORT: frozenset[str] = frozenset("bdfgiMhnRrVcCmsuzktS")
+# Short options that consume the rest of the token (or the next one) as a VALUE.
+# Needed so `-k2n` and `-S1k` read as flag-plus-value instead of a letter cluster
+# where `2` and `1` look like unknown options.
+_SORT_VALUE_SHORT: frozenset[str] = frozenset("ktSTo")
+_SORT_READONLY_LONG: frozenset[str] = frozenset(
+    (
+        "--ignore-leading-blanks",
+        "--dictionary-order",
+        "--ignore-case",
+        "--general-numeric-sort",
+        "--ignore-nonprinting",
+        "--month-sort",
+        "--human-numeric-sort",
+        "--numeric-sort",
+        "--random-sort",
+        "--reverse",
+        "--sort",
+        "--version-sort",
+        "--batch-size",
+        "--check",
+        "--debug",
+        "--key",
+        "--merge",
+        "--stable",
+        "--buffer-size",
+        "--field-separator",
+        "--parallel",
+        "--unique",
+        "--zero-terminated",
+        "--help",
+        "--version",
+    )
+)
 
-# The SHORT setters as LETTERS, and the letters that consume the rest of their
-# token, because a cluster has to be walked rather than prefix-tested. `-s` sets
-# the clock, and it can arrive anywhere in a cluster: GNU resolves
-# `date -us2026-08-23` to `-u` plus `-s 2026-08-23`, which a test anchored at the
-# token's first character never saw.
+
+# `date`'s read-only surface. Enumerated from GNU coreutils `date --help`, then
+# checked for a second axis the other accept-lists did not have to face: whether the
+# same LETTER means different things in different `date` implementations.
 #
-# The value-taking letters are what keeps the walk from reading a VALUE as a flag —
-# the `date -Iseconds` case: `I` takes an optional attached value, so the `s` in
-# `seconds` belongs to that value and the walk stops before it. This is the same
-# distinction, stated per letter, that the note above states per token.
-_SYSTEM_SHORT_SETTERS: dict[str, str] = {"hostname": "bF", "date": "s"}
-_SYSTEM_SHORT_VALUE_TAKING: dict[str, str] = {"hostname": "F", "date": "dfrsI"}
+# `-d` IS on the list, and the reason it is here is worth recording because an earlier
+# revision of this change left it OFF on the belief that BSD/macOS `date -d` sets the
+# kernel's daylight-saving value. That belief came from documentation, not from the
+# implementations, and checking the implementations showed it is false on every
+# platform that ships today. Read from each project's own `getopt(3)` string:
+#
+#   GNU coreutils      `-d STRING`  parses and PRINTS  (verified by execution, 8.22)
+#   FreeBSD  bin/date  "f:I::jnRr:uv:z:"   no `d` at all -> invalid option
+#   Apple    shell_cmds/date  "f:I::jnRr:uv:z:"   no `d` at all -> invalid option
+#   OpenBSD  bin/date  "af:jr:uz:"         no `d` at all -> invalid option
+#   NetBSD   bin/date  "ad:f:jnRr:Uuz:"    `-d` sets rflag and parsedate()s optarg,
+#                                          i.e. the GNU meaning: a reference time to
+#                                          PRINT. `setthetime()` is reached only from
+#                                          a bare operand, never from `-d`.
+#
+# So `-d` either reads or errors, never writes. The historical `-d dst` that set the
+# kernel daylight-saving flag is gone from every current BSD.
+#
+# There was also an internal tell that should have caught this without the source
+# dive: `--date=` was already on the read-only long list, and `-d` is the same option
+# under a shorter spelling on every implementation that has it. Admitting one and
+# refusing the other could not both be right.
+#
+# `-s`/`--set` IS the setter GNU shares, verified accepted and failing only on
+# privilege ("date: cannot set date: Operation not permitted"). `-f`, `-r`, `-I` and
+# `-d` take values, which is what makes `-Iseconds`, `-r FILE` and `-d yesterday` read
+# cleanly while `-s` is refused -- the dilemma that kept `-s` out of the old
+# write-flag table.
+#
+# The other three accept-lists were swept for divergence and need no change: BSD
+# `sort`'s writers are `-o`/`-T` and BSD `file`'s is `-C`, all already excluded, and
+# BSD `hostname` offers only `-f`/`-s` plus a name OPERAND, which `operands="none"`
+# already refuses. BSD `date`'s other setters (`-t` minutes west, `-j`, `-n`, `-v`)
+# are likewise absent from this list, so they fail closed already.
+_DATE_READONLY_SHORT: frozenset[str] = frozenset("dfIrRu")
+_DATE_VALUE_SHORT: frozenset[str] = frozenset("dfIrs")
+_DATE_READONLY_LONG: frozenset[str] = frozenset(
+    (
+        "--date",
+        "--file",
+        "--iso-8601",
+        "--reference",
+        "--rfc-2822",
+        "--rfc-3339",
+        "--universal",
+        "--utc",
+        "--help",
+        "--version",
+    )
+)
+# Long and short forms that consume the NEXT token, so an operand count is not
+# fooled by a flag's value. `-I` is absent on purpose: its TIMESPEC is optional and
+# must be attached (`-Iseconds`), so `-I` never eats the following word.
+_DATE_VALUE_FLAGS: frozenset[str] = frozenset(
+    ("-d", "-f", "-r", "-s", "--date", "--file", "--reference", "--set")
+)
+
+# `hostname`'s surface, from its own `--help`. Tiny and fully enumerable, which is
+# why a positive list is cheap here. `-b/--boot` and `-F/--file` SET the name with
+# no operand (both verified: privilege-only failure, with `-F` re-tested against a
+# file that EXISTS -- against a missing path it fails at open() and looks read-only).
+_HOSTNAME_READONLY_SHORT: frozenset[str] = frozenset("aAdfiIsyVh")
+_HOSTNAME_VALUE_SHORT: frozenset[str] = frozenset("F")
+_HOSTNAME_READONLY_LONG: frozenset[str] = frozenset(
+    (
+        "--alias",
+        "--all-fqdns",
+        "--all-ip-addresses",
+        "--domain",
+        "--fqdn",
+        "--ip-address",
+        "--long",
+        "--nis",
+        "--short",
+        "--yp",
+        "--help",
+        "--version",
+    )
+)
 
 
-def _system_set_flag(verb: str, args: list[str]) -> str:
-    """Return the setter flag *args* supplies for *verb*, or "".
+# `file`'s surface, from its own `--help`. It reached an accept-list rather than a
+# `-C` denylist entry because that is the shape this change keeps converging on: an
+# unlisted option prompts instead of passing, so a flag missing from the help text
+# costs a prompt rather than a write. `git blame --textconv` is the reason that
+# distinction is not academic.
+#
+# `-C/--compile` is the setter: with `-m FILE` it compiles that magic file and writes
+# `FILE.mgc` beside it (verified, 464 bytes). `-z/--uncompress` is ALSO excluded, on
+# the omission-is-cheap principle rather than a measured escape -- libmagic can shell
+# out to an external decompressor for formats it does not handle internally, and the
+# flag is rare enough that a prompt costs nothing. Everything else prints.
+# `f`/`--files-from` is absent, and for a different reason than `-C`: it does not
+# write, it INDIRECTS. `file -f LIST` opens every path named inside LIST, and those
+# paths never appear in the command, so the hook layer's path gates
+# (`is_sensitive_path` / `is_sensitive_bash_command`, applied to the command text) see
+# only LIST and cannot see what is actually read. A guard that inspects argv is blind
+# to one more level of indirection, so the option has to go rather than the guard get
+# cleverer. `sort --files0-from` was already excluded for the same shape; `hostname -F`
+# is already refused as a setter.
+#
+# Kept: `-m/--magic-file`, `-e/--exclude`, `-F/--separator` all take a value, but the
+# value IS the path or string being used, visible in argv, so the guards can act on it.
+# There is no indirection to hide behind.
+#
+# `p`/`--preserve-date` is absent too, and it is the subtlest of the three exclusions.
+# It LOOKS read-only because it RESTORES the access time rather than setting a caller
+# chosen one -- which is how it was originally, and wrongly, admitted here. Restoring
+# still requires a `utimes()` call on the named path, and the `ctime` that call bumps is
+# NOT restorable. So the option erases the evidence that a file was read while leaving a
+# permanent metadata modification behind: the wrong side of read-only in both directions.
+#
+# MEASURED, because `noatime` on this box hides the atime effect entirely and made the
+# obvious test inconclusive. `ctime` advances on any inode metadata write and is visible
+# whatever the mount options are:
+#
+#   file t.txt            -> ctime unchanged   (control)
+#   file -b t.txt         -> ctime unchanged   (control)
+#   file -p t.txt         -> ctime ADVANCED
+#   file --preserve-date  -> ctime ADVANCED
+#
+# The same probe was then run over every other accept-list flag that opens a named file
+# -- `file -m/-k/-L/-s/-r`, `sort`, `sort -u`, `sort -k1`, `date -r`, `date -f`, plus
+# `cat` and `wc -l` as controls -- and all twelve are clean. `-p` is the only one.
+#
+# `-z`/`--uncompress` is also absent, and it belongs to a class this module already
+# names elsewhere rather than to the write-flag class. From `file`'s own
+# `src/compress.c`, the decompressor is SPAWNED:
+#
+#     status = posix_spawnp(&pid, compr[method].argv[0], &fa, NULL, ...)
+#
+# with `compr[]` holding `"gzip"`, `"bzip2"`, `"lzip"`, `"xz"`, `"lrzip"`, `"zstd"` and
+# `method` selected from the examined file's magic bytes. So `-z` runs a program whose
+# NAME is chosen by the content being inspected, which is the same hand-off as
+# `git diff --ext-diff`. Stated because it is a behaviour change: on the write-flag
+# table `file -z` auto-approved, and under this list it prompts.
+_FILE_READONLY_SHORT: frozenset[str] = frozenset("vmbceFiklLhnN0rsd")
+# `f` stays here so `-f LIST` and `-fLIST` are both recognised as flag-plus-value and
+# refused, rather than `LIST` being mistaken for an operand.
+_FILE_VALUE_SHORT: frozenset[str] = frozenset("mefF")
+_FILE_READONLY_LONG: frozenset[str] = frozenset(
+    (
+        "--apple",
+        "--brief",
+        "--checking-printout",
+        "--debug",
+        "--dereference",
+        "--exclude",
+        "--keep-going",
+        "--list",
+        "--magic-file",
+        "--mime",
+        "--mime-encoding",
+        "--mime-type",
+        "--no-buffer",
+        "--no-dereference",
+        "--no-pad",
+        "--print0",
+        "--raw",
+        "--separator",
+        "--special-files",
+        "--help",
+        "--version",
+    )
+)
+# `file` needs no VALUE-FLAG set: `spec.value_flags` is read only by `_operands`,
+# which is behind an early return for `operands == "any"`, and `file`'s operands are
+# the files it identifies. A set here would look load-bearing and never be read.
 
-    Prefix-matches the token, so the attached spelling (`--set=…`, `-s2020`) is
-    caught while an unrelated flag whose attached value merely CONTAINS the
-    letter is not. See the note on `_SYSTEM_SET_FLAGS` for why the cluster scan
-    in :func:`_matched_flag` is the wrong tool here.
 
-    A long option is ALSO matched by any unambiguous abbreviation of it, because
-    GNU's own parser resolves one: `date --se=2026-08-23` reaches `--set` and the
-    clock moves, while a plain prefix test on the flag saw nothing. Avoiding the
-    cluster scan is what this function is for — abbreviation is a separate axis,
-    and `_matched_flag` already accepts it for every other table.
+class _AcceptSpec(NamedTuple):
+    """A tool's read-only surface, stated positively.
 
-    A SHORT setter is found by walking the cluster, because it can sit anywhere in
-    one: GNU resolves `date -us2026-08-23` to `-u` plus `-s 2026-08-23`. The walk
-    stops at the first letter that consumes the rest of the token, which is what
-    keeps `date -Iseconds` a read — the `s` there is part of `I`'s value, not a
-    flag. Avoiding `_matched_flag`'s *undifferentiated* cluster scan is still the
-    point; this one knows which letters take a value.
+    One registry rather than three bespoke checks, because the algorithm turned out
+    identical for every tool that needed it. `sort` had this shape first; `date` and
+    `hostname` arrived at it for the same reason -- a per-tool DENYLIST had already
+    leaked on each of them, and an accept-list is closed by construction instead.
     """
-    for tok in args:
-        head = tok.split("=", 1)[0]
-        if len(tok) > 1 and tok[0] == "-" and tok[1] != "-":
-            setters = _SYSTEM_SHORT_SETTERS.get(verb, "")
-            consumes = _SYSTEM_SHORT_VALUE_TAKING.get(verb, "")
-            for ch in tok[1:]:
-                if ch in setters:
-                    return "-" + ch
-                if ch in consumes:
-                    break
-        for flag in _SYSTEM_SET_FLAGS.get(verb, ()):
-            if len(flag) == 2 and flag[0] == "-" and flag[1] != "-":
-                # Short setters are handled by the cluster walk above; matching
-                # them again by prefix here would re-introduce the `-Iseconds`
-                # false positive this function exists to avoid.
-                continue
-            if tok.startswith(flag):
-                return flag
-            # `--` plus at least one character, and a prefix of this flag. Over-
-            # matching can only add a prompt: an abbreviation that is ambiguous
-            # against the tool's OTHER long options is rejected by the tool itself,
-            # so refusing it here costs a command that was never going to run.
-            if (
-                flag.startswith("--")
-                and head.startswith("--")
-                and len(head) > 2
-                and flag.startswith(head)
-            ):
-                return flag
+
+    reason_fmt: str  # carries `{tok}`
+    readonly_short: frozenset[str]
+    value_short: frozenset[str]
+    readonly_long: frozenset[str]
+    operands: str  # "any" (they are inputs) | "none" | "plus" (only +FORMAT)
+    operand_reason: str
+    value_flags: frozenset[str]  # for operand counting
+
+
+_OPTION_ACCEPT_LISTS: dict[str, _AcceptSpec] = {
+    "sort": _AcceptSpec(
+        reason_fmt="pipe target 'sort {tok}' is not a recognised read-only option",
+        readonly_short=_SORT_READONLY_SHORT,
+        value_short=_SORT_VALUE_SHORT,
+        readonly_long=_SORT_READONLY_LONG,
+        # sort's operands are input FILES, which it reads.
+        operands="any",
+        operand_reason="",
+        value_flags=frozenset(),
+    ),
+    "date": _AcceptSpec(
+        # The reason names the accepted spelling because `date -d` is a form agents
+        # emit constantly, and a refusal that only says no turns every one of them
+        # into a human prompt instead of a self-serve retry.
+        reason_fmt=(
+            "'date {tok}' is not a recognised read-only option; "
+            "'--date=<expr>' is the read-only spelling"
+        ),
+        readonly_short=_DATE_READONLY_SHORT,
+        value_short=_DATE_VALUE_SHORT,
+        readonly_long=_DATE_READONLY_LONG,
+        # `date 08221200` sets the clock (verified: privilege-only failure). A `+`
+        # operand is the output FORMAT and only prints.
+        operands="plus",
+        operand_reason=("'date <operand>' sets the system clock unless it is a +FORMAT string"),
+        value_flags=_DATE_VALUE_FLAGS,
+    ),
+    "file": _AcceptSpec(
+        reason_fmt="'file {tok}' is not a recognised read-only option",
+        readonly_short=_FILE_READONLY_SHORT,
+        value_short=_FILE_VALUE_SHORT,
+        readonly_long=_FILE_READONLY_LONG,
+        # `file`'s operands are the FILES it identifies, which it only reads.
+        operands="any",
+        operand_reason="",
+        value_flags=frozenset(),
+    ),
+    "hostname": _AcceptSpec(
+        reason_fmt="'hostname {tok}' is not a recognised read-only option",
+        readonly_short=_HOSTNAME_READONLY_SHORT,
+        value_short=_HOSTNAME_VALUE_SHORT,
+        readonly_long=_HOSTNAME_READONLY_LONG,
+        operands="none",
+        operand_reason=("'hostname <operand>' sets the hostname; every read form is flag-only"),
+        value_flags=frozenset(("-F", "--file")),
+    ),
+}
+
+#: Keys whose verdict depends on the COUNT or ORDER of words rather than on which
+#: flags are present, so a word bash deletes can flip it. See `_ELISION_SENSITIVE_RE`
+#: for the measurements and for why the refusal is scoped here instead of applied to
+#: every command.
+#:
+#: Derived from the tables that carry those decisions, so a tool added to the accept
+#: list with an operand rule joins this set without a second edit. `git remote` and
+#: `uniq` are named: their decision is positional in the walk itself (first
+#: non-option word is the subcommand; second operand is the output file) rather than
+#: expressed in a table this can read.
+_ELISION_SENSITIVE_KEYS: frozenset[str] = (
+    frozenset(f"git {subcommand}" for subcommand in _GIT_REF_WRITE_FLAGS)
+    | frozenset(("git remote", "uniq"))
+    | frozenset(verb for verb, spec in _OPTION_ACCEPT_LISTS.items() if spec.operands != "any")
+)
+
+
+def _option_accept_list_violation(prefix: str, tokens: list[str]) -> str:
+    """Reason *tokens* leave *prefix*'s positively-vetted read-only surface, else "".
+
+    Deny-by-default per tool: an option has to be RECOGNISED as read-only, so an
+    unlisted one prompts instead of passing. That is what makes this closed by
+    construction where a write-flag denylist was not -- a spelling nobody thought of
+    is refused rather than admitted.
+
+    A long flag must match EXACTLY, which disposes of getopt_long abbreviation for
+    free: `--out` is an abbreviation of `--output` and simply is not in the read-only
+    set. The cost is that an abbreviation of a read-only flag (`--rev` for
+    `--reverse`) also prompts.
+    """
+    spec = _OPTION_ACCEPT_LISTS[prefix]
+    # `--` does not stop this loop either. HARDENING rather than a fix here: measured,
+    # every value-taking read flag of this box's `sort` REJECTS `--` as its value and
+    # aborts (`-k` "invalid number", `-S` "invalid -S argument '--'", `-t`
+    # "multi-character tab"), so `sort -k -- -o OUT` writes nothing today. That is
+    # sort's argument validation saving us, not this classifier, and it is not a
+    # property worth depending on -- the git path above proved the same shape does
+    # write when the tool is more permissive. Cost is a prompt on an input FILE named
+    # like an option (`sort -- -o`).
+    for token in tokens:
+        if not token.startswith("-") or token == "-":
+            continue  # operand, or `-` for stdin
+        if _GLOB_META_RE.search(token):
+            # An option-shaped token whose real spelling the shell has not produced
+            # yet. No legitimate option contains a glob metacharacter, so this costs
+            # nothing, and an operand glob is untouched: it has no leading dash.
+            return spec.reason_fmt.format(tok=token)
+        if token.startswith("--"):
+            if token.partition("=")[0] not in spec.readonly_long:
+                return spec.reason_fmt.format(tok=token)
+            continue
+        for letter in token[1:]:
+            if letter in spec.value_short:
+                # This option takes a value, so the remainder of the token is that
+                # value and carries no further option letters.
+                if letter not in spec.readonly_short:
+                    return spec.reason_fmt.format(tok=f"-{letter}")
+                break
+            if letter not in spec.readonly_short:
+                return spec.reason_fmt.format(tok=f"-{letter}")
+    if spec.operands == "any":
+        return ""
+    operands = _operands(tokens, spec.value_flags)
+    if spec.operands == "none" and operands:
+        return spec.operand_reason
+    if spec.operands == "plus" and any(not o.startswith("+") for o in operands):
+        return spec.operand_reason
     return ""
 
 
-def _operands(args: list[str]) -> list[str]:
+def _operands(args: list[str], value_flags: frozenset[str] = frozenset()) -> list[str]:
     """Operand tokens in *args*, honouring the `--` terminator.
 
     Before the terminator a leading-dash word is an option; after it EVERY word
@@ -974,9 +1329,24 @@ def _operands(args: list[str]) -> list[str]:
     operand and passed a segment that writes `-pwned`.
     """
     if "--" in args:
-        cut = args.index("--")
-        return [tok for tok in args[:cut] if not tok.startswith("-")] + args[cut + 1 :]
-    return [tok for tok in args if not tok.startswith("-")]
+        at = args.index("--")
+        before, after = args[:at], args[at + 1 :]
+    else:
+        before, after = args, []
+    out: list[str] = []
+    previous = ""
+    for tok in before:
+        if tok.startswith("-"):
+            # A short option consumes the NEXT word only when the token is the bare
+            # flag; `-Iseconds` carries its own value, so treating it as `-I` plus a
+            # separate operand would deny an ordinary read.
+            previous = tok if tok in value_flags else ""
+            continue
+        if previous:
+            previous = ""
+            continue
+        out.append(tok)
+    return out + after
 
 
 #: Shell expansions whose RESULT is the argument, while ``shlex`` hands this
@@ -1066,7 +1436,19 @@ _EXTGLOB_RE = re.compile(r"[?*+@!]\(")
 _GLOB_SENSITIVE_WORDS: frozenset[str] = (
     frozenset(
         flag
-        for table in (_WRITE_FLAGS, _EXEC_FLAGS, _GIT_REF_WRITE_FLAGS)
+        for table in (
+            _WRITE_FLAGS,
+            _EXEC_FLAGS,
+            _GIT_REF_WRITE_FLAGS,
+            # Derived, not restated: this is the whole reason `wc --file*` is
+            # refused. A checkout containing a file named `--files0-from=payload`
+            # turns that pattern into the flag, and measured, `wc --file*` then read
+            # a path that appears nowhere in the command. Listing the flag in one
+            # table and having the glob defence read that table is what keeps the
+            # two from drifting -- the same coupling that broke when `sort` moved
+            # off the denylist.
+            _INDIRECT_LIST_FLAGS_BY_PREFIX,
+        )
         for flags in table.values()
         for flag in flags
     )
@@ -1074,6 +1456,17 @@ _GLOB_SENSITIVE_WORDS: frozenset[str] = (
     # A glob that expands to `--` shifts every following word into operand
     # position, which is how the terminator changes what the walk below decides.
     | frozenset(("--",))
+    # The accept-listed tools have no denylist to derive from, but they do not need
+    # one: a letter that TAKES A VALUE and is not READ-ONLY is refused by the
+    # registry by construction, so it is precisely a word a glob must not reach.
+    # For `sort` that yields `-o` and `-T`. Without this, moving a tool to a positive
+    # list dropped it out of this set -- measured, `cat f | sort ?uo victim` was
+    # auto-approved because `-o` had stopped being a sensitive word.
+    | frozenset(
+        f"-{letter}"
+        for spec in _OPTION_ACCEPT_LISTS.values()
+        for letter in spec.value_short - spec.readonly_short
+    )
 )
 
 #: Verbs whose OWN tables carry a short flag, so a glob can expand into a bundled
@@ -1086,6 +1479,8 @@ _SHORT_FLAG_VERBS: frozenset[str] = frozenset(
     for table in (_WRITE_FLAGS, _EXEC_FLAGS)
     for key, flags in table.items()
     if any(len(flag) == 2 and flag[0] == "-" for flag in flags)
+) | frozenset(
+    verb for verb, spec in _OPTION_ACCEPT_LISTS.items() if spec.value_short - spec.readonly_short
 )
 
 
@@ -1228,6 +1623,12 @@ def _side_effect_reason(segment: str) -> str:
     verb = tokens[0].rsplit("/", 1)[-1].lower()
     args = tokens[1:]
 
+    # Checked on the RAW segment, before any table lookup, because the thing being
+    # guarded against is a word that reached `shlex` but will not reach the program.
+    elision_key = f"git {args[0].lower()}" if verb == "git" and args else verb
+    if elision_key in _ELISION_SENSITIVE_KEYS and _ELISION_SENSITIVE_RE.search(segment):
+        return f"a word bash removes could change what '{elision_key}' does"
+
     # Whether an unexpanded word can subvert THIS segment's classification.
     #
     # Every check below is keyed on a table, so a verb with no table has no
@@ -1239,15 +1640,20 @@ def _side_effect_reason(segment: str) -> str:
     # `git` is guarded whatever the subcommand, because the subcommand itself is
     # a decided word: `git $x` reaches bash as `git branch -D release`.
     #
-    # `hostname` and `date` are guarded through `_SYSTEM_OPERAND_VALUE_FLAGS`
-    # rather than a flag table, because their rule is an OPERAND rule: an
-    # unexpanded word IS the decision there, so `hostname $EVIL` renames the host
-    # under a spelling this module read as harmless.
+    # `hostname` and `date` are guarded through `_OPTION_ACCEPT_LISTS` rather than a
+    # write-flag table, because their rule is an OPERAND rule: an unexpanded word IS
+    # the decision there, so `hostname $EVIL` renames the host under a spelling this
+    # module read as harmless.
     guarded = (
         verb in ("git", "uniq")
         or verb in _WRITE_FLAGS
         or verb in _EXEC_FLAGS
-        or verb in _SYSTEM_OPERAND_VALUE_FLAGS
+        or verb in _OPTION_ACCEPT_LISTS
+        # A verb whose arguments this module reads for an INDIRECTION or a pager
+        # startup command has a decision to subvert just as much as one with a
+        # write-flag table, so it belongs in the same guard.
+        or verb in _INDIRECT_LIST_FLAGS_BY_PREFIX
+        or verb in _PAGER_STARTUP_VERBS
     )
 
     # ANSI-C quoting is stripped by `shlex` but honoured by bash, so the token
@@ -1338,7 +1744,7 @@ def _side_effect_reason(segment: str) -> str:
                     # EVERY character of the cluster must be a list letter or a
                     # digit, not merely one of them. `any` read an attached VALUE
                     # as part of the cluster, which is the same trap the note on
-                    # `_SYSTEM_SET_FLAGS` records for `date -Iseconds`: the `l` in
+                    # the accept-list registry records for `date -Iseconds`: the `l` in
                     # `git tag -ulin@kiro.co` selected list mode and the bare
                     # operand it then licensed created a signed tag. A digit is
                     # allowed because `-n` carries an optional count (`-n5`).
@@ -1420,6 +1826,21 @@ def _side_effect_reason(segment: str) -> str:
     if hit:
         return f"'{key} {hit}' runs a program named by the repository"
 
+    hit = _matched_flag(args, _INDIRECT_LIST_FLAGS_BY_PREFIX.get(key, ()))
+    if hit:
+        return f"'{key} {hit}' reads paths named inside a file, which this check cannot see"
+
+    # A `+` argument to a pager is a string in the pager's own command language,
+    # not an option, and that language reaches a shell. A glob is refused here too:
+    # the shell has not produced the real spelling yet, so `less +*` could resolve
+    # against a file named `+!cmd` and nothing downstream would see the `+`.
+    if verb in _PAGER_STARTUP_VERBS:
+        for token in args:
+            if token.startswith("+"):
+                return f"'{verb} {token}' runs a pager startup command, which reaches a shell"
+            if _GLOB_META_RE.search(token) or _EXTGLOB_RE.search(token):
+                return f"a glob in a '{verb}' argument could expand into a startup command"
+
     # `uniq INPUT OUTPUT` writes its second operand. `--` ends the options here
     # too, so a word after it is an operand however it is spelled:
     # `uniq -- input -pwned` writes `-pwned`, while a leading-dash test counted
@@ -1436,148 +1857,16 @@ def _side_effect_reason(segment: str) -> str:
         if len(operands) > 1:
             return "'uniq INPUT OUTPUT' writes its second operand"
 
-    # `hostname` and `date` each carry a SYSTEM-state setter under a verb whose
-    # bare form is a listing, so the prefix match vouched for the setter too.
-    hit = _system_set_flag(verb, args)
-    if hit:
-        changes = "renames the host" if verb == "hostname" else "sets the system clock"
-        return f"'{verb} {hit}' {changes}"
+    # Tools whose read-only option surface is enumerated POSITIVELY. Deny-by-default:
+    # an option has to be recognised as a read before it passes, so a spelling nobody
+    # thought of prompts instead of being admitted. This is what a per-tool write-flag
+    # denylist could not give us on these four -- see the note above the registry for
+    # the six `sort` spellings that arrived one review round at a time.
+    if verb in _OPTION_ACCEPT_LISTS:
+        violation = _option_accept_list_violation(verb, args)
+        if violation:
+            return violation
 
-    # Both also change state through a BARE OPERAND, with no flag at all —
-    # `hostname evil-host` and `date 08221200` (which fails only on privilege,
-    # not on parsing). Their legitimate operands differ, so the predicate does
-    # too: every `hostname` read form is flag-only, while `date`'s one operand
-    # is a `+FORMAT` string.
-    if verb in _SYSTEM_OPERAND_VALUE_FLAGS:
-        value_flags = _SYSTEM_OPERAND_VALUE_FLAGS[verb]
-        previous = ""
-        operand_only = False
-        for tok in args:
-            # `--` ends the options here for the same reason it does for a ref:
-            # after it, `hostname -- -evil` names the host `-evil`, and a
-            # leading-dash test read that as one more option and passed it.
-            if tok == "--" and not operand_only:
-                operand_only = True
-                previous = ""
-                continue
-            if not operand_only and tok.startswith("-"):
-                # Whether a flag takes the FOLLOWING word depends on its form,
-                # and long and short disagree. A long option consumes the next
-                # word unless the value is attached with `=`, so
-                # `date --date yesterday` is a read. A short option consumes it
-                # only when the token is the bare flag: `-Iseconds` carries its
-                # own value, so reading it as `-I` + a separate operand would
-                # deny that read.
-                if tok.startswith("--"):
-                    previous = "" if "=" in tok else tok
-                else:
-                    previous = tok if len(tok) == 2 else ""
-                continue
-            if previous in value_flags:
-                previous = ""
-                continue
-            previous = ""
-            if verb == "date":
-                if tok.startswith("+"):
-                    continue
-                return "'date <operand>' sets the system clock unless it is a +FORMAT string"
-            return f"'{verb} <operand>' sets the hostname; every read form is flag-only"
-
-    return ""
-
-
-def _elided_shell_construct(cmd: str) -> str:
-    """Reason *cmd* carries a construct bash REMOVES but ``shlex`` keeps.
-
-    Every operand rule in this module reads `shlex.split`'s token list and
-    assumes it is the argv the program receives. Two shell constructs break that
-    assumption by DELETING words rather than rewriting them, and `shlex` has no
-    concept of either — it hands them back as ordinary tokens:
-
-        git branch injected # --list      shlex: [… 'injected', '#', '--list']
-                                          bash:  git branch injected
-        git branch injected <<< --list    shlex: [… 'injected', '<<<', '--list']
-                                          bash:  git branch injected
-
-    In both, the `--list` this module reads never reaches git. It flips
-    `_GIT_REF_LIST_FLAGS` on, the bare `injected` is reclassified from "creates a
-    ref" to "a pattern", and the segment auto-approves — while bash creates the
-    ref. Measured against real git: `git branch injected # --list`,
-    `git tag forged # --list` and `git branch injected <<< --list` each created
-    the ref, so this is a live auto-approval bypass rather than a parse curiosity.
-
-    Refused as a CLASS rather than repaired. Repairing it means deciding what
-    bash would have deleted — i.e. reimplementing shell word removal on top of
-    the quoting rules `shlex` already models differently — and an earlier
-    revision of this fix tried exactly that and reopened the bypass it closed:
-    reproducing the comment made this scanner keep going after the `#`, and a
-    lone `'` inside comment TEXT (`echo x # don't`) then leaked quote state
-    across the newline, so the next line's forged `# --list` was never removed
-    and `git branch evil # --list` auto-approved again. Refusing on the FIRST
-    hit has no "afterwards" to get wrong. A read-only command needs neither
-    construct, and a refused command falls through to the human approval prompt.
-
-    Every way this scanner can disagree with bash therefore costs a prompt
-    rather than an approval. It is deliberately wider than bash in places —
-    `str.isspace()` accepts separators bash does not (U+00A0), and ANSI-C
-    `$'…\''` quoting is not modelled — and in this direction that is a false
-    refusal, never a false approval.
-
-    Quote-aware on purpose, so it costs no ordinary read. Both constructs are
-    shell syntax only when unquoted, and the common false positives are exactly
-    the quoted and non-word-initial spellings:
-
-        grep '#include' file        `#` inside quotes is data
-        git log --grep=#123         `#` mid-word is not a comment to bash
-        grep "<div>" file           `<` inside quotes is data
-
-    A backslash escape is honoured for the same reason (`grep \\# file`).
-
-    Two costs, stated rather than hidden, and asserted in the tests:
-
-    * An ordinary trailing comment is refused (`git status # note`,
-      `ls -la # list files`). Agent-emitted bash carries one often, so this is
-      the larger everyday cost of the two — a real auto-approve-rate loss, taken
-      knowingly because the alternative above is a live bypass.
-    * An unquoted input redirect is refused even where it is genuinely harmless
-      (`wc -l < file`, `grep pattern < file`), since what makes it dangerous is
-      the token-list divergence, not the direction of the data.
-    """
-    quote: str | None = None
-    # Start-of-string counts as a word boundary: bash reads a leading `#` as a
-    # comment, so `# git status` is an empty command rather than a read.
-    at_word_start = True
-    i = 0
-    n = len(cmd)
-    while i < n:
-        ch = cmd[i]
-        if quote is not None:
-            # Inside double quotes a backslash still escapes; inside single
-            # quotes it is literal, exactly as a shell reads it.
-            if ch == "\\" and quote == '"' and i + 1 < n:
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
-            i += 1
-            at_word_start = False
-            continue
-        if ch == "\\" and i + 1 < n:
-            # An escaped character is data, including an escaped `#` or `<`.
-            i += 2
-            at_word_start = False
-            continue
-        if ch in ("'", '"'):
-            quote = ch
-            i += 1
-            at_word_start = False
-            continue
-        if ch == "#" and at_word_start:
-            return "a comment deletes the rest of the line, which `shlex` keeps"
-        if ch == "<":
-            return "an input redirect removes words that `shlex` keeps"
-        at_word_start = ch.isspace()
-        i += 1
     return ""
 
 
@@ -1592,13 +1881,6 @@ def _classify_bash(cmd: str) -> str:
     """
     if not cmd.strip():
         return "empty command"
-    # Runs on the RAW command, before any splitting: a comment elides to the end
-    # of the line regardless of the `&&` / `;` boundaries the regex split below
-    # believes in, so `git status && git branch injected # --list` has to be
-    # caught here rather than per-segment.
-    elided = _elided_shell_construct(cmd)
-    if elided:
-        return f"unsafe shell pattern: {elided}"
     # Strip discard-only redirects (output sinks / stderr-merge) before the
     # unsafe-shell check; they are read-only but contain '>' / '&'.
     scrubbed = _DEVNULL_REDIR_RE.sub(" ", cmd)
@@ -2600,7 +2882,8 @@ class _ChatSlot:
         "created_at",
         "messages",
         "total_messages",
-        "task",
+        "_task",
+        "_turn_generation",
         "event",
         "_pending",
         "_pending_consumers",
@@ -2759,7 +3042,11 @@ class _ChatSlot:
         self._source_links_revision = 0
         self._source_links_cache: tuple[tuple[int, int], list[dict]] | None = None
         self.total_messages: int = 0  # lifetime count (survives trimming)
-        self.task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._task: asyncio.Task[Any] | None = None
+        # Monotonic publication history for turn ownership. ``task`` returns to
+        # None after teardown, so consumers that span awaits cannot distinguish
+        # "stayed idle" from "ran and finished" by comparing task references.
+        self._turn_generation: int = 0
         self.event = asyncio.Event()
         self._pending: list[dict[str, str]] = []
         # Number of readers currently treating ``_pending`` as their delivery
@@ -2771,7 +3058,7 @@ class _ChatSlot:
         # purge never runs again for that slot, so the rows it declined to drop
         # outlive every consumer and the leak survives its own fix.
         self._pending_release_deferred: bool = False
-        self._queue: list[dict[str, str]] = []  # [{"id": uuid, "content": str}, ...]
+        self._queue: list[dict[str, Any]] = []  # [{"id": uuid, "content": str}, ...]
         # Newest enqueue instant, read only while ``_queue`` is non-empty — see
         # ``_note_enqueue``.
         self._last_enqueue_ts: str = ""
@@ -3897,7 +4184,14 @@ class _ChatSlot:
 
     # ── Queue helpers (dict-based queue items) ──
 
-    def queue_append(self, content: str, kind: str = "", meta: dict | None = None) -> str:
+    def queue_append(
+        self,
+        content: str,
+        kind: str = "",
+        meta: dict | None = None,
+        *,
+        directive_user_origin: bool = False,
+    ) -> str:
         """Append a message to the queue. Returns the generated queue ID.
 
         ``kind`` is a structural origin tag (e.g. ``"synthetic_recovery"`` for
@@ -3910,6 +4204,10 @@ class _ChatSlot:
         row whose facts were computed at enqueue time (a sub-agent completion's
         structured header — see gateway ``_subagent_done``) keeps them instead of
         forcing the drain to re-derive them from the prose.
+
+        ``directive_user_origin`` is fail-closed provenance for effects that may
+        mutate the owning session. Only authenticated human entry points set it;
+        absent and automation-created entries remain false through queue merges.
         """
         qid = uuid.uuid4().hex[:12]
         # dict[str, Any]: the base entry is all strings, but ``meta`` adds a dict
@@ -3917,6 +4215,8 @@ class _ChatSlot:
         item: dict[str, Any] = {"id": qid, "content": content, "kind": kind}
         if meta:
             item["meta"] = meta
+        if directive_user_origin:
+            item["_directive_user_origin"] = True
         self._queue.append(item)
         self._note_enqueue()
         return qid
@@ -3943,6 +4243,9 @@ class _ChatSlot:
         kind: str = "",
         payload: str = "",
         meta: dict | None = None,
+        on_consumed: Callable[[bool], None] | None = None,
+        on_irreversibly_consumed: Callable[[], Awaitable[None] | None] | None = None,
+        directive_user_origin: bool = False,
     ) -> str:
         """Insert a message at a specific queue position. Returns the queue ID.
 
@@ -3950,16 +4253,33 @@ class _ChatSlot:
         is the orthogonal question of whether the TEXT is runner-authored, read by
         ``is_synthetic_payload_item``; a recovery entry that replays the user's own
         message shares the recovery kind but is not machine speech.
+
+        The consumption callbacks and directive provenance are process-local state
+        for an automatic retry. They follow the exact queue entry through reordering
+        and repeated retries, but queue snapshots expose only id/content and gateway
+        restart deliberately drops them so the durable producer can recover the
+        still-pending delivery.
         """
         qid = uuid.uuid4().hex[:12]
-        entry: dict[str, Any] = {"id": qid, "content": content, "kind": kind, "payload": payload}
+        item: dict[str, Any] = {
+            "id": qid,
+            "content": content,
+            "kind": kind,
+            "payload": payload,
+        }
         if meta:
-            entry["meta"] = dict(meta)
-        self._queue.insert(index, entry)
+            item["meta"] = dict(meta)
+        if on_consumed is not None:
+            item["_on_consumed"] = on_consumed
+        if on_irreversibly_consumed is not None:
+            item["_on_irreversibly_consumed"] = on_irreversibly_consumed
+        if directive_user_origin:
+            item["_directive_user_origin"] = True
+        self._queue.insert(index, item)
         self._note_enqueue()
         return qid
 
-    def queue_pop(self, index: int = 0) -> dict[str, str]:
+    def queue_pop(self, index: int = 0) -> dict[str, Any]:
         """Pop a queue item by index. Returns {"id": ..., "content": ...}."""
         return self._queue.pop(index)
 
@@ -4030,14 +4350,30 @@ class _ChatSlot:
                 return item["content"]
         return None
 
-    def queue_edit_by_id(self, queue_id: str, content: str) -> bool:
+    def queue_edit_by_id(
+        self,
+        queue_id: str,
+        content: str,
+        *,
+        directive_user_origin: bool = False,
+    ) -> bool:
         """Replace the content of a queue item by ID. Returns True if found.
 
-        Order is preserved — only the content of the matching item changes.
+        Order and identity are preserved. Directive provenance follows the
+        editor because replacement text may contain a directive that the
+        original author never supplied. Automatic recovery entries are immutable:
+        their consumption callbacks settle the exact content that failed, so moving
+        those callbacks onto replacement text would settle the wrong delivery.
         """
         for item in self._queue:
             if item["id"] == queue_id:
+                if "_on_consumed" in item or "_on_irreversibly_consumed" in item:
+                    return False
                 item["content"] = content
+                if directive_user_origin:
+                    item["_directive_user_origin"] = True
+                else:
+                    item.pop("_directive_user_origin", None)
                 return True
         return False
 
@@ -4055,6 +4391,16 @@ class _ChatSlot:
                 self._queue.insert(0, self._queue.pop(i))
                 return True
         return False
+
+    @property
+    def task(self) -> asyncio.Task[Any] | None:
+        return self._task
+
+    @task.setter
+    def task(self, value: asyncio.Task[Any] | None) -> None:
+        if value is not None and value is not self._task:
+            self._turn_generation += 1
+        self._task = value
 
     @property
     def running(self) -> bool:
@@ -4771,6 +5117,13 @@ class DashboardState:
         # lifecycle matches the gateway instance.
         self.resource_pressure_notifier = ResourcePressureNotifier(self.notification_bus)
         self._slots: dict[str, _ChatSlot] = {}
+        # Process-local Spec Builder outbox claims, keyed by directory + delivery.
+        # Directory scope matters because aliases use different slots for the same
+        # files; durable status remains owned by the app's decision ledger.
+        self._spec_decision_deliveries_inflight: set[tuple[str, str]] = set()
+        # Consumed claims whose durable finalization failed remain blocked from
+        # redispatch while a later Spec Builder detail poll retries the ledger write.
+        self._spec_decision_deliveries_consumed: set[tuple[str, str]] = set()
         # Slot keys that EXIST but are deliberately absent from ``_slots`` while
         # they are being built (see ``session_transfer``'s import path, which
         # retracts a slot so it is unreachable until its transcript and context
@@ -4846,6 +5199,14 @@ class DashboardState:
         # Sidebar columns — flat list of {id, name, tag_ids, mode, order, include_untagged}
         self._tag_boards: list[dict[str, Any]] = []
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
+        # Gateway replacement is process-wide, not an ordinary repeatable
+        # background mutation.  The task latch coalesces duplicate /api/restart
+        # clicks during the response-drain window; the in-progress latch also
+        # serializes restart requests arriving through update and other server
+        # paths.  Both are cleared when a mocked/failed exec returns, while a
+        # successful exec replaces this state with the successor process.
+        self._gateway_restart_task: asyncio.Task[None] | None = None
+        self._gateway_restart_in_progress: bool = False
         # FIX 2: unattended-turn concurrency cap. Semaphore is created lazily
         # (see _background_turn_sema) because this object outlives / predates
         # the event loop in some hosts. The counters exist so a queued fleet is
@@ -5239,6 +5600,8 @@ class DashboardState:
         update_managed_by: str = "",
         update_commits_ahead: int = 0,
         update_commits_behind: int = 0,
+        update_last_checked_at: float | None = None,
+        update_check_interval_secs: int = 43200,
     ) -> dict[str, Any]:
         """Core status fields shared by /api/status, SSE, and WebSocket pushes."""
         uptime = int(time.time() - self.start_time)
@@ -5298,6 +5661,8 @@ class DashboardState:
             # tell the two apart. 0/0 on non-git layouts and before any check.
             "update_commits_ahead": update_commits_ahead,
             "update_commits_behind": update_commits_behind,
+            "update_last_checked_at": update_last_checked_at,
+            "update_check_interval_secs": update_check_interval_secs,
             "no_crons": self.no_crons,
             "branch": branch,
             "commit": commit,
@@ -7055,6 +7420,20 @@ class DashboardState:
         except Exception:
             logger.warning("Failed to load cron folders", exc_info=True)
 
+    def _persist_cron_folders(self, folders: list[dict[str, Any]]) -> None:
+        """Atomically write ``folders`` to the cron-folders file.
+
+        Takes the list to persist explicitly so a caller can save a candidate
+        list before committing it to ``_cron_folders`` (see ``create_cron_folder``),
+        keeping in-memory state and disk from diverging mid-operation. Any
+        malformed entries preserved at load time (``_unparsed_cron_folder_entries``)
+        are appended, so a save cannot erase bytes a hand-edit left in a shape
+        the loader could not validate.
+        """
+        path = config_dir() / self._CRON_FOLDERS_FILE
+        unparsed = getattr(self, "_unparsed_cron_folder_entries", [])
+        self._atomic_write_json_strict(path, [*folders, *unparsed])
+
     def save_cron_folders(self) -> None:
         """Persist cron folder definitions to disk (atomic write).
 
@@ -7064,25 +7443,27 @@ class DashboardState:
         shape this loader could not validate. Raises on I/O failure so callers
         can surface a 500 to the client rather than silently losing the write.
         """
-        path = config_dir() / self._CRON_FOLDERS_FILE
-        unparsed = getattr(self, "_unparsed_cron_folder_entries", [])
-        payload: list[Any] = [*self._cron_folders, *unparsed]
-        self._atomic_write_json_strict(path, payload)
+        self._persist_cron_folders(self._cron_folders)
 
     def create_cron_folder(self, name: str, folder_id: str) -> dict:
         """Create a new cron folder and persist.
 
         Returns the created folder dict. Raises on persistence failure
-        (callers should surface a 500); in-memory state is rolled back.
+        (callers should surface a 500).
+
+        The folder is persisted BEFORE it is exposed in ``_cron_folders``: a
+        concurrent ``GET /api/cron-folders`` reads the live list, so appending
+        first and saving second would let a reader observe (and the frontend
+        render) a folder that a failed save then removes — a transient "ghost"
+        folder inconsistent with disk. Building the candidate list, persisting
+        it, and only then committing the reference means a reader sees either
+        the pre-create list or the durably-saved one, never an intermediate.
         """
         order = max((f["order"] for f in self._cron_folders), default=-1) + 1
         folder = {"id": folder_id, "name": name, "order": order}
-        self._cron_folders.append(folder)
-        try:
-            self.save_cron_folders()
-        except Exception:
-            self._cron_folders.pop()
-            raise
+        candidate = [*self._cron_folders, folder]
+        self._persist_cron_folders(candidate)
+        self._cron_folders = candidate
         return folder
 
     def rename_cron_folder(self, folder_id: str, name: str) -> dict | None:

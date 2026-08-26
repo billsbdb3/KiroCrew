@@ -92,6 +92,10 @@ Current status:
   open the existing native Electron menus from the left of that row, the command
   palette remains centered on the window, and native minimize/maximize/close
   controls remain on the right.
+- **Cold-start-aware gateway handoff** — a live bundled backend keeps the loading
+  screen and progress updates through the longer Windows import window instead of
+  presenting a false failure that succeeds on Retry. A child exit or spawn error
+  still fails immediately and includes the launch-log cause.
 
 The source install below remains the fully supported path.
 
@@ -172,6 +176,11 @@ PowerShell installer; if it is signed out, choose **Sign in to Kiro** and
 complete the device-code flow in the browser. The dashboard opens automatically
 after `kiro-cli whoami` succeeds. This setup runs on the gateway machine, which
 may be different from the computer running the browser.
+
+The per-user Kiro CLI install under `%LOCALAPPDATA%\Kiro-Cli` is discovered
+independently of the gateway's inherited `PATH`. Installing it while the desktop
+gateway is already running is therefore picked up by the setup page's next
+automatic check; neither a gateway restart nor a Windows reboot is required.
 
 `kirocrew` lands in `.venv\Scripts\`. If a launched (non-shell)
 gateway can't find the built-in `kirocrew-cron` / `kirocrew-core` MCP servers,

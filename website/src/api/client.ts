@@ -861,11 +861,12 @@ export interface TailnetStatusData {
  * - `install` / `start_daemon` / `sign_in` / `enable_magicdns` — the four ways
  *   there is no usable tailnet name, kept apart because each is a different
  *   errand for the operator.
+ * - `enable_https` — the tailnet has not granted certificate provisioning for
+ *   that name; this requires one-time tailnet administrator consent.
  * - `trust_off` — a name exists but the gateway will not accept it as an origin
  *   yet, so publishing would yield a reachable dashboard answering 403.
- * - `restart_gateway` — configured and resolvable NOW, but this server resolved
- *   nothing at startup (it booted before tailscaled). Genuinely not trusted
- *   until a restart, so it must not render as ready.
+ * - `restart_gateway` — configured and resolvable NOW, but this server did not
+ *   trust that exact name at startup. The one-click flow restarts and resumes.
  * - `occupied` — serve holds the mount for something that is not this dashboard,
  *   or its state is undeterminable; publishing would REPLACE it.
  * - `publish` — everything in place, one action left.
@@ -877,6 +878,7 @@ export type TailnetMobileStep =
   | 'start_daemon'
   | 'sign_in'
   | 'enable_magicdns'
+  | 'enable_https'
   | 'trust_off'
   | 'restart_gateway'
   | 'occupied'
@@ -904,7 +906,7 @@ export interface TailnetMobileData {
   peers_online: number
   /** `dashboard.tailscale.enabled` — the origin-trust config switch. */
   trusted: boolean
-  /** Whether the RUNNING server resolved a name at startup. */
+  /** Whether the RUNNING server trusted this exact name at startup. */
   startup_trusted: boolean
   /** `null` when serve state could not be determined — never render as false. */
   published: boolean | null
@@ -1617,6 +1619,8 @@ export interface KiroBonusCreditGrantPayload {
 
 export interface KiroUsagePayload {
   available?: boolean
+  /** Why usage is unavailable when `available` is false (e.g. `api_key_auth`). */
+  reason?: string
   credits_used?: number
   credits_covered?: number
   credits_overage?: number
@@ -1913,8 +1917,8 @@ export const api = {
   securityPosture: () => get('/api/security/posture').then(j) as Promise<SecurityPostureData>,
   // Tailnet origin (Settings → Security). READ ONLY here: the toggle writes
   // `dashboard.tailscale.enabled` through the generic config PATCH, because the
-  // setting IS a config value and the status endpoint only reports what the
-  // running server resolved from it at startup.
+  // setting IS a config value and the status endpoint reports what the running
+  // server resolved from it at startup.
   tailnetStatus: () => get('/api/tailnet/status').then(j) as Promise<TailnetStatusData>,
   // Mobile access. `tailnetMobile` is a LIVE probe (two daemon round trips
   // server-side), so poll it gently; the three mutations below are user-driven.
@@ -2751,11 +2755,13 @@ export const api = {
    *  `kinds` narrows the result set server-side — 'files' or 'dirs'; omitted returns both.
    *  Filtering server-side rather than dropping unwanted hits here matters because the
    *  backend caps results BEFORE the response, so a client-side filter would silently
-   *  shrink an already-capped list. */
-  fileSearch: (q: string, project?: string, signal?: AbortSignal, kinds?: 'files' | 'dirs') => {
+   *  shrink an already-capped list. `limit` raises the server's result cap (default 15);
+   *  the server clamps it to a fixed ceiling, so a large value cannot amplify the walk. */
+  fileSearch: (q: string, project?: string, signal?: AbortSignal, kinds?: 'files' | 'dirs', limit?: number) => {
     const p = new URLSearchParams({ q })
     if (project) p.set('project', project)
     if (kinds) p.set('kinds', kinds)
+    if (limit) p.set('limit', String(limit))
     return fetch(`/api/file-search?${p}`, signal ? { signal } : undefined).then(j) as Promise<{ results: Array<{ path: string; name: string; size: number; mtime: number; kind?: 'file' | 'dir' }>; root: string }>
   },
   /** Upload files via browser File API (cross-platform) */
