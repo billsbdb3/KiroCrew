@@ -1948,8 +1948,11 @@ export const api = {
   // endpoint returns the full refreshed snapshot so callers can seed the query
   // cache from the mutation response instead of re-fetching.
   listTrustedApps: () => get('/api/security/trusted-apps').then(j) as Promise<TrustedAppsData>,
-  trustApp: (name: string) =>
-    post('/api/security/trusted-apps/' + encodeURIComponent(name)).then(j) as Promise<TrustedAppsData>,
+  trustApp: (name: string, repository?: string) =>
+    post(
+      '/api/security/trusted-apps/' + encodeURIComponent(name),
+      repository ? { repository } : undefined,
+    ).then(j) as Promise<TrustedAppsData>,
   // Returns the snapshot PLUS `disabled` — revoking trust also disables an app
   // that is currently enabled, so its code stops running immediately.
   untrustApp: (name: string) =>

@@ -1621,6 +1621,16 @@ class AgentConfig:
             "accepted (use apps_allow_third_party to trust all).",
         ),
     )
+    apps_trusted_local: list[str] = field(
+        default_factory=list,
+        metadata=_meta(
+            "Trusted Local Apps",
+            "App names whose per-app execution grant was explicitly reviewed "
+            "as local, repository-less code. This internal grant-kind marker "
+            "distinguishes current local consent from legacy name-only grants; "
+            "it is effective only with the matching apps_trusted entry.",
+        ),
+    )
     apps_trusted_repositories: dict[str, str] = field(
         default_factory=dict,
         metadata=_meta(
@@ -1629,7 +1639,8 @@ class AgentConfig:
             "Each key is an app name from apps_trusted and each value is the "
             "normalized repository shown at consent. Registry installation "
             "refuses if that name later resolves to a different repository. "
-            "Legacy grants without an entry remain name-only.",
+            "Legacy repository-backed grants without an entry require one-time "
+            "re-consent before code execution.",
         ),
     )
     jail: str = field(
@@ -7176,6 +7187,11 @@ class KiroCrewConfig:
                     if isinstance(_trusted := agent_data.get("apps_trusted"), list)
                     else []
                 ),
+                apps_trusted_local=(
+                    [a for a in _trusted_local if isinstance(a, str) and a]
+                    if isinstance(_trusted_local := agent_data.get("apps_trusted_local"), list)
+                    else []
+                ),
                 apps_trusted_repositories=(
                     {
                         name: repository
@@ -7186,9 +7202,7 @@ class KiroCrewConfig:
                         and repository
                     }
                     if isinstance(
-                        _trusted_repositories := agent_data.get(
-                            "apps_trusted_repositories"
-                        ),
+                        _trusted_repositories := agent_data.get("apps_trusted_repositories"),
                         dict,
                     )
                     else {}

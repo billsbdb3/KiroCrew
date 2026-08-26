@@ -31,6 +31,7 @@
         "sandbox_allow_unsandboxed_exec": false,
         "apps_allow_third_party": false,
         "apps_trusted": [],
+        "apps_trusted_local": [],
         "apps_trusted_repositories": {},
         "jail": "auto",
         "dangerously_skip_permissions": false,
@@ -375,6 +376,34 @@
       "defaultValue": null
     },
     {
+      "path": "agent.apps_trusted_local",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Trusted Local Apps",
+      "help": "App names whose per-app execution grant was explicitly reviewed as local, repository-less code. This internal grant-kind marker distinguishes current local consent from legacy name-only grants; it is effective only with the matching apps_trusted entry.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "agent.apps_trusted_local.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
       "path": "agent.apps_trusted_repositories",
       "kind": "core",
       "type": "object",
@@ -383,7 +412,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Trusted App Repositories",
-      "help": "Repository coordinates captured by the per-app trust endpoint. Each key is an app name from apps_trusted and each value is the normalized repository shown at consent. Registry installation refuses if that name later resolves to a different repository. Legacy grants without an entry remain name-only.",
+      "help": "Repository coordinates captured by the per-app trust endpoint. Each key is an app name from apps_trusted and each value is the normalized repository shown at consent. Registry installation refuses if that name later resolves to a different repository. Legacy repository-backed grants without an entry require one-time re-consent before code execution.",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": {}
