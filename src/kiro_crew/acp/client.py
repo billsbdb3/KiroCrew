@@ -131,7 +131,7 @@ from kiro_crew.sandbox import (
     apply_windows_resource_ceiling,
     cgroup_scope_argv,
     create_subprocess_limited,
-    scrub_agent_denied_env,
+    scrub_agent_subprocess_env,
     wrap_argv,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -717,6 +717,55 @@ _TOOL_INTERRUPTED_MARKER = "Tool uses were interrupted, waiting for the next use
 def _is_tool_interrupted_marker(chunk: str) -> bool:
     """Exact match against the kiro-cli security-filter interrupt marker."""
     return chunk.strip() == _TOOL_INTERRUPTED_MARKER
+
+
+def format_command_result(result: dict) -> str:
+    """Extract displayable text from a commands/execute response.
+
+    Module-level (not a method) because both native slash-command paths need
+    it: AcpClient.stream_command (direct-spawn sessions) and
+    AcpSessionHandle.stream_command (shared-runtime sessions).
+
+    The output is two-pass redacted (URLs + credentials) HERE, in the shared
+    helper, so every present and future caller inherits the security control
+    (command output is backend-echoed text that reaches the dashboard) instead
+    of each call site re-discovering it. Call-site re-redaction stays
+    harmless — both passes are idempotent.
+    """
+    data = result.get("data")
+    message = result.get("message", "")
+    text = ""
+    # Structured data — format as readable JSON block
+    if isinstance(data, dict) and data:
+        # Filter out agent/model metadata (handled separately)
+        display = {k: v for k, v in data.items() if k not in ("agent", "model")}
+        if display:
+            block = json.dumps(display, indent=2)
+            text = (
+                f"{message}\n```json\n{block}\n```"
+                if message
+                else f"```json\n{block}\n```"
+            )
+    if not text:
+        text = message or ""
+    if text:
+        text, _ = redact_exfiltration_urls(text)
+        text, _ = redact_credentials(text)
+    return text
+
+
+def parse_slash_command(command: str) -> tuple[str, dict]:
+    """Parse ``/foo bar baz`` into TuiCommand ``(name, args)``.
+
+    Shared by AcpClient.stream_command and AcpSessionHandle.stream_command —
+    both send the OBJECT form (``{command, args}``) because kiro-cli 2.14.0
+    returns no response on the string form of ``_kiro.dev/commands/execute``.
+    """
+    parts = command.strip().split(None, 1)
+    name = parts[0].lstrip("/") if parts else command.lstrip("/")
+    value = parts[1] if len(parts) > 1 else None
+    args: dict = {"value": value} if value else {}
+    return name, args
 
 
 # Timeouts for session initialization steps
@@ -2691,9 +2740,9 @@ class AcpClient:
         # foreign MCP subprocesses (which bundle their own interpreter + deps).
         # is_kiro_cli is membership in ACP_BACKENDS_INTERNAL_SANDBOX
         # (harness-parity H7), not "not claude": the flag makes wrap_argv SKIP
-        # Crew's seatbelt on macOS in favour of the harness's own internal
-        # sandbox, so a harness without one must never be granted it by the
-        # absence of another harness.
+        # Crew's seatbelt on macOS and grants Windows's Kiro-only delegation in
+        # favour of the harness's own internal sandbox, so a harness without one
+        # must never be granted it by the absence of another harness.
         argv, self._sandbox_cleanup = wrap_argv(
             argv,
             mode=self._sandbox_mode,
@@ -2715,14 +2764,6 @@ class AcpClient:
         env = {**os.environ}
         if self._extra_env:
             env.update(self._extra_env)
-        # Parent-level scrub of gateway-owned channel credentials. The default
-        # auto/standard sandbox launcher strips _AGENT_DENIED_ENV_KEYS only for
-        # cc/strict, and this path copies a raw os.environ + wrap_argv (not
-        # sandboxed_spawn_argv), so without this the Slack/WeCom/Telegram tokens
-        # seeded into os.environ by load_credentials() would be inherited by the
-        # agent subprocess on the default tier. Leaves the AWS/SSH env the
-        # standard sandbox intentionally exposes untouched.
-        env = scrub_agent_denied_env(env)
         env["PATH"] = augmented_path(env.get("PATH", ""))
         if self._is_claude and not env.get("CLAUDE_CODE_EXECUTABLE"):
             # Dormant seam (see _spawn docstring): the adapter's SDK needs a
@@ -2763,6 +2804,12 @@ class AcpClient:
         env = await self._to_thread_guarding_sandbox(
             functools.partial(_resolve_spawn_env, kiro_api_key=self._is_kiro), env
         )
+        # Match the OS launchers' sensitive + Python env scrub in the parent.
+        # Windows Kiro delegation has no POSIX `env -u` wrapper, so this is the
+        # enforcement point there. Keep it after _resolve_spawn_env so SSH repair
+        # cannot reintroduce a denied pointer; KIRO_API_KEY remains available only
+        # to the positively identified Kiro backend.
+        env = scrub_agent_subprocess_env(env)
         # Positive-identity marker for the orphan sweep: kiro-cli and every MCP
         # server it spawns inherit this, so escaped launcher trees (``npx
         # @playwright/mcp`` -> node) are identifiable as ours.
@@ -4256,7 +4303,7 @@ class AcpClient:
                 if extract_agent_from_result and isinstance(result, dict):
                     # commands/execute returns output in result fields,
                     # not via session/update chunks — yield as text.
-                    text = self._format_command_result(result)
+                    text = format_command_result(result)
                     if text:
                         yield AcpEvent(kind=EVENT_TEXT_CHUNK, text=text)
                     if not saw_agent_switch:
@@ -4620,7 +4667,7 @@ class AcpClient:
         self._cancelled = False
         await self.ensure_ready()
 
-        cmd_name, cmd_args = self._parse_slash_command(command)
+        cmd_name, cmd_args = parse_slash_command(command)
         req_id = await self._send_request(
             METHOD_COMMANDS_EXECUTE,
             {
@@ -4630,34 +4677,6 @@ class AcpClient:
         )
         async for event in self._dispatch_events(req_id, timeout, extract_agent_from_result=True):
             yield event
-
-    @staticmethod
-    def _format_command_result(result: dict) -> str:
-        """Extract displayable text from a commands/execute response."""
-        import json as _json
-
-        data = result.get("data")
-        message = result.get("message", "")
-        # Structured data — format as readable JSON block
-        if isinstance(data, dict) and data:
-            # Filter out agent/model metadata (handled separately)
-            display = {k: v for k, v in data.items() if k not in ("agent", "model")}
-            if display:
-                return (
-                    f"{message}\n```json\n{_json.dumps(display, indent=2)}\n```"
-                    if message
-                    else f"```json\n{_json.dumps(display, indent=2)}\n```"
-                )
-        return message or ""
-
-    @staticmethod
-    def _parse_slash_command(command: str) -> tuple[str, dict]:
-        """Parse ``/foo bar baz`` into TuiCommand ``(name, args)``."""
-        parts = command.strip().split(None, 1)
-        name = parts[0].lstrip("/") if parts else command.lstrip("/")
-        value = parts[1] if len(parts) > 1 else None
-        args: dict = {"value": value} if value else {}
-        return name, args
 
     async def cancel_session(self, grace_secs: float = 0.0) -> None:
         """Cancel the current in-flight operation via ACP session/cancel.

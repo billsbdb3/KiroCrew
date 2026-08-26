@@ -21,6 +21,7 @@ import AssistantMessage, { type TurnStats } from '../pages/chat/AssistantMessage
 import UserMessage from '../pages/chat/UserMessage'
 import { renderMcpOAuthMessage } from '../pages/chat/McpOAuthBanner'
 import SubagentCompletionCard from '../pages/chat/SubagentCompletionCard'
+import NudgeCard from '../pages/chat/NudgeCard'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import MessageErrorBoundary from '../components/MessageErrorBoundary'
@@ -29,6 +30,7 @@ import { type PasteBlock, findTokenRanges, recollapsePastes } from '../utils/pas
 import type { ChatMessage } from '../types'
 import { fmtMessageTime, fmtMessageTimeFull } from '../pages/chat/messageTime'
 import { turnHadPolicyBlock } from './turnPolicyBlock'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
 /** Everything a renderer may read. Passed per row so entries stay pure functions. */
 export interface MessageRenderContext {
@@ -114,6 +116,7 @@ function formatTs(ts?: string): string | undefined {
 
 /** Prop-driven tool row. The store-connected variant is a host entry. */
 export const ToolCallPill = memo(function ToolCallPill({ message, running, onFileOpen, autoDenied }: { message: ChatMessage; running: boolean; onFileOpen?: (path: string) => void; autoDenied?: boolean }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = React.useState(false)
   const isDone = message.role === 'tool_result'
   const isRejected = message.meta?.resolved === 'rejected'
@@ -352,6 +355,14 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
       if (!banner) return null
       return ctx.row(banner)
     },
+  },
+  {
+    // Auto-nudge cycle marker. `onOpenLoop` (jump to the loop popover) is
+    // ChatPage chrome and is deliberately absent here: the card renders its
+    // full content without it, only the affordance is page-specific.
+    id: 'nudge',
+    roles: ['nudge'],
+    render: (m, ctx) => ctx.row(<NudgeCard message={m} disclosureKey={ctx.key} />),
   },
 ]
 

@@ -1,9 +1,6 @@
-"""SEL audit for the remaining cron-removal paths (issue #5408).
+"""SEL audit coverage for cron-removal paths (issues #5408 and #5438).
 
-PR #5405 (in review) adds the ``cron.remove`` audit to the dashboard, MCP, and
-CLI single-delete paths; on base, the plural ``cron.batch_delete`` is the only
-audited removal. These tests lock in the same shapes for the paths neither
-covers:
+These tests lock in the caller attribution and one-shot record shapes for:
 
 * Slack keyword ``cron remove <id>`` (``slack/handler.py``)
 * Slack ``cron remove all`` (the plural path, mirroring ``cron.batch_delete``)
@@ -11,10 +8,10 @@ covers:
   Done removal, the deferred drain, and the ``delete_after_run`` consume in
   ``_merge_job_result``
 
-Each path asserts both halves of the contract: the event is emitted on
-success, and the removal still succeeds when the audit raises (the first
-``sel()`` of a process constructs the log and can raise). The composite
-gateway-then-merge test locks the exactly-one-record invariant across paths.
+Caller-requested paths assert that actor/source attribution reaches the
+CronService seam without a duplicate call-site emit. Automated paths retain
+their one-shot outcome/path contract. The composite gateway-then-merge test
+locks the exactly-one-record invariant across paths.
 """
 
 from __future__ import annotations
@@ -26,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import kiro_crew.cron as cron_mod
+import kiro_crew.messaging.commands as mc
 import kiro_crew.slack.handler as h
 from kiro_crew.cron import CronJob, CronSchedule, CronService, CronStoreBusy
 
@@ -40,43 +38,40 @@ def _job(job_id: str = "j1", *, name: str = "nightly") -> CronJob:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Slack keyword `cron remove <id>`
+# Keyword `cron remove <id>` -- the SHARED reply, reached through Slack's handler.
+# Exercised through `_handle_cron_command` so the caller attribution is tested
+# end to end (it threads Slack's `user_id` into the shared `caller`), with the
+# `sel` patch on the module that now emits the record.
 # ──────────────────────────────────────────────────────────────────────
 class TestSlackSingleRemoveAudit:
     @pytest.mark.asyncio
     async def test_remove_emits_sel_audit_with_caller(self):
         svc = MagicMock()
         svc.remove_job_async = AsyncMock(return_value=True)
-        with patch("kiro_crew.slack.handler.sel") as mock_sel:
+        with patch("kiro_crew.messaging.commands.sel") as mock_sel:
             out = await h._handle_cron_command("cron remove j1", svc, "C", "t", user_id="U123")
         assert out is not None and "Removed cron job" in out
-        mock_sel.return_value.log_api_access.assert_called_once_with(
-            caller="U123",
-            operation="cron.remove",
-            outcome="allowed",
-            source="slack",
-            resources="job_id=j1",
-        )
+        svc.remove_job_async.assert_awaited_once_with("j1", actor="U123", source="slack")
+        mock_sel.return_value.log_api_access.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_remove_missing_audits_not_found(self):
         svc = MagicMock()
         svc.remove_job_async = AsyncMock(return_value=False)
-        with patch("kiro_crew.slack.handler.sel") as mock_sel:
+        with patch("kiro_crew.messaging.commands.sel") as mock_sel:
             out = await h._handle_cron_command("cron remove ghost", svc, "C", "t", user_id="U123")
         assert out is not None and "not found" in out
-        kw = mock_sel.return_value.log_api_access.call_args.kwargs
-        assert kw["operation"] == "cron.remove"
-        assert kw["outcome"] == "not_found"
-        assert "ghost" in kw["resources"]
+        svc.remove_job_async.assert_awaited_once_with("ghost", actor="U123", source="slack")
+        mock_sel.return_value.log_api_access.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_caller_falls_back_to_surface_when_no_user(self):
         svc = MagicMock()
         svc.remove_job_async = AsyncMock(return_value=True)
-        with patch("kiro_crew.slack.handler.sel") as mock_sel:
+        with patch("kiro_crew.messaging.commands.sel") as mock_sel:
             await h._handle_cron_command("cron remove j1", svc, "C", "t")
-        assert mock_sel.return_value.log_api_access.call_args.kwargs["caller"] == "slack"
+        svc.remove_job_async.assert_awaited_once_with("j1", actor="slack", source="slack")
+        mock_sel.return_value.log_api_access.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_busy_store_audits_nothing(self):
@@ -84,7 +79,7 @@ class TestSlackSingleRemoveAudit:
         # audit, matching the dashboard single-delete busy path.
         svc = MagicMock()
         svc.remove_job_async = AsyncMock(side_effect=CronStoreBusy())
-        with patch("kiro_crew.slack.handler.sel") as mock_sel:
+        with patch("kiro_crew.messaging.commands.sel") as mock_sel:
             out = await h._handle_cron_command("cron remove j1", svc, "C", "t", user_id="U123")
         assert out is not None and "busy" in out
         mock_sel.return_value.log_api_access.assert_not_called()
@@ -97,7 +92,7 @@ class TestSlackSingleRemoveAudit:
         svc = MagicMock()
         svc.remove_job_async = AsyncMock(return_value=True)
         with patch(
-            "kiro_crew.slack.handler.sel",
+            "kiro_crew.messaging.commands.sel",
             side_effect=RuntimeError("SEL trust root unavailable"),
         ):
             out = await h._handle_cron_command("cron remove j1", svc, "C", "t", user_id="U123")
@@ -105,7 +100,9 @@ class TestSlackSingleRemoveAudit:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Slack `cron remove all` (plural path)
+# `cron remove all` (plural path) -- now the SHARED reply, so the audit covers
+# every channel rather than Slack's own copy of the command. Slack threads its
+# `user_id` through as `caller`; the patch target moves with the code.
 # ──────────────────────────────────────────────────────────────────────
 class TestSlackRemoveAllAudit:
     @pytest.mark.asyncio
@@ -113,16 +110,11 @@ class TestSlackRemoveAllAudit:
         svc = MagicMock()
         svc.list_jobs.return_value = [_job("j1"), _job("j2")]
         svc.remove_jobs = AsyncMock(return_value=(["j1", "j2"], []))
-        with patch("kiro_crew.slack.handler.sel") as mock_sel:
-            out = await h._remove_all_jobs(svc, user_id="U123")
+        with patch("kiro_crew.messaging.commands.sel") as mock_sel:
+            out = await mc.cron_remove_all_reply(svc, source="slack", caller="U123")
         assert "Removed 2 cron job(s)" in out
-        mock_sel.return_value.log_api_access.assert_called_once()
-        kw = mock_sel.return_value.log_api_access.call_args.kwargs
-        assert kw["caller"] == "U123"
-        assert kw["operation"] == "cron.batch_delete"
-        assert kw["outcome"] == "ok"
-        assert kw["source"] == "slack"
-        assert "j1" in kw["resources"] and "j2" in kw["resources"]
+        svc.remove_jobs.assert_awaited_once_with(["j1", "j2"], actor="U123", source="slack")
+        mock_sel.return_value.log_api_access.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_remove_all_nothing_deleted_audits_failed(self):
@@ -131,17 +123,18 @@ class TestSlackRemoveAllAudit:
         svc = MagicMock()
         svc.list_jobs.return_value = [_job("j1")]
         svc.remove_jobs = AsyncMock(return_value=([], ["j1"]))
-        with patch("kiro_crew.slack.handler.sel") as mock_sel:
-            await h._remove_all_jobs(svc, user_id="U123")
-        assert mock_sel.return_value.log_api_access.call_args.kwargs["outcome"] == "failed"
+        with patch("kiro_crew.messaging.commands.sel") as mock_sel:
+            await mc.cron_remove_all_reply(svc, source="slack", caller="U123")
+        svc.remove_jobs.assert_awaited_once_with(["j1"], actor="U123", source="slack")
+        mock_sel.return_value.log_api_access.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_busy_store_audits_nothing(self):
         svc = MagicMock()
         svc.list_jobs.return_value = [_job("j1")]
         svc.remove_jobs = AsyncMock(side_effect=CronStoreBusy())
-        with patch("kiro_crew.slack.handler.sel") as mock_sel:
-            out = await h._remove_all_jobs(svc, user_id="U123")
+        with patch("kiro_crew.messaging.commands.sel") as mock_sel:
+            out = await mc.cron_remove_all_reply(svc, source="slack", caller="U123")
         assert "busy" in out
         mock_sel.return_value.log_api_access.assert_not_called()
 
@@ -151,10 +144,10 @@ class TestSlackRemoveAllAudit:
         svc.list_jobs.return_value = [_job("j1"), _job("j2")]
         svc.remove_jobs = AsyncMock(return_value=(["j1", "j2"], []))
         with patch(
-            "kiro_crew.slack.handler.sel",
+            "kiro_crew.messaging.commands.sel",
             side_effect=RuntimeError("SEL trust root unavailable"),
         ):
-            out = await h._remove_all_jobs(svc, user_id="U123")
+            out = await mc.cron_remove_all_reply(svc, source="slack", caller="U123")
         assert "Removed 2 cron job(s)" in out
 
 
@@ -234,7 +227,7 @@ class TestDeferredDrainAudit:
         svc = CronService(base_dir=tmp_path)
         job = svc.add_job("one-shot", "ping", at_ts=time.time() + 3600, delete_after_run=True)
         svc.defer_removal(job.id)
-        svc.remove_job(job.id)
+        svc.remove_job(job.id, actor="test", source="test")
         sel_recorder.events.clear()
         svc._tick_scan_locked()
         assert not _remove_events(sel_recorder)
@@ -278,7 +271,7 @@ class TestMergeJobResultOneShotAudit:
         # consume here; the gateway path owns that audit record.
         svc = CronService(base_dir=tmp_path)
         job = svc.add_job("reminder", "ping", at_ts=time.time() - 5, delete_after_run=True)
-        svc.remove_job(job.id)
+        svc.remove_job(job.id, actor="test", source="test")
         sel_recorder.events.clear()
         job.last_run_ts = time.time()
         job.last_status = "ok"
@@ -396,8 +389,13 @@ class TestGatewayDoneRemovalAudit:
         job = _make_script_job()
         result, _ = await _run_done_callback(gw, job)
         assert "all done" in (result or "")
-        gw.cron_svc.remove_job_async.assert_called_once_with("sj1")
-        gw.cron_svc.audit_one_shot_removal.assert_called_once_with("sj1", "cron_gateway")
+        gw.cron_svc.remove_job_async.assert_called_once_with(
+            "sj1",
+            actor="cron",
+            source="cron",
+            one_shot_path="cron_gateway",
+        )
+        gw.cron_svc.audit_one_shot_removal.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_busy_store_defers_without_gateway_audit(self):

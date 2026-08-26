@@ -2,6 +2,7 @@ import { createSlice, createAsyncThunk, createSelector, type PayloadAction } fro
 import { api } from '../api/client'
 import { addSlotOptimistic, updateSlot, removeSlotOptimistic, markSlotRead, fetchSlots, slotSurfaceKey, sseSlots, sseConnected } from './dashboardSlice'
 import { resolveDefaultColor } from '../utils/sessionColors'
+import { isChatPageSurface } from '../utils/channelOrigin'
 import { isSystemNoticeKind } from '../lib/systemNotice'
 import { gcSessionStorage } from '../utils/storageGc'
 import type { RootState } from './index'
@@ -810,7 +811,13 @@ interface ChatState {
   // Ephemeral like `followups`: frontend-only, dropped by a reload. The backend
   // offers at most one card per slot for the lifetime of that slot, so a
   // dismissed or lost card is never re-offered.
-  folderSuggestions: Record<string, { folderId: string; folderName: string; breadcrumb: string; ts: number }>
+  //
+  // `turns` counts the user sends that have happened since the card arrived, so
+  // an unanswered card ages out instead of sitting above the composer for the
+  // rest of the session (see FOLDER_SUGGESTION_MAX_TURNS). Ignoring a suggestion
+  // IS an answer — the user who keeps typing has declined by conduct — and the
+  // backend needs no telling because it never re-offers this slot anyway.
+  folderSuggestions: Record<string, { folderId: string; folderName: string; breadcrumb: string; ts: number; turns: number }>
   // Slot with a locally-started turn awaiting server confirmation. While set,
   // the slots-sync ignores a server running=false for it (the snapshot may
   // predate the send). Cleared on server confirmation or turn end.
@@ -818,6 +825,23 @@ interface ChatState {
 }
 
 const MAX_RETIRED_QUEUE_IDS = 50
+
+/** User sends a folder-suggestion card survives before it ages out on its own.
+ *
+ *  The card is an offer, not a task: a user who keeps typing past it has already
+ *  answered by conduct, and a permanent card in the composer band is a standing
+ *  cost paid by every session the model guessed wrong about. Three is the count
+ *  where the offer is still plausibly in view (the user may be mid-thought when
+ *  it lands, so one turn is too eager) without becoming furniture.
+ *
+ *  Counted by an explicit `ageFolderSuggestion` dispatch from the ONE surface
+ *  that renders the card (ChatPage's composer band, active slot), and only
+ *  after the server confirmed the send was delivered. So: a failed send never
+ *  counts (delivery unconfirmed), a send from a surface that does not show the
+ *  card (ChatPane companion/embed panes, Slack, cron) never counts (nothing
+ *  rendered, nothing dispatched), and a replacement card that landed while the
+ *  send was in flight is not aged (ts-pinned to the generation the user saw). */
+export const FOLDER_SUGGESTION_MAX_TURNS = 3
 
 const initialState: ChatState = {
   activeSlot: null,
@@ -1758,7 +1782,12 @@ export const resumeFromHistory = createAsyncThunk(
     // Without a cursor this response cannot be paged, so do not advertise more:
     // a zero cursor beside hasMore renders an affordance that loads nothing.
     const cursor = typeof d.next_before === 'number' ? d.next_before : null
-    return { ok: d.ok, key: d.key, nextBefore: cursor ?? 0, messages: filterMessages(d.messages || []), hasMore: cursor !== null && (d.has_more || false), total: d.total || 0 }
+    // `surface` (falling back to `mode`) is returned so a caller resuming from
+    // a surface that cannot display every slot (ChatPage's unified view only
+    // shows default/orchestrator/crew, see isChatPageSurface) can tell a
+    // silently-unusable resume apart from a genuinely failed one (#3624) --
+    // the request succeeds either way, so `ok` alone cannot distinguish them.
+    return { ok: d.ok, key: d.key, surface: d.surface ?? d.mode, nextBefore: cursor ?? 0, messages: filterMessages(d.messages || []), hasMore: cursor !== null && (d.has_more || false), total: d.total || 0 }
   },
 )
 
@@ -2314,7 +2343,7 @@ const chatSlice = createSlice({
       // Defensive: a partial preloaded slice (tests, older persisted state) can
       // arrive without this key.
       if (!state.folderSuggestions) state.folderSuggestions = {}
-      state.folderSuggestions[slot] = { folderId, folderName, breadcrumb, ts: ts ?? Date.now() / 1000 }
+      state.folderSuggestions[slot] = { folderId, folderName, breadcrumb, ts: ts ?? Date.now() / 1000, turns: 0 }
     },
     // Both answers land here — accepting the move and declining it clear the same
     // way, because the backend keeps no state to resolve and offers at most one
@@ -2490,6 +2519,33 @@ const chatSlice = createSlice({
         return false
       }
       if (!confirm(state.messages)) confirm(state.slotMessages[safeKey(slot)])
+    },
+    /** Age the slot's folder-suggestion card by one delivered user send, and
+     *  drop it once it has had its run (> FOLDER_SUGGESTION_MAX_TURNS).
+     *
+     *  Deliberately its OWN action, dispatched ONLY by the render site that
+     *  showed the card (ChatPage's composer band, active slot) after the server
+     *  confirmed the send was delivered — never baked into a shared send
+     *  reducer. The two review rounds that shaped this: counting the optimistic
+     *  `startLocalTurn` let FAILED sends burn the one-shot offer, and counting
+     *  `confirmOptimisticSend` let surfaces that confirm sends WITHOUT rendering
+     *  the card (ChatPane in artifact companion chats, sidebar panes, settings
+     *  embeds) expire a card the user never saw. Tying aging to an explicit
+     *  dispatch from the renderer makes every "send from a surface that does not
+     *  show the card" variant unreachable by construction.
+     *
+     *  `ts` guards the in-flight-replacement race the way `clearFolderSuggestion`
+     *  does: the POST that earns this dispatch was sent while ONE card
+     *  generation was visible, and a replacement arriving before the response
+     *  must not inherit its age. */
+    ageFolderSuggestion(state, action: PayloadAction<{ slot: string; ts?: number }>) {
+      const { slot, ts } = action.payload
+      if (isUnsafeKey(slot)) return
+      const suggestion = state.folderSuggestions?.[slot]
+      if (!suggestion) return
+      if (ts != null && suggestion.ts !== ts) return
+      suggestion.turns = (suggestion.turns ?? 0) + 1
+      if (suggestion.turns > FOLDER_SUGGESTION_MAX_TURNS) delete state.folderSuggestions[slot]
     },
     removeByApprovalId(state, action: PayloadAction<string>) { state.messages = state.messages.filter(m => m.meta?.approval_id !== action.payload) },
     resolveByApprovalId(state, action: PayloadAction<{ id: string; decision?: string }>) {
@@ -2722,7 +2778,7 @@ const chatSlice = createSlice({
         if (b) { b.approving = action.payload.approving; return }
       }
     },
-    sseSubagentSpawn(state, action: PayloadAction<{ slot: string; id: string; task: string; agent: string }>) {
+    sseSubagentSpawn(state, action: PayloadAction<{ slot: string; id: string; task: string; agent: string; model?: string }>) {
       if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
       const subs = action.payload.slot !== state.activeSlot
         ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).subagents
@@ -2731,6 +2787,9 @@ const chatSlice = createSlice({
       if (existing?.status === 'pending') {
         existing.status = 'running'
         existing.agent = action.payload.agent || existing.agent || 'kirocrew'
+        // Only overwrite a known model with another known one — never clobber a
+        // resolved id back to '' if a later frame omits it.
+        if (action.payload.model) existing.model = action.payload.model
         // The spawn event carries the authoritative task text (the pending
         // card's task is derived from the approval title, which may be empty
         // or just "spawn_run") — always prefer the spawn payload's task.
@@ -2739,6 +2798,7 @@ const chatSlice = createSlice({
       }
       subs[safeKey(action.payload.id)] = {
         id: action.payload.id, task: action.payload.task, agent: action.payload.agent || 'kirocrew',
+        model: action.payload.model || '',
         status: 'running', streaming: existing?.streaming || '', lastTool: '', startedAt: existing?.startedAt || Date.now(), elapsed: 0,
         toolCount: 0, stalled: false,
       }
@@ -2844,7 +2904,7 @@ const chatSlice = createSlice({
         if (st === 'done' || st === 'error' || st === 'stopped') delete subs[id]
       }
     },
-    sseSubagentDone(state, action: PayloadAction<{ slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; result?: string }>) {
+    sseSubagentDone(state, action: PayloadAction<{ slot: string; id: string; elapsed: number; error?: string; stopped?: boolean; outcome?: 'completed' | 'failed' | 'stopped'; task?: string; agent?: string; model?: string; result?: string }>) {
       if (isUnsafeKey(action.payload.slot) || isUnsafeKey(action.payload.id)) return
       const subs = action.payload.slot !== state.activeSlot
         ? (state.slotActivity[safeKey(action.payload.slot)] ??= { toolLog: [], subagents: {} }).subagents
@@ -2877,6 +2937,10 @@ const chatSlice = createSlice({
         a.streaming = ''
         if (action.payload.task && !a.task) a.task = action.payload.task
         if (action.payload.agent && !a.agent) a.agent = action.payload.agent
+        // The done frame carries the authoritative served model (the CC path
+        // has resolved it by completion). Prefer a known value, but never
+        // clobber a prior known id back to '' if this frame omits it.
+        if (action.payload.model) a.model = action.payload.model
         if (isNative && action.payload.result !== undefined) a.result = action.payload.result
       }
       else {
@@ -2884,6 +2948,7 @@ const chatSlice = createSlice({
           id: action.payload.id,
           task: action.payload.task || '',
           agent: action.payload.agent || 'kirocrew',
+          model: action.payload.model || '',
           status: doneStatus,
           streaming: '',
           lastTool: '',
@@ -3141,7 +3206,7 @@ const chatSlice = createSlice({
       if (idx >= 0) side.messages.splice(idx, 1)
       side.pending = false
     },
-    sseSubagentSnapshot(state, action: PayloadAction<{ id: string; slot: string; task: string; agent: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean }>) {
+    sseSubagentSnapshot(state, action: PayloadAction<{ id: string; slot: string; task: string; agent: string; model?: string; streaming: string; last_tool: string; started: number; tool_count?: number; stalled?: boolean; idle_secs?: number }>) {
       const d = action.payload
       if (isUnsafeKey(d.slot) || isUnsafeKey(d.id)) return
       const subs = d.slot && d.slot !== state.activeSlot
@@ -3151,11 +3216,23 @@ const chatSlice = createSlice({
       // Live events can interleave with replay because subscription starts before
       // snapshots are sent. Never let a stale running snapshot demote a terminal card.
       if (existing?.status === 'done' || existing?.status === 'error') return
+      const stalled = d.stalled ?? false
       subs[safeKey(d.id)] = {
         id: d.id, task: d.task, agent: d.agent || 'kirocrew',
+        // Prefer the snapshot's model; fall back to any id a live frame already
+        // set, so a reconnect that omits it does not blank the pill.
+        model: d.model || existing?.model || '',
         status: d.last_tool ? 'tool' : 'running', streaming: d.streaming, lastTool: d.last_tool,
         startedAt: d.started * 1000, elapsed: 0,
-        toolCount: d.tool_count ?? 0, stalled: d.stalled ?? false,
+        toolCount: d.tool_count ?? 0, stalled,
+        // Same pairing rule as sseSubagentStalled: the idle span lives and dies
+        // with the flag it justifies, so a non-stalled snapshot can never carry
+        // one. `stalledAt` is the receipt instant — the row advances the figure
+        // from here rather than freezing it beside a live elapsed counter.
+        // Both stay undefined when the gateway omits `idle_secs`, which keeps
+        // the plain "no activity" fallback reachable for an older gateway.
+        idleSecs: stalled ? d.idle_secs : undefined,
+        stalledAt: stalled && typeof d.idle_secs === 'number' ? Date.now() : undefined,
         approval_id: existing?.approval_id, approving: existing?.approving,
       }
     },
@@ -4162,11 +4239,28 @@ const chatSlice = createSlice({
         writeSlotPage(state, key, revived, warmIsPrefix ? hasMore : undefined,
           warmIsPrefix && hasMore ? boundedLen : undefined)
         retainServerTotal(state, key, total, running, warmSeq)
-        // Clear the per-slot run indicator (the _done frame already idles it;
-        // this is belt-and-braces for the fetch-completes-after-_done ordering).
-        const run = (state.slotRun[safeKey(key)] ??= { state: 'idle' })
-        run.state = 'idle'
-        run.lastChunkSeq = undefined
+        // Idle the per-slot run indicator only when the server says the turn is
+        // NOT running. This is a pure non-regression gate for the reconnect
+        // caller (which warms slots MID-TURN): idling is idempotent with the
+        // _done frame — the turn-done caller's belt-and-braces contract for the
+        // fetch-completes-after-_done ordering, unchanged — while the
+        // unconditional write it replaces wiped a RUNNING background pane's
+        // indicator with no server-side recovery until the next chunk frame.
+        // Deliberately NO write in the running direction: the warm is a
+        // point-in-time snapshot racing the ordered live-frame writers
+        // (chunk -> streaming, _done -> idle), and any promotion policy has a
+        // losing ordering (a late fulfillment resurrected a pane a _done had
+        // already idled, wedging its composer locked with no healer inside the
+        // reconnect suppression window). A turn that STARTED while the socket
+        // was down therefore still reads idle until its first post-reconnect
+        // frame — exactly as on main today, where reconnect never touches
+        // background run state at all; closing that pre-existing gap needs an
+        // ordering token on the run entry and is tracked separately.
+        if (!running) {
+          const run = (state.slotRun[safeKey(key)] ??= { state: 'idle' })
+          run.state = 'idle'
+          run.lastChunkSeq = undefined
+        }
         seedContextUsage(state, key, action.payload.context)
       })
       .addCase(createSlot.pending, (state) => { state.creatingSlot = true })
@@ -4225,6 +4319,13 @@ const chatSlice = createSlice({
         }
       })
       .addCase(resumeFromHistory.fulfilled, (state, action) => {
+        // A resume that resolved to a surface ChatPage cannot display must not
+        // mutate this slice at all: consuming the history row while the notice
+        // says "can't be opened" reads as data loss, and switching activeSlot
+        // to an undisplayable slot is the silent bounce #3624 exists to stop.
+        // The wire resume itself already happened (the caller's notice handles
+        // telling the user); the row stays reachable in Older Sessions.
+        if (action.payload.ok && !isChatPageSurface(action.payload.surface)) return
         if (action.payload.ok) {
           // The row just became an open tab, so it leaves the Older-sessions
           // pane — that pane is the complement of the tab list, and leaving the
@@ -4298,7 +4399,7 @@ const chatSlice = createSlice({
 })
 
 export const {
-  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
+  setActiveSlot, clearSlotState, setPendingInput, setAgentSwitchNotice, setQuestionCard, retireStatelessQuestion, clearQuestionCard, setQuestionDraft, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
   removeThinking, confirmOptimisticSend, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, startLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoiceAudio,
   toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentChunk, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued,

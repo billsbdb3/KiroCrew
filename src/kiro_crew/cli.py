@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import faulthandler
 import importlib
+import importlib.machinery
 import logging
 import os
 import shutil
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from kiro_crew import __version__, cli_help, platform_compat
+from kiro_crew.apps import builtins as _builtins_pkg
 from kiro_crew.apps.builtins import BUILTIN_NAMES as _BUILTIN_NAMES
 from kiro_crew.config import KiroCrewConfig, config_dir, ensure_data_home
 from kiro_crew.config.loader import (
@@ -875,6 +877,34 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
         install_log_redaction([])
 
 
+def _builtin_mcp_server_available(name: str) -> bool:
+    """True when ``kiro_crew.apps.builtins.<name>.mcp_server`` resolves.
+
+    ``_BUILTIN_NAMES`` answers two different questions: which builtins get HTTP
+    routes (all of them) and which get an ``mcp-<name>`` CLI verb (only those
+    that actually ship an ``mcp_server`` module). Gating the verb on this
+    predicate keeps the two decoupled — a builtin without the module is simply
+    not registered, instead of advertising a command that dies with a raw
+    ``ModuleNotFoundError`` traceback (#5901).
+
+    Resolution deliberately uses ``PathFinder`` rather than
+    ``importlib.util.find_spec``: ``find_spec`` IMPORTS the parent package as a
+    side effect, and every builtin's ``__init__`` pulls in its whole
+    ``backend.routes`` chain — which would execute all builtin apps at
+    parser-build time on every CLI invocation, including the gateway boot path.
+    ``PathFinder`` walks the same import machinery (source, bytecode, extension
+    loaders) without executing anything. Worst-case boot cost is bounded by
+    ``len(BUILTIN_NAMES)``: one directory listing per builtin package
+    (mtime-cached by the import system), independent of user data or profile
+    size.
+    """
+    finder = importlib.machinery.PathFinder
+    pkg_spec = finder.find_spec(name, list(_builtins_pkg.__path__))
+    if pkg_spec is None or not pkg_spec.submodule_search_locations:
+        return False
+    return finder.find_spec("mcp_server", list(pkg_spec.submodule_search_locations)) is not None
+
+
 def main() -> None:
     """Entry point — parse args and dispatch to the appropriate subcommand."""
     # On Windows, force stdout/stderr to UTF-8 BEFORE anything prints — KiroCrew's
@@ -1328,6 +1358,17 @@ Examples:
     snap_parser.add_argument(
         "--list", action="store_true", dest="list_snapshots", help="List existing snapshots"
     )
+    snap_parser.add_argument(
+        "--allow-unpinned-staging",
+        action="store_true",
+        dest="allow_unpinned",
+        help=(
+            "Stage by path name on a platform that cannot open a directory relative to "
+            "a descriptor (Windows). Without this the snapshot is refused there rather "
+            "than taken with a traversal an ancestor swap could redirect. The archive's "
+            "MANIFEST.json records that it was staged unpinned."
+        ),
+    )
 
     rest_parser = cli_help.add_command(sub, "restore")
     rest_parser.add_argument("snapshot", nargs="?", help="Path to snapshot .tar.gz")
@@ -1345,6 +1386,16 @@ Examples:
     )
     rest_parser.add_argument(
         "--force", action="store_true", help="Restore even if gateway is running"
+    )
+    rest_parser.add_argument(
+        "--allow-unpinned-staging",
+        action="store_true",
+        dest="allow_unpinned",
+        help=(
+            "Restore by path name on a platform that cannot open a directory relative "
+            "to a descriptor (Windows). Without this the restore is refused there "
+            "rather than run with a destination an ancestor swap could redirect."
+        ),
     )
 
     # security
@@ -1385,8 +1436,7 @@ Examples:
     # (issue #4843). Reading the file directly is correctly refused by the
     # credential-path gate, so the time selector has to live here.
     _time_help = (
-        "a relative age (30m, 2h, 7d) or an ISO 8601 instant "
-        "(2026-08-21, 2026-08-21T04:00:00Z)"
+        "a relative age (30m, 2h, 7d) or an ISO 8601 instant " "(2026-08-21, 2026-08-21T04:00:00Z)"
     )
     sel_parser.add_argument("--since", default="", help=f"Only entries at or after {_time_help}")
     sel_parser.add_argument("--until", default="", help=f"Only entries before {_time_help}")
@@ -1424,7 +1474,9 @@ Examples:
 
     policy_parser = cli_help.add_command(sub, "policy")
     policy_sub = policy_parser.add_subparsers(dest="policy_action")
-    policy_show = policy_sub.add_parser("show", help="Show the effective enterprise security policy")
+    policy_show = policy_sub.add_parser(
+        "show", help="Show the effective enterprise security policy"
+    )
     policy_show.add_argument(
         "--ids",
         action="store_true",
@@ -1534,9 +1586,7 @@ Examples:
         action="store_true",
         help="Classify and print what would be reclaimed without deleting anything",
     )
-    pod_prune.add_argument(
-        "--json", action="store_true", help="Emit per-name results as JSON"
-    )
+    pod_prune.add_argument("--json", action="store_true", help="Emit per-name results as JSON")
     pod_status = pod_sub.add_parser("status", help="Up/down + health for one pod")
     pod_status.add_argument("name", help="Worktree name")
     pod_status.add_argument("--json", action="store_true", help="Emit status as JSON")
@@ -1666,12 +1716,8 @@ Only needed on hosts with kernel.apparmor_restrict_unprivileged_userns=1
     sbx_status = sbx_sub.add_parser(
         "status", help="Report whether this launch is covered by the profile"
     )
-    sbx_status.add_argument(
-        "--path", default=None, help="Executable to check instead of $APPIMAGE"
-    )
-    sbx_sub.add_parser(
-        "remove-profile", help="Unload and remove the profile (sudo on Linux)"
-    )
+    sbx_status.add_argument("--path", default=None, help="Executable to check instead of $APPIMAGE")
+    sbx_sub.add_parser("remove-profile", help="Unload and remove the profile (sudo on Linux)")
 
     # cloud — provision + run KiroCrew on the user's own AWS EC2 (bring-your-own
     # AWS; credentials resolved by the aws CLI, never stored by KiroCrew).
@@ -1883,9 +1929,22 @@ Examples:
     # a session nothing: kiro-cli loads a server only when `tools` names it.
     sub.add_parser("mcp-dashboard")
 
-    # Builtin app MCP servers (spawned by the agent backend, not user-facing)
+    # Builtin app MCP servers (spawned by the agent backend, not user-facing).
+    # Only builtins that actually ship an ``mcp_server`` module get a verb —
+    # ``_BUILTIN_NAMES`` is load-bearing for HTTP route registration and lists
+    # every builtin, so registering unconditionally advertised commands that
+    # crashed with a raw ModuleNotFoundError traceback (#5901). A builtin that
+    # gains an ``mcp_server.py`` gains its verb automatically.
+    #
+    # The probe only runs when the invocation actually names an ``mcp-*``
+    # command: registration precision is unobservable otherwise (the verbs are
+    # hidden from help/choices by hide_internal_commands, and dispatch cannot
+    # reach them), so every other command — including the gateway boot path —
+    # pays nothing for it.
+    _probe_mcp_verbs = any(_a.startswith("mcp-") for _a in sys.argv[1:])
     for _bname in _BUILTIN_NAMES:
-        sub.add_parser(f"mcp-{_bname}")
+        if not _probe_mcp_verbs or _builtin_mcp_server_available(_bname):
+            sub.add_parser(f"mcp-{_bname}")
 
     # them in the ``kirocrew-computer`` MCP server instead.
     computer_parser = cli_help.add_command(
@@ -2406,8 +2465,15 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # optional subsystem must not be imported to start it.
         importlib.import_module("kiro_crew.mcp_dashboard").run_mcp_server()
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
-        _mod = importlib.import_module(f"kiro_crew.apps.builtins.{args.command[4:]}.mcp_server")
-        _mod.run_mcp_server()
+        # Registration gates this verb on _builtin_mcp_server_available, and
+        # _run_app_mcp_server is the ONE dispatch-time spelling of "import the
+        # builtin's mcp_server and run it or refuse cleanly" — the same helper
+        # the `kirocrew app mcp <name>` manifest path uses (clean stderr line +
+        # exit 1 on ImportError or a missing run_mcp_server entrypoint), so an
+        # unresolvable module cannot reach a raw traceback here (#5901).
+        from kiro_crew.cli_commands import _run_app_mcp_server
+
+        _run_app_mcp_server(args.command[4:])
     elif args.command == "computer":
         # Deferred import: ``computer_use.cli`` reaches the driver seam, and the
         # macOS driver loads native frameworks on first use. Keeping it out of
