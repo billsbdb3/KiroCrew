@@ -1189,7 +1189,7 @@ class TestUxScopeGateSurvivesAWideDiff:
     def test_a_ui_change_is_detected_regardless_of_diff_width(
         self, lane: str, tail_files: int, tmp_path: Path
     ) -> None:
-        bash = shutil.which("bash")
+        bash = _bash()
         if bash is None:
             pytest.skip("the scope gate runs only under Bash")
         # The UI file comes FIRST so `grep -q` can answer immediately -- the
@@ -1234,7 +1234,7 @@ class TestUxScopeGateSurvivesAWideDiff:
     def test_a_non_ui_diff_still_skips(self, lane: str, tmp_path: Path) -> None:
         """The fix must not turn the gate into an always-true: a backend-only
         diff still has to skip, or every PR pays for a UX review."""
-        bash = shutil.which("bash")
+        bash = _bash()
         if bash is None:
             pytest.skip("the scope gate runs only under Bash")
         touched = "src/kiro_crew/session.py\ndocs/ci/ci-and-reviews.md"
@@ -1324,7 +1324,7 @@ class TestAdvisoryVerdictRequiresCurrentHeadMarker:
         `grep -qF` matters -- the marker is bracketed, and those are regex
         metacharacters, so a non-fixed match would not mean what it reads as.
         """
-        bash = shutil.which("bash")
+        bash = _bash()
         if bash is None:
             pytest.skip("the guard runs only under Bash")
         script = (
