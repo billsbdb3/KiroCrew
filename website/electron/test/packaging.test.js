@@ -222,7 +222,7 @@ describe("first-download installer design contract", () => {
     assert.match(installer, /Function \.onGUIEnd[\s\S]*?Call KiroFadeOutPage[\s\S]*?FunctionEnd/);
     assert.match(
       installer,
-      /!macro customWelcomePage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage[\s\S]*?!insertmacro MUI_PAGE_WELCOME/
+      /!macro customWelcomePage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_PRE KiroWelcomePre[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_SHOW KiroFadeInPage[\s\S]*?MUI_PAGE_CUSTOMFUNCTION_LEAVE KiroFadeOutPage[\s\S]*?!insertmacro MUI_PAGE_WELCOME/
     );
     assert.match(
       installer,
@@ -249,6 +249,46 @@ describe("first-download installer design contract", () => {
     assert.match(runtimeScript, /native-install-mode\.png/);
   });
 
+  it("shows native progress for updates without adding setup decisions", () => {
+    assert.deepEqual(
+      [...installer.matchAll(/^LangString KiroUpdateProgress (\d+) /gm)].map((match) => Number(match[1])),
+      [
+        1033, 1031, 1036, 3082, 2052, 1028, 1041, 1042, 1040, 1043, 1030, 1053, 1044,
+        1035, 1049, 2070, 1046, 1045, 1058, 1029, 1051, 1038, 1025, 1055, 1054, 1066,
+      ],
+      "the update progress contract must cover every default electron-builder installer language"
+    );
+    assert.match(
+      installer,
+      /LangString KiroUpdateProgress 1033 "This can take several minutes\. \$\{PRODUCT_NAME\} will reopen automatically\."/
+    );
+    assert.match(
+      installer,
+      /Function KiroWelcomePre[\s\S]*?\$KiroVisibleUpdate == 1[\s\S]*?Abort[\s\S]*?FunctionEnd/
+    );
+    assert.match(
+      installer,
+      /!macro customInstallMode[\s\S]*?\$KiroVisibleUpdate == 1[\s\S]*?StrCpy \$isForceMachineInstall 1[\s\S]*?StrCpy \$isForceCurrentInstall 1/
+    );
+    assert.match(
+      installer,
+      /Function KiroFinishPagePre[\s\S]*?\$KiroVisibleUpdate == 1[\s\S]*?\$\{If\} \$\{isForceRun\}[\s\S]*?Call StartApp[\s\S]*?!insertmacro quitSuccess[\s\S]*?FunctionEnd/
+    );
+    assert.match(
+      installer,
+      /!macro customInit[\s\S]*?\$\{If\} \$\{isUpdated\}[\s\S]*?\$\{If\} \$\{Silent\}[\s\S]*?SetSilent normal/
+    );
+    assert.match(
+      installer,
+      /Function KiroInstFilesShow[\s\S]*?\$KiroVisibleUpdate == 1[\s\S]*?GetDlgItem \$0 \$HWNDPARENT 1038[\s\S]*?SendMessage \$0 \$\{KIRO_WM_SETTEXT\} 0 "STR:\$\(KiroUpdateProgress\)"[\s\S]*?EnableWindow \$0 0[\s\S]*?ShowWindow \$0 \$\{KIRO_SW_HIDE\}[\s\S]*?FunctionEnd/
+    );
+    assert.match(
+      installer,
+      /Function KiroAbortPre[\s\S]*?\$KiroVisibleUpdate == 1[\s\S]*?Abort[\s\S]*?FunctionEnd[\s\S]*?!define MUI_PAGE_FUNCTION_ABORTWARNING KiroAbortPre/
+    );
+    assert.doesNotMatch(installer, /NSD_(?:Create|Kill)Timer|Sleep\s+\d+/);
+  });
+
   it("keeps install-root ownership and legacy startup cleanup without custom pages", () => {
     assert.match(installer, /Function KiroEnsureAppInstallDir[\s\S]*?FunctionEnd/);
     assert.match(installer, /!macro customInit[\s\S]*?Call KiroEnsureAppInstallDir/);
@@ -265,10 +305,11 @@ describe("first-download installer design contract", () => {
       installer,
       /Function KiroValidateInstallDirAfterMode[\s\S]*?Call KiroEnsureAppInstallDir[\s\S]*?StrCpy \$INSTDIR \$KiroInstallDir[\s\S]*?FunctionEnd/
     );
-    assert.doesNotMatch(
+    const validateInstallDir = normalizedNsisBlock(
       installer,
-      /Function KiroValidateInstallDirAfterMode[\s\S]*?Abort[\s\S]*?FunctionEnd/
+      /Function KiroValidateInstallDirAfterMode[\s\S]*?FunctionEnd/
     );
+    assert.doesNotMatch(validateInstallDir, /Abort/);
     assert.match(installer, /GetFileAttributesW/);
     assert.match(installer, /KiroCheckFreshInstallDir/);
     assert.match(

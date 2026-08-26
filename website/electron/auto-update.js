@@ -693,7 +693,21 @@ function initAutoUpdate(deps) {
   }
   function emit(state, extra = {}) {
     if (!uiDriven) return;
-    const payload = { state, channel: currentChannel(), version: app.getVersion(), ...extra };
+    const payload = {
+      state,
+      channel: currentChannel(),
+      version: app.getVersion(),
+      // The renderer cannot infer the real updater handoff from getInfo().platform:
+      // packaged Linux variants and older bundles make that display field an
+      // unreliable capability signal. Carry the handoff contract with every
+      // lifecycle event so both ready surfaces can set the right expectation.
+      // Externally managed Windows installs run the marker's update command
+      // and relaunch directly; they never hand off to our NSIS installer.
+      installHandoff: osPlatform === "win32" && !managed
+        ? "windows-installer"
+        : "automatic-relaunch",
+      ...extra,
+    };
     // Remembered even when the push below throws: a renderer that missed the
     // push is exactly the one the getInfo() replay exists to catch up.
     lastEmittedState = payload;
@@ -1333,16 +1347,28 @@ function initAutoUpdate(deps) {
 
   // isForceRunAfter=true so the user lands back in the app after the swap.
   //
-  // isSilent is platform-dependent, and on Windows it decides whether this is an
-  // automatic update at all. NsisUpdater passes /S only when isSilent, and the
-  // installer is assisted (nsis.oneClick=false), so isSilent=false shows the
-  // full NSIS wizard: the app would quit and then sit waiting for the user to
-  // click through a setup dialog, which is not the silent swap macOS and Linux
-  // perform. macOS and Linux have no installer UI to suppress, and passing
-  // isSilent there would change which relaunch flag BaseUpdater honours, so the
-  // flag is set only for win32.
+  // Windows deliberately uses isSilent=false. The assisted NSIS installer has
+  // update-only hooks in build/installer.nsh that skip every decision page,
+  // leave the native extraction progress visible, then relaunch and close on
+  // completion. Passing /S hid that only useful feedback for several minutes,
+  // making a healthy update look exactly like a crash. The installer also
+  // converts /S back to this visible update mode for clients released before
+  // this change, so the first upgrade into the fix is covered too.
+  function notifyWindowsInstallHandoff() {
+    if (osPlatform !== "win32") return;
+    try {
+      new Notification({
+        title: "Installing Kiro Crew update",
+        // Timing and automatic relaunch stay on the installer window that they
+        // explain. The toast carries only the unique recovery instruction.
+        body: "If Kiro Crew doesn’t reopen after the installer finishes, open it from the Start menu.",
+      }).show();
+    } catch { /* notifications optional */ }
+  }
+
   function quitAndInstall() {
-    autoUpdater.quitAndInstall(osPlatform === "win32", true);
+    notifyWindowsInstallHandoff();
+    autoUpdater.quitAndInstall(false, true);
   }
 
   async function applyUpdateAndRestart() {
@@ -1409,7 +1435,7 @@ function initAutoUpdate(deps) {
       installing = false;
       try { if (onInstallFailed) onInstallFailed(); } catch { /* advisory */ }
       // Use the install-error renderer contract, NOT a bare found/not-available:
-      // the user just clicked Restart & Update and is watching an install
+      // the user just clicked Install Update & Restart App and is watching an install
       // surface -- a silent state swap reads as an unexplained cancel. The
       // error/install shape has an existing renderer contract (the About
       // card, and the in-place overlay failure state) that says the install
@@ -1501,16 +1527,19 @@ function initAutoUpdate(deps) {
   }
 
   async function promptInstall(versionName, notes) {
+    const handoffDetail = osPlatform === "win32"
+      ? "Installing can take several minutes. Kiro Crew will close, show Windows installation progress, and reopen automatically."
+      : "Installing can take several minutes. Kiro Crew will close and reopen automatically when the update is complete.";
     const { response } = await dialog.showMessageBox({
       type: "info",
-      buttons: ["Restart & Update", "Later"],
+      buttons: ["Install Update & Restart App", "Later"],
       defaultId: 0,
       cancelId: 1,
       title: "Kiro Crew update ready",
       message: `Kiro Crew ${versionName || ""} is ready to install.`.trim(),
       detail:
         (notes || "").slice(0, 500) +
-        "\n\nKiro Crew will stop the local gateway, install the update, and relaunch.",
+        `\n\n${handoffDetail}`,
     });
     if (response === 0) {
       await applyUpdateAndRestart();

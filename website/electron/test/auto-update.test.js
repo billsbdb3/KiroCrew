@@ -597,6 +597,7 @@ function stubSpawn(script) {
 
 test("managed check() with updateCommand+checkCommand emits found with the printed version", async (t) => {
   const { deps, states } = makeDeps({
+    osPlatform: "win32",
     externallyManaged: {
       managedBy: "internal-registry",
       updateCommand: "pkgtool update kirocrew",
@@ -614,6 +615,11 @@ test("managed check() with updateCommand+checkCommand emits found with the print
   const found = states.find((s) => s.state === "found");
   assert.ok(found, "an available update must surface a 'found' state");
   assert.strictEqual(found.version, "0.5.0.5", "trimmed stdout is the version");
+  assert.strictEqual(
+    found.installHandoff,
+    "automatic-relaunch",
+    "managed Windows updates run the marker command and must not promise an NSIS window",
+  );
 });
 
 test("managed check(): non-zero exit -> not-available (ran, nothing new)", async (t) => {

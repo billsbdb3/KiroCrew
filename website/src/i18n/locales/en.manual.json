@@ -2193,9 +2193,11 @@
       "up": "up {{time}}"
     },
     "updateModal": {
-      "restart_update": "Restart & Update",
+      "restart_update": "Install Update & Restart App",
+      "install_restart_timing": "Installing may take several minutes. The app will close and relaunch automatically when the update is complete.",
+      "windows_installer_handoff": "A Windows installation window will show progress.",
       "installing_update": "Installing update…",
-      "installing_update_body": "{{productName}} is stopping the local gateway and installing the update. This can take a minute — don’t quit the app; it will relaunch itself.",
+      "installing_update_body": "{{productName}} is stopping the local gateway and installing the update. This can take several minutes. It will relaunch automatically.",
       "install_failed": "Update failed to install",
       "install_failed_body": "The update could not be applied. {{productName}} is restoring the local gateway — you can keep using this version and retry from Settings > About.",
       "back_to_dashboard": "Back to dashboard",
@@ -4142,7 +4144,8 @@
         "download_failed": "Download failed",
         "download_the_latest_version": "download the latest version",
         "install_failed": "Couldn’t install the update",
-        "installing_quiet_note": "Installing — Kiro Crew will go quiet for a minute or two, then restart itself.",
+        "install_update_restart_app": "Install Update & Restart App",
+        "installing_quiet_note": "Installing — this can take several minutes. {{productName}} will reopen automatically when the update is complete.",
         "manual_install_fallback": "If updating doesn't work, you can {{link}} and reinstall over this copy. Your settings, chats, and files are kept.",
         "published": "published {{when}}",
         "restarting": "Restarting...",

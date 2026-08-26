@@ -55,6 +55,17 @@ Current status:
   missing even though its `.exe` is untouched. Either mode leaves
   the Kiro Crew home alone (`deleteAppDataOnUninstall` stays false, and
   `~/.kiro/crew` is outside the install directory).
+- **Auto-updates stay visible without becoming interactive** — after the app
+  stops its local gateway and closes, the update path skips Welcome, install
+  scope, and Finish, but leaves the native NSIS extraction page on screen with
+  real progress. At 100% it reopens Kiro Crew and closes automatically. A
+  persistent message on that progress page warns that the handoff can take
+  several minutes; a Windows notification tells the user to reopen Kiro Crew
+  from the Start menu if the relaunch does not happen. New clients call
+  `quitAndInstall(false, true)` so NSIS is visible;
+  the installer also converts a legacy `/S --updated` launch back to this same
+  visible path, which covers the first upgrade from clients that predate the
+  change.
 - **Guided Kiro Crew artwork** — the welcome and finish pages use the existing
   Kiro Crew logo and ghost family in the native NSIS sidebar, and intermediate
   pages retain a compact branded header. Buttons, progress, install-mode copy,
@@ -62,8 +73,8 @@ Current status:
   Native page boundaries use a short Win32 alpha-blended cross-fade and honor
   Windows' client-area animation setting. The fade contains no timer-driven
   bitmap swap or UI-thread sleep, so extraction keeps the native progress path;
-  CI performs a real silent install, records its duration, and fails if it
-  exceeds 5 minutes.
+  CI performs a real silent *first install*, records its duration, and fails if
+  it exceeds 5 minutes. The auto-update path is intentionally visible.
 - **Uninstall removes the app and its caches, and keeps your data.** Removed:
   the install directory, the Start Menu shortcut, the uninstall registry key,
   and any “start with Windows” Run entry left by an earlier custom installer,

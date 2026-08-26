@@ -4728,7 +4728,6 @@
       "is_downloaded_and_ready_to_install": "is downloaded and ready to install.",
       "kirocrew": "{{productName}}",
       "later": "Later",
-      "the_app_will_stop_the_local_gateway_install_the": "The app will stop the local gateway, install the update, and relaunch.",
       "update_ready": "Update ready"
     },
     "updatePill": {
@@ -7132,7 +7131,6 @@
         "loading_changelog": "Loading changelog…",
         "open_source_under_the_apache_2_0_license": "Open source under the Apache 2.0 license",
         "platform": "Platform",
-        "restart_update": "Restart & Update",
         "up_to_date": "Up to date",
         "update": "Update",
         "update_available": "Update available",

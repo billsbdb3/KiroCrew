@@ -49,7 +49,10 @@ The electron-builder configuration lives in
   alpha-blended window animation, honoring the client-area animation preference.
   It performs no timer-driven bitmap work or `Sleep` on the NSIS UI thread;
   Windows CI installs the real artifact, records its duration, and enforces a
-  5-minute ceiling.
+  5-minute ceiling. Auto-updates skip the assisted wizard's decision pages but
+  keep its native extraction progress visible, then relaunch Kiro Crew and close
+  automatically. A legacy silent `/S --updated` invocation is converted to the
+  same visible update path so the transition works from already-fielded clients.
 - linux targets: `AppImage`, `deb`, `rpm` (category `Development`). One backend
   tree is packaged three times, with `scripts/stamp-distribution.sh` re-run
   between electron-builder invocations so each artifact's beacon `dist` names
