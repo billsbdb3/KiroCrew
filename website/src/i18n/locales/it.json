@@ -5133,6 +5133,8 @@
       "continue_interrupted_turn": "Riprendi il turno interrotto",
       "continue_thread": "Chiedi all'agente di continuare",
       "could_not_submit_that_decision_see_the_console_f": "Impossibile inviare quella decisione — vedi la console per i dettagli.",
+      "deny_all": "Nega tutto",
+      "deny_once": "Nega una volta",
       "detached_head_at": "HEAD scollegato su {{branch}}",
       "drag_to_resize_double_click_to_reset": "Trascina per ridimensionare (doppio clic per reimpostare)",
       "file": "File",

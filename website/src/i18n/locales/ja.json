@@ -4967,6 +4967,8 @@
       "continue_interrupted_turn": "中断されたターンを継続",
       "continue_thread": "エージェントに続行を依頼",
       "could_not_submit_that_decision_see_the_console_f": "その決定を送信できません — 詳細はコンソールを参照してください。",
+      "deny_all": "すべて拒否",
+      "deny_once": "1回のみ拒否",
       "detached_head_at": "{{branch}} で HEAD が切り離されています",
       "drag_to_resize_double_click_to_reset": "ドラッグしてリサイズ (ダブルクリックでリセット)",
       "file": "ファイル",

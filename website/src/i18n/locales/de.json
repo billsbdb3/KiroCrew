@@ -5050,6 +5050,8 @@
       "continue_interrupted_turn": "Unterbrochenen Zug fortsetzen",
       "continue_thread": "Den Agenten fortsetzen lassen",
       "could_not_submit_that_decision_see_the_console_f": "Entscheidung konnte nicht übermittelt werden — Details in der Konsole.",
+      "deny_all": "Alle ablehnen",
+      "deny_once": "Einmal ablehnen",
       "detached_head_at": "Detached HEAD bei {{branch}}",
       "drag_to_resize_double_click_to_reset": "Ziehen zum Ändern der Größe (Doppelklick zum Zurücksetzen)",
       "file": "Datei",

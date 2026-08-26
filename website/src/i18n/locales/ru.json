@@ -5216,6 +5216,8 @@
       "continue_interrupted_turn": "Продолжить прерванный ход",
       "continue_thread": "Попросить агента продолжить",
       "could_not_submit_that_decision_see_the_console_f": "Не удалось отправить это решение — подробности в консоли.",
+      "deny_all": "Отклонить все",
+      "deny_once": "Отклонить один раз",
       "detached_head_at": "Отсоединённый HEAD на {{branch}}",
       "drag_to_resize_double_click_to_reset": "Потяните, чтобы изменить размер (двойной щелчок — сброс)",
       "file": "Файл",

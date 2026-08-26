@@ -5133,6 +5133,8 @@
       "continue_interrupted_turn": "Continuar o turno interrompido",
       "continue_thread": "Pedir ao agente para continuar",
       "could_not_submit_that_decision_see_the_console_f": "Não foi possível enviar essa decisão — veja os detalhes no console.",
+      "deny_all": "Negar tudo",
+      "deny_once": "Negar uma vez",
       "detached_head_at": "HEAD desanexado em {{branch}}",
       "drag_to_resize_double_click_to_reset": "Arraste para redimensionar (clique duplo para redefinir)",
       "file": "Arquivo",

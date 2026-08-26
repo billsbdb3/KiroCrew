@@ -5050,6 +5050,8 @@
       "continue_interrupted_turn": "বিঘ্নিত টার্ন চালিয়ে যান",
       "continue_thread": "এজেন্টকে চালিয়ে যেতে বলুন",
       "could_not_submit_that_decision_see_the_console_f": "সেই সিদ্ধান্ত জমা দেওয়া যায়নি — বিস্তারিত জানতে কনসোল দেখো।",
+      "deny_all": "সব প্রত্যাখ্যান",
+      "deny_once": "একবার প্রত্যাখ্যান",
       "detached_head_at": "{{branch}}-এ detached HEAD",
       "drag_to_resize_double_click_to_reset": "আকার বদলাতে টানুন (রিসেট করতে ডাবল-ক্লিক করুন)",
       "file": "ফাইল",

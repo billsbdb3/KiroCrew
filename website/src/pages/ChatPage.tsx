@@ -4491,8 +4491,8 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // Any UI feeding this path must offer only those decisions — a Trust
   // affordance here would claim a standing grant the backend never records
   // (#5400 on the spawn-approval card, #5434 on the collapsed tool row).
-  const toApiDecision = (action: string): 'approve' | 'reject' =>
-    action === 'approved' ? 'approve' : 'reject'
+  const toApiDecision = (action: string): 'approve' | 'reject' | 'reject_once' =>
+    action === 'approved' ? 'approve' : action === 'rejected_once' ? 'reject_once' : 'reject'
   const dismissApproval = useCallback((aid: string, decision?: string) => {
     dispatch(resolveByApprovalId({ id: aid, decision }))
     const n = store.getState().notifications.items.find(x => x.approval_id === aid)

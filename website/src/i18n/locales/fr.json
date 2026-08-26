@@ -5133,6 +5133,8 @@
       "continue_interrupted_turn": "Reprendre le tour interrompu",
       "continue_thread": "Demander à l'agent de continuer",
       "could_not_submit_that_decision_see_the_console_f": "Impossible d’envoyer cette décision — détails dans la console.",
+      "deny_all": "Tout refuser",
+      "deny_once": "Refuser une fois",
       "detached_head_at": "HEAD détachée sur {{branch}}",
       "drag_to_resize_double_click_to_reset": "Faire glisser pour redimensionner (double-cliquer pour réinitialiser)",
       "file": "Fichier",

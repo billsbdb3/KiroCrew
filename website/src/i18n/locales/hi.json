@@ -5050,6 +5050,8 @@
       "continue_interrupted_turn": "बाधित टर्न जारी रखें",
       "continue_thread": "एजेंट से जारी रखने को कहें",
       "could_not_submit_that_decision_see_the_console_f": "वह निर्णय सबमिट नहीं हो सका — विवरण के लिए कंसोल देखें।",
+      "deny_all": "सभी अस्वीकार करें",
+      "deny_once": "एक बार अस्वीकार करें",
       "detached_head_at": "{{branch}} पर detached HEAD",
       "drag_to_resize_double_click_to_reset": "आकार बदलने के लिए खींचें (रीसेट करने के लिए डबल-क्लिक करें)",
       "file": "फ़ाइल",

@@ -4967,6 +4967,8 @@
       "continue_interrupted_turn": "继续被中断的回答",
       "continue_thread": "让智能体继续",
       "could_not_submit_that_decision_see_the_console_f": "无法提交此决定 — 详见控制台。",
+      "deny_all": "拒绝全部",
+      "deny_once": "拒绝一次",
       "detached_head_at": "游离 HEAD，位于 {{branch}}",
       "drag_to_resize_double_click_to_reset": "拖动调整大小（双击重置）",
       "file": "文件",

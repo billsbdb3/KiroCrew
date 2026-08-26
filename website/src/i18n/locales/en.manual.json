@@ -1396,6 +1396,8 @@
       "agent": "Agent: {{name}}",
       "approve_sub_agent": "Approve sub-agent: {{name}}",
       "branch": "Branch: {{branch}}",
+      "deny_all": "Deny all",
+      "deny_once": "Deny once",
       "detached_head_at": "Detached HEAD at {{branch}}",
       "message_placeholder": "Message {{bot}}… (/command · @file · $skill)",
       "approve": "Approve",

@@ -4967,6 +4967,8 @@
       "continue_interrupted_turn": "중단된 턴 계속하기",
       "continue_thread": "에이전트에게 계속 진행 요청",
       "could_not_submit_that_decision_see_the_console_f": "해당 결정을 제출하지 못했습니다 — 자세한 내용은 콘솔을 확인하세요.",
+      "deny_all": "모두 거부",
+      "deny_once": "한 번만 거부",
       "detached_head_at": "{{branch}}에서 HEAD가 분리되었습니다",
       "drag_to_resize_double_click_to_reset": "드래그하여 크기 조절 (더블클릭하면 초기화)",
       "file": "파일",
