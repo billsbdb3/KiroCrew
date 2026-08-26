@@ -78,7 +78,7 @@ _NOTE_MAX = 256
 
 # Same shapes handlers.py enforces for the legacy single-profile config — these
 # values flow into subprocess argv (--profile/--region) on every aws call.
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.+-]+\Z")
 PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_PROFILE_RE)
 # Multi-segment to admit GovCloud (us-gov-west-1) alongside standard regions;
 # max_len=32 keeps the backtracking surface negligible.

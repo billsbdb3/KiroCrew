@@ -225,7 +225,7 @@ _LOCAL_DIR_SPEC = FieldSpec(name="local_dir", type=str, max_len=4096, pattern=_L
 # argv (--profile/--region) on every aws call, so they get schema validation too.
 # Both allow empty (clears profile / falls back to default region); the pattern is
 # only enforced on non-empty values by validate_field.
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.+-]+\Z")
 _PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_PROFILE_RE)
 _REGION_SPEC = profiles_mod.REGION_SPEC
 

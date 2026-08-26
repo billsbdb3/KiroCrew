@@ -1454,7 +1454,7 @@ def _validate_artifact_save(cleaned: dict) -> None:
 
 # Shared slug pattern (matches _ARTIFACT_SLUG_RE + deploy slug validation).
 _WM_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-_WM_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_WM_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.+-]+\Z")
 _WM_URL_RE = re.compile(r"^https?://.{1,2048}$")
 _WM_LIFECYCLE_STATUSES = {"draft", "deploying", "live", "error", "expired"}
 _WM_LIST_CAP = 50
