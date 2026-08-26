@@ -714,6 +714,7 @@ make this tool possible:
 <a href="https://github.com/brantai" title="Brent Naylor"><img src="https://github.com/brantai.png?size=64" width="64" height="64" alt="Brent Naylor" /></a>
 <a href="https://github.com/brianwthomas" title="Brian Thomas"><img src="https://github.com/brianwthomas.png?size=64" width="64" height="64" alt="Brian Thomas" /></a>
 <a href="https://github.com/buluoray" title="Ray Xu"><img src="https://github.com/buluoray.png?size=64" width="64" height="64" alt="Ray Xu" /></a>
+<a href="https://github.com/c020627" title="XiaoChen"><img src="https://github.com/c020627.png?size=64" width="64" height="64" alt="XiaoChen" /></a>
 <a href="https://github.com/cabbey" title="Chris Abbey"><img src="https://github.com/cabbey.png?size=64" width="64" height="64" alt="Chris Abbey" /></a>
 <a href="https://github.com/caribbeansteve" title="George Coll"><img src="https://github.com/caribbeansteve.png?size=64" width="64" height="64" alt="George Coll" /></a>
 <a href="https://github.com/carttrp" title="carttrp"><img src="https://github.com/carttrp.png?size=64" width="64" height="64" alt="carttrp" /></a>
@@ -972,6 +973,7 @@ make this tool possible:
 <a href="https://github.com/rlunar" title="Roberto Luna-Rojas"><img src="https://github.com/rlunar.png?size=64" width="64" height="64" alt="Roberto Luna-Rojas" /></a>
 <a href="https://github.com/rnoack1" title="Robert Noack"><img src="https://github.com/rnoack1.png?size=64" width="64" height="64" alt="Robert Noack" /></a>
 <a href="https://github.com/robchahin" title="robchahin"><img src="https://github.com/robchahin.png?size=64" width="64" height="64" alt="robchahin" /></a>
+<a href="https://github.com/robomnis" title="Rob Weaver"><img src="https://github.com/robomnis.png?size=64" width="64" height="64" alt="Rob Weaver" /></a>
 <a href="https://github.com/rochakgupta" title="Rochak Gupta"><img src="https://github.com/rochakgupta.png?size=64" width="64" height="64" alt="Rochak Gupta" /></a>
 <a href="https://github.com/Rocketpoodle" title="Austin Goddard"><img src="https://github.com/Rocketpoodle.png?size=64" width="64" height="64" alt="Austin Goddard" /></a>
 <a href="https://github.com/RohanK6" title="RohanK6"><img src="https://github.com/RohanK6.png?size=64" width="64" height="64" alt="RohanK6" /></a>
@@ -1055,6 +1057,7 @@ make this tool possible:
 <a href="https://github.com/wannaFlyKa" title="Yao"><img src="https://github.com/wannaFlyKa.png?size=64" width="64" height="64" alt="Yao" /></a>
 <a href="https://github.com/wbowditch" title="Will Bowditch"><img src="https://github.com/wbowditch.png?size=64" width="64" height="64" alt="Will Bowditch" /></a>
 <a href="https://github.com/weinansi" title="weinansi"><img src="https://github.com/weinansi.png?size=64" width="64" height="64" alt="weinansi" /></a>
+<a href="https://github.com/welikoiwanenko" title="Vadym Velykoivanenko"><img src="https://github.com/welikoiwanenko.png?size=64" width="64" height="64" alt="Vadym Velykoivanenko" /></a>
 <a href="https://github.com/wenliwyan" title="wenliwyan"><img src="https://github.com/wenliwyan.png?size=64" width="64" height="64" alt="wenliwyan" /></a>
 <a href="https://github.com/werainkhatri" title="Viren Khatri"><img src="https://github.com/werainkhatri.png?size=64" width="64" height="64" alt="Viren Khatri" /></a>
 <a href="https://github.com/wmaillard" title="Will Maillard"><img src="https://github.com/wmaillard.png?size=64" width="64" height="64" alt="Will Maillard" /></a>
