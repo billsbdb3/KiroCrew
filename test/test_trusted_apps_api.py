@@ -301,6 +301,7 @@ async def test_revoke_removes_grant_and_is_idempotent(home: Path, tmp_path: Path
         assert (await never.json())["disabled"] is False
 
     assert _stored(home)["apps_trusted"] == []
+    assert _stored(home)["apps_trusted_repositories"] == {}
 
 
 @pytest.mark.asyncio
@@ -1581,6 +1582,9 @@ async def test_grant_accepts_a_registry_name_that_is_not_installed(
 
     # Persisted AND effective, so the install that follows is admitted.
     assert _stored(home)["apps_trusted"] == [_REG_ONLY]
+    assert _stored(home)["apps_trusted_repositories"] == {
+        _REG_ONLY: "acme/registry-only-app"
+    }
     from kiro_crew.apps.execution import app_execution_denied
 
     assert app_execution_denied(_REG_ONLY, action="install") is None
@@ -1935,7 +1939,17 @@ def test_uninstall_drops_the_base_grant_even_when_an_overlay_replaces_the_list(
     from kiro_crew.apps import manager as appmanager
 
     (home / "config.json").write_text(
-        json.dumps({"agent": {"apps_trusted": [_APP], "model": "sonnet"}}),
+        json.dumps(
+            {
+                "agent": {
+                    "apps_trusted": [_APP],
+                    "apps_trusted_repositories": {
+                        _APP: "https://example.test/owner/trust-app"
+                    },
+                    "model": "sonnet",
+                }
+            }
+        ),
         encoding="utf-8",
     )
     (home / "config.local.json").write_text(
@@ -1951,6 +1965,7 @@ def test_uninstall_drops_the_base_grant_even_when_an_overlay_replaces_the_list(
 
     base = json.loads((home / "config.json").read_text(encoding="utf-8"))
     assert base["agent"]["apps_trusted"] == []
+    assert base["agent"]["apps_trusted_repositories"] == {}
     # Everything else in the base file survives the targeted edit.
     assert base["agent"]["model"] == "sonnet"
     # And the overlay is never written by us.
@@ -2013,7 +2028,17 @@ def test_a_failed_delete_puts_the_trust_grant_back(home: Path, tmp_path: Path):
     from kiro_crew.apps import manager as appmanager
 
     (home / "config.json").write_text(
-        json.dumps({"agent": {"apps_trusted": [_APP], "model": "sonnet"}}),
+        json.dumps(
+            {
+                "agent": {
+                    "apps_trusted": [_APP],
+                    "apps_trusted_repositories": {
+                        _APP: "https://example.test/owner/trust-app"
+                    },
+                    "model": "sonnet",
+                }
+            }
+        ),
         encoding="utf-8",
     )
     _install(tmp_path, _APP, enabled=False)
@@ -2029,6 +2054,9 @@ def test_a_failed_delete_puts_the_trust_grant_back(home: Path, tmp_path: Path):
     assert base["agent"]["apps_trusted"] == [_APP], (
         "a failed uninstall left the still-installed app stripped of its grant"
     )
+    assert base["agent"]["apps_trusted_repositories"] == {
+        _APP: "https://example.test/owner/trust-app"
+    }, "a failed uninstall restored the name but lost its repository binding"
     assert base["agent"]["model"] == "sonnet"
 
 

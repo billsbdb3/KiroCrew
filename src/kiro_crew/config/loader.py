@@ -1621,6 +1621,17 @@ class AgentConfig:
             "accepted (use apps_allow_third_party to trust all).",
         ),
     )
+    apps_trusted_repositories: dict[str, str] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Trusted App Repositories",
+            "Repository coordinates captured by the per-app trust endpoint. "
+            "Each key is an app name from apps_trusted and each value is the "
+            "normalized repository shown at consent. Registry installation "
+            "refuses if that name later resolves to a different repository. "
+            "Legacy grants without an entry remain name-only.",
+        ),
+    )
     jail: str = field(
         default=JAIL_MODE_AUTO,
         metadata=_meta(
@@ -7164,6 +7175,23 @@ class KiroCrewConfig:
                     [a for a in _trusted if isinstance(a, str) and a]
                     if isinstance(_trusted := agent_data.get("apps_trusted"), list)
                     else []
+                ),
+                apps_trusted_repositories=(
+                    {
+                        name: repository
+                        for name, repository in _trusted_repositories.items()
+                        if isinstance(name, str)
+                        and isinstance(repository, str)
+                        and name
+                        and repository
+                    }
+                    if isinstance(
+                        _trusted_repositories := agent_data.get(
+                            "apps_trusted_repositories"
+                        ),
+                        dict,
+                    )
+                    else {}
                 ),
                 jail=_normalize_jail(agent_data.get("jail", "auto")),
                 dangerously_skip_permissions=_read_skip_permissions(agent_data),

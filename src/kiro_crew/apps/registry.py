@@ -44,7 +44,7 @@ from typing import Any
 
 from kiro_crew.apps import install_receipt, official_catalog
 from kiro_crew.apps.admission import app_admission_denied, verified_signer
-from kiro_crew.apps.execution import app_execution_denied
+from kiro_crew.apps.execution import app_execution_denied, trusted_app_repository
 from kiro_crew.apps.manager import (
     get_app,
     install_app,
@@ -1619,8 +1619,8 @@ async def _move_checkout_aside(dest: Path, log_lines: list[str]) -> Path | None:
     return aside
 
 
-def _same_git_target(a: str, b: str) -> bool:
-    """Whether two clone URLs name the same repository.
+def _normalize_git_target(url: str) -> str:
+    """Canonical form used whenever a security decision compares clone URLs.
 
     Cosmetic variance between the separately-authored seed and catalog is a trailing
     ``/``, a trailing ``.git``, and the case of the scheme and host -- those three
@@ -1633,19 +1633,22 @@ def _same_git_target(a: str, b: str) -> bool:
     that requiring URL equality exists to prevent.
     """
 
-    def norm(url: str) -> str:
-        u = (url or "").strip().rstrip("/")
-        if u.endswith(".git"):
-            u = u[: -len(".git")]
-        scheme, sep, rest = u.partition("://")
-        if not sep:
-            # No scheme to split on (scp-style or a bare path): fold nothing, since
-            # the host cannot be told from the path without guessing.
-            return u
-        host, slash, path = rest.partition("/")
-        return f"{scheme.lower()}://{host.lower()}{slash}{path}"
+    normalized = (url or "").strip().rstrip("/")
+    if normalized.endswith(".git"):
+        normalized = normalized[: -len(".git")]
+    scheme, sep, rest = normalized.partition("://")
+    if not sep:
+        # No scheme to split on (scp-style or a bare path): fold nothing, since
+        # the host cannot be told from the path without guessing.
+        return normalized
+    host, slash, path = rest.partition("/")
+    return f"{scheme.lower()}://{host.lower()}{slash}{path}"
 
-    return bool(a) and norm(a) == norm(b)
+
+def _same_git_target(a: str, b: str) -> bool:
+    """Whether two clone URLs name the same repository."""
+
+    return bool(a) and _normalize_git_target(a) == _normalize_git_target(b)
 
 
 def _catalog_row_supersedes_seed(seed: dict[str, Any], catalog_row: dict[str, Any]) -> bool:
@@ -5303,6 +5306,36 @@ async def install_from_registry(
     git_url = _entry_git_url(entry)
     if not git_url:
         return {"ok": False, "error": f"app {name!r} has no git URL configured"}
+
+    # A per-app execution grant is consent to the repository the operator saw,
+    # not to whichever repository later claims the same app name. New grants
+    # record that coordinate; legacy grants have no record and intentionally
+    # keep their historical name-only behaviour. This gate runs before manifest
+    # fetch, credential selection, clone, build, or setup code.
+    granted_repository = trusted_app_repository(name)
+    if granted_repository and not _same_git_target(granted_repository, git_url):
+        reason = (
+            f"execution trust for app {name!r} was granted for repository "
+            f"{granted_repository!r}, but the registry now resolves it to "
+            f"{git_url!r}; revoke the existing grant and grant it again after "
+            "reviewing the new repository"
+        )
+        try:
+            sel().log_api_access(
+                caller="app_install_from_registry",
+                operation="trust_repository_mismatch",
+                outcome="rejected",
+                resources=f"name={name!r}",
+                error=reason,
+            )
+        except Exception as exc:  # an audit failure must never mask the refusal
+            logger.debug("SEL audit failed for %s trust repository mismatch: %s", name, exc)
+        return {
+            "ok": False,
+            "name": name,
+            "error": reason,
+            "code": "app_trust_repository_mismatch",
+        }
 
     repo = entry.get("repo", "")
     branch = entry.get("branch", "main")

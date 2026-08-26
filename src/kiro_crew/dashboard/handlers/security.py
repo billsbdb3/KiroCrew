@@ -50,7 +50,11 @@ from aiohttp import web
 from kiro_crew.apps.execution import APP_NAME_RE, builtin_app_names, trusted_app_names
 from kiro_crew.apps.manager import disable_app, get_app, list_apps
 from kiro_crew.apps.official_catalog import CatalogUnavailable
-from kiro_crew.apps.registry import get_registry_app
+from kiro_crew.apps.registry import (
+    _entry_git_url,
+    _normalize_git_target,
+    get_registry_app,
+)
 from kiro_crew.apps.routes import app_lifecycle_lock
 from kiro_crew.apps.teardown import teardown_app_runtime
 from kiro_crew.config.loader import (
@@ -799,6 +803,21 @@ def _trusted_list_raw(agent_raw: dict) -> list[str]:
     return [a for a in raw if isinstance(a, str) and a]
 
 
+def _trusted_repositories_raw(agent_raw: dict) -> dict[str, str]:
+    """Repository bindings from the raw base ``agent`` dict, junk dropped."""
+    raw = agent_raw.get("apps_trusted_repositories", {})
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        name: repository
+        for name, repository in raw.items()
+        if isinstance(name, str)
+        and isinstance(repository, str)
+        and name
+        and repository
+    }
+
+
 def build_trusted_apps_snapshot() -> dict:
     """Compute the snapshot returned by every trusted-apps endpoint.
 
@@ -867,7 +886,11 @@ class TrustSettingOverlayOwned(Exception):
         )
 
 
-_TRUST_SETTING_NAMES = ("apps_trusted", "apps_allow_third_party")
+_TRUST_SETTING_NAMES = (
+    "apps_trusted",
+    "apps_trusted_repositories",
+    "apps_allow_third_party",
+)
 
 
 def _overlay_owned_trust_settings() -> list[str]:
@@ -1036,16 +1059,26 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
     async with app_lifecycle_lock(name):
         # Offloaded: both read from disk (installed.json + app.json; the registry
         # file and its cached external-index snapshots).
-        def _is_known_app() -> bool:
-            if get_app(name) is not None:
-                return True
+        def _known_app_repository() -> tuple[bool, str]:
+            installed = get_app(name)
+            if installed is not None:
+                # Registry installs persist the exact source URL they came from.
+                # Local/external installs may have no repository coordinate; those
+                # remain grantable but receive no install-time binding.
+                source_url = installed.get("sourceUrl", "")
+                return True, _normalize_git_target(
+                    source_url if isinstance(source_url, str) else ""
+                )
             try:
-                return get_registry_app(name) is not None
+                entry = get_registry_app(name)
             except CatalogUnavailable:
                 # Resolution was refused because the catalog could not be consulted.
                 # Treat as not-known: this gates an execution grant, so declining
                 # while the source cannot be confirmed is the safe direction.
-                return False
+                return False, ""
+            if entry is None:
+                return False, ""
+            return True, _normalize_git_target(_entry_git_url(entry))
 
         # Whether the app is INSTALLED right now, kept separate from "known". A
         # registry-only name is grantable on purpose (the install-consent flow grants
@@ -1054,7 +1087,8 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
         # after the write is the race below.
         was_installed = await _run_off_loop(lambda: get_app(name) is not None)
 
-        if not await _run_off_loop(_is_known_app):
+        known, repository = await _run_off_loop(_known_app_repository)
+        if not known:
             _audit(request, operation=op, outcome="denied", resources=f"{name}=unknown")
             return web.json_response(
                 {
@@ -1089,6 +1123,14 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
             if name not in current:
                 current.append(name)
             agent_raw["apps_trusted"] = current
+            repositories = _trusted_repositories_raw(agent_raw)
+            if repository:
+                repositories[name] = repository
+            else:
+                # Re-granting a local app under a formerly registry-owned name
+                # must not retain a stale binding from that prior occupant.
+                repositories.pop(name, None)
+            agent_raw["apps_trusted_repositories"] = repositories
 
         try:
             await _mutate_agent_config(_mutate)
@@ -1136,6 +1178,9 @@ async def api_trusted_app_grant(request: web.Request) -> web.Response:
             agent_raw["apps_trusted"] = [
                 a for a in _trusted_list_raw(agent_raw) if a != name
             ]
+            repositories = _trusted_repositories_raw(agent_raw)
+            repositories.pop(name, None)
+            agent_raw["apps_trusted_repositories"] = repositories
 
         try:
             await _mutate_agent_config(_undo)
@@ -1300,6 +1345,9 @@ async def api_trusted_app_revoke(request: web.Request) -> web.Response:
             agent_raw["apps_trusted"] = [
                 a for a in _trusted_list_raw(agent_raw) if a != name
             ]
+            repositories = _trusted_repositories_raw(agent_raw)
+            repositories.pop(name, None)
+            agent_raw["apps_trusted_repositories"] = repositories
 
         try:
             await _mutate_agent_config(_mutate)

@@ -724,6 +724,47 @@ class TestTrustedGrantBounds:
         assert app_execution_denied(real, action="module_load") is None
         assert app_execution_denied(padding[-1], action="module_load") is not None
 
+    def test_repository_binding_is_inert_without_the_name_grant(self, monkeypatch) -> None:
+        from kiro_crew.apps import execution
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        monkeypatch.setattr(
+            KiroCrewConfig,
+            "load",
+            classmethod(
+                lambda cls: SimpleNamespace(
+                    agent=SimpleNamespace(
+                        apps_trusted=[],
+                        apps_trusted_repositories={
+                            "stale-app": "https://example.test/owner/stale"
+                        },
+                    )
+                )
+            ),
+        )
+
+        assert execution.trusted_app_repository("stale-app") == ""
+
+    def test_active_grant_exposes_its_repository_binding(self, monkeypatch) -> None:
+        from kiro_crew.apps import execution
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        repository = "https://example.test/Owner/Repo"
+        monkeypatch.setattr(
+            KiroCrewConfig,
+            "load",
+            classmethod(
+                lambda cls: SimpleNamespace(
+                    agent=SimpleNamespace(
+                        apps_trusted=["bound-app"],
+                        apps_trusted_repositories={"bound-app": repository},
+                    )
+                )
+            ),
+        )
+
+        assert execution.trusted_app_repository("bound-app") == repository
+
 
 class TestRegistryAndProvenanceBoundary:
     @pytest.mark.asyncio

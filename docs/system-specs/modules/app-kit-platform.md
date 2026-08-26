@@ -811,6 +811,20 @@ independently load-bearing:
   collision keeps the seed, so a republished document cannot silently re-home
   an app to a new repository under a familiar name.
 
+**Execution consent is repository-bound for new grants.** The trust dialog
+shows the registry row's repository, so `POST /api/security/trusted-apps/{name}`
+records that resolved clone target in `agent.apps_trusted_repositories` beside
+the name in `agent.apps_trusted`. The stored value uses the same normalization
+as catalog supersession (scheme/host case-folded, trailing slash and `.git`
+removed, path case preserved). `install_from_registry` compares its freshly
+resolved row against that value before manifest fetch, credential selection,
+clone, build, or setup code; a mismatch returns
+`app_trust_repository_mismatch`, names both repositories, and requires revoke +
+fresh consent. A grant written before the binding map existed has no recorded
+repository and keeps working, so the change requires no migration. The commit
+is deliberately not bound: a new pin in the same repository is the ordinary
+catalog update path and does not warrant a new consent prompt.
+
 A name is a filesystem path on install, so `inventory()` and
 `list_catalog_rows` drop any entry whose name fails the manifest name contract
 (`app_name_error` / `KEBAB_RE`), and the catalog fetch runs off the event loop
@@ -820,6 +834,7 @@ Writers: `apps/official_catalog.py` (`list_catalog_rows`, `inventory`,
 `fetch_inventory_entries`, `inventory_for_install`), `apps/registry.py`
 (`list_catalog_apps`, `_resolve_registry_row`, `_git_fetch_commit`,
 `_append_external_registry_apps`, `_detect_installed_probe`),
+`dashboard/handlers/security.py` (`api_trusted_app_grant`),
 `apps/routes.py` (`handle_registry`).
 
 ## 15. A registry's credential posture follows its index's change control

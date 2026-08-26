@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 _BUILTINS_DIR = (Path(__file__).resolve().parent / "builtins").resolve()
 _ALLOW_ALL_SETTING_PATH = "agent.apps_allow_third_party"
 _TRUST_SETTING_PATH = "agent.apps_trusted"
+_TRUST_REPOSITORIES_SETTING_PATH = "agent.apps_trusted_repositories"
 
 # App names admissible as a per-app trust grant. Deliberately the same shape the
 # dashboard's app routes accept, so a grant can only ever name a real app: no
@@ -421,6 +422,37 @@ def trusted_app_names() -> frozenset[str]:
         for entry in raw
         if isinstance(entry, str) and APP_NAME_RE.fullmatch(entry)
     )
+
+
+def trusted_app_repository(app_name: str) -> str:
+    """Repository recorded when *app_name* received its execution grant.
+
+    An empty result means there is no active repository-bound grant. Grants
+    written before repository binding existed intentionally return empty and
+    keep their historical name-only behaviour. A repository record without a
+    matching effective entry in ``agent.apps_trusted`` is inert, so stale
+    metadata can never block an unrelated install after its grant was removed.
+    """
+    try:
+        # Deferred for the same reason as third_party_execution_allowed().
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        agent = KiroCrewConfig.load().agent
+        raw_names = getattr(agent, "apps_trusted", [])
+        raw_repositories = getattr(agent, "apps_trusted_repositories", {})
+    except Exception as exc:  # noqa: BLE001 - unreadable policy has no usable binding
+        logger.error(
+            "%s: config load failed (%s); ignoring repository bindings",
+            _TRUST_REPOSITORIES_SETTING_PATH,
+            exc,
+        )
+        return ""
+    if not isinstance(raw_names, list) or app_name not in raw_names:
+        return ""
+    if not APP_NAME_RE.fullmatch(app_name) or not isinstance(raw_repositories, dict):
+        return ""
+    repository = raw_repositories.get(app_name)
+    return repository.strip() if isinstance(repository, str) else ""
 
 
 def app_execution_denied(

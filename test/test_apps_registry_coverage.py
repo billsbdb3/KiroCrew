@@ -1964,6 +1964,36 @@ class TestInstallFromRegistryRefusals:
         assert result == {"ok": False, "error": "app 'demo' has no git URL configured"}
 
     @pytest.mark.asyncio
+    async def test_trust_repository_mismatch_refuses_before_fetch_or_clone(
+        self, monkeypatch
+    ):
+        granted = "https://example.test/owner/consented.git"
+        resolved = "https://example.test/owner/rebound.git"
+        monkeypatch.setattr(
+            registry,
+            "_resolve_install_entry",
+            lambda name: ({"name": "demo", "gitUrl": resolved}, ""),
+        )
+        monkeypatch.setattr(registry, "trusted_app_repository", lambda name: granted)
+        audit = MagicMock()
+        monkeypatch.setattr(registry, "sel", lambda: audit)
+
+        result = await registry.install_from_registry("demo")
+
+        assert result["ok"] is False
+        assert result["code"] == "app_trust_repository_mismatch"
+        assert granted in result["error"]
+        assert resolved in result["error"]
+        assert "grant it again" in result["error"]
+        audit.log_api_access.assert_called_once_with(
+            caller="app_install_from_registry",
+            operation="trust_repository_mismatch",
+            outcome="rejected",
+            resources="name='demo'",
+            error=result["error"],
+        )
+
+    @pytest.mark.asyncio
     async def test_admission_denial_stops_before_the_clone(self, monkeypatch):
         monkeypatch.setattr(
             registry,

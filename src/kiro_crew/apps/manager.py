@@ -815,10 +815,12 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
     # Withdraw the execution grant FIRST, and abort the whole uninstall if it
     # cannot be withdrawn.
     #
-    # A grant is keyed on the app NAME and nothing else, so one left behind admits
-    # a DIFFERENT app later installed under this name — in-process code execution
+    # Runtime admission is keyed on the app NAME, so one left behind can admit a
+    # DIFFERENT app later installed under this name — in-process code execution
     # with no consent prompt, because the gate just sees a name it was told to
-    # trust. Doing this AFTER the files were deleted (as this did) produced a state
+    # trust. New registry grants additionally bind their install repository, but
+    # that does not make an orphaned runtime grant safe. Doing this AFTER the files
+    # were deleted (as this did) produced a state
     # the user could not recover from: the app is gone, so there is nothing left to
     # uninstall and no retry that would clear the grant, while the name stays
     # armed. Ordering it first makes the failure retryable — nothing has been
@@ -830,6 +832,7 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
         # exactly what was there — and only when there WAS something. Restoring a
         # grant the app never held would be granting, not restoring.
         had_grant = _has_trust_grant(name)
+        granted_repository = _trust_grant_repository(name)
         _drop_trust_grant(name)
     except Exception as exc:  # noqa: BLE001 - refuse rather than half-uninstall
         logger.warning("trust-grant cleanup on uninstall of %r failed", name, exc_info=True)
@@ -876,7 +879,7 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
         # failed uninstall with no side effect on trust.
         restore_note = ""
         try:
-            _restore_trust_grant(name, had_grant)
+            _restore_trust_grant(name, had_grant, granted_repository)
         except Exception as restore_exc:  # noqa: BLE001 - report, never mask the real error
             logger.warning(
                 "could not restore %r's execution grant after a failed uninstall",
@@ -1048,6 +1051,11 @@ def _drop_trust_grant(name: str) -> None:
     if not isinstance(base_grants, list) or name not in base_grants:
         return
     agent_raw["apps_trusted"] = [a for a in base_grants if a != name]
+    repositories = agent_raw.get("apps_trusted_repositories")
+    if isinstance(repositories, dict):
+        repositories = dict(repositories)
+        repositories.pop(name, None)
+        agent_raw["apps_trusted_repositories"] = repositories
     # Concurrency: this is the repo's standard config read-modify-write, and it
     # inherits that model exactly — no cross-process lock, atomic (tmp+rename) on
     # the way out so no reader can see a torn file. `read_config_for_update`'s own
@@ -1112,7 +1120,24 @@ def _has_trust_grant(name: str) -> bool:
     return isinstance(grants, list) and name in grants
 
 
-def _restore_trust_grant(name: str, had_grant: bool) -> None:
+def _trust_grant_repository(name: str) -> str:
+    """Repository binding for *name* in the BASE config, or ``""``."""
+    path = config_path()
+    if not path.is_file():
+        return ""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    agent_raw = raw.get("agent") if isinstance(raw, dict) else None
+    if not isinstance(agent_raw, dict):
+        return ""
+    repositories = agent_raw.get("apps_trusted_repositories")
+    repository = repositories.get(name) if isinstance(repositories, dict) else None
+    return repository if isinstance(repository, str) else ""
+
+
+def _restore_trust_grant(name: str, had_grant: bool, repository: str = "") -> None:
     """Put *name*'s grant back after an uninstall failed with the app still installed.
 
     A no-op when the app held no grant to begin with — restoring one it never had
@@ -1131,6 +1156,11 @@ def _restore_trust_grant(name: str, had_grant: bool) -> None:
         raise RuntimeError(f"{path} has a non-object agent section")
     grants = agent_raw.get("apps_trusted")
     agent_raw["apps_trusted"] = [*(grants if isinstance(grants, list) else []), name]
+    if repository:
+        repositories = agent_raw.get("apps_trusted_repositories")
+        bindings = dict(repositories) if isinstance(repositories, dict) else {}
+        bindings[name] = repository
+        agent_raw["apps_trusted_repositories"] = bindings
     write_config_atomically(path, raw)
     logger.info("Restored %s's trust grant after a failed uninstall", name)
     try:
