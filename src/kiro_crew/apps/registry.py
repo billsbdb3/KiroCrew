@@ -2210,16 +2210,15 @@ async def _communicate_with_timeout(
     gateway's — every caller in this module does. If the group kill fails
     (e.g. the child already exited, or it was never made a group leader) we
     fall back to a pid-scoped ``proc.kill()`` so the child is never left
-    un-reaped.
+    un-reaped. The reap itself goes through the shared
+    ``platform_compat.kill_and_reap``, which drains the pipes via
+    ``communicate()`` under a bound so a killed child blocked writing into a
+    full pipe cannot hang the caller.
     """
     try:
         return await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        try:
-            await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGKILL)
-        except OSError:
-            proc.kill()
-        await proc.wait()
+        await platform_compat.kill_and_reap(proc)
         raise
 
 
@@ -3729,11 +3728,7 @@ async def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
     try:
         await asyncio.wait_for(proc.wait(), timeout=_KILL_GRACE_PERIOD)
     except asyncio.TimeoutError:
-        try:
-            await platform_compat.kill_process_tree_async(proc.pid, platform_compat.SIGKILL)
-        except OSError:
-            proc.kill()
-        await proc.wait()
+        await platform_compat.kill_and_reap(proc)
 
 
 async def _git_fetch_commit(

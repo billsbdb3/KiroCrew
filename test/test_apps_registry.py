@@ -67,9 +67,16 @@ class _TimeoutProc:
         self.returncode: int | None = None
         self.kill_calls = 0
         self.wait_calls = 0
+        self.communicate_calls = 0
 
     async def communicate(self) -> tuple[bytes, bytes]:
-        raise asyncio.TimeoutError
+        self.communicate_calls += 1
+        if self.communicate_calls == 1:
+            raise asyncio.TimeoutError
+        # The reap: pipes drained, exit status collected.
+        if self.returncode is None:
+            self.returncode = -9
+        return b"", b""
 
     def kill(self) -> None:
         self.kill_calls += 1
@@ -141,10 +148,12 @@ async def test_communicate_with_timeout_kills_whole_process_tree(monkeypatch):
 
     # Whole-tree kill was invoked with the child's pid + SIGKILL ...
     assert killed == [(proc.pid, registry.platform_compat.SIGKILL)]
-    # ... the child was reaped ...
-    assert proc.wait_calls == 1
-    # ... and the single-process fallback was NOT needed.
-    assert proc.kill_calls == 0
+    # ... the child was reaped by draining pipes via a SECOND communicate(),
+    # never a bare wait() that a full pipe could hang (#5989) ...
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 0
+    # ... and the helper's pid-scoped kill backs up the group signal.
+    assert proc.kill_calls == 1
 
 
 @pytest.mark.asyncio
@@ -160,7 +169,8 @@ async def test_communicate_with_timeout_falls_back_when_group_kill_fails(monkeyp
         await registry._communicate_with_timeout(proc, timeout=0.01)
 
     assert proc.kill_calls == 1
-    assert proc.wait_calls == 1
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 0
 
 
 @pytest.fixture(autouse=True)
@@ -208,7 +218,8 @@ async def test_fetch_app_manifest_reaps_clone_tree_on_timeout(monkeypatch):
     assert result is None
     # ... but the clone's whole process group was killed and the child reaped.
     assert killed == [proc.pid]
-    assert proc.wait_calls == 1
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 0
 
 
 # --------------------------------------------------------------------------
@@ -246,7 +257,8 @@ async def test_list_registry_reaps_detect_probe_tree_on_timeout(monkeypatch):
     await registry.list_registry()
 
     assert killed == [proc.pid]
-    assert proc.wait_calls == 1
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 0
 
 
 # --------------------------------------------------------------------------
@@ -286,7 +298,8 @@ async def test_install_from_registry_reaps_detect_probe_tree_on_timeout(monkeypa
     await registry.install_from_registry("demoapp")
 
     assert killed == [proc.pid]
-    assert proc.wait_calls == 1
+    assert proc.communicate_calls == 2
+    assert proc.wait_calls == 0
 
 
 # --------------------------------------------------------------------------
@@ -319,6 +332,54 @@ async def test_kill_process_group_reaps_and_escalates_to_sigkill(monkeypatch):
     assert proc.returncode is not None
     # Portable liveness check — never the prohibited raw ``os.kill(pid, 0)``.
     assert not platform_compat.pid_exists(pid)
+
+
+@pytest.mark.asyncio
+async def test_kill_process_group_escalation_reaps_via_communicate_not_wait(monkeypatch):
+    """The SIGKILL escalation reaps by draining pipes via communicate(); a
+    bare wait() on a killed child blocked writing into a full pipe would
+    hang the app-build timeout path forever (#5989)."""
+    monkeypatch.setattr(registry, "_KILL_GRACE_PERIOD", 0.01)
+    killed: list[tuple[int, int]] = []
+
+    async def _tree(pid, sig):
+        killed.append((pid, sig))
+        return True
+
+    monkeypatch.setattr(registry.platform_compat, "kill_process_tree_async", _tree)
+
+    class _StubbornProc:
+        pid = 987654
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.kill_calls = 0
+            self.wait_calls = 0
+            self.communicate_calls = 0
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                # The site's own grace wait: SIGTERM is ignored, so this
+                # outlives _KILL_GRACE_PERIOD and the escalation fires.
+                await asyncio.sleep(3600)
+            raise AssertionError("bare wait() used as the post-SIGKILL reap (#5989)")
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            self.communicate_calls += 1
+            self.returncode = -9
+            return b"", b""
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+    proc = _StubbornProc()
+    await registry._kill_process_group(proc)
+
+    pc = registry.platform_compat
+    assert killed == [(proc.pid, pc.SIGTERM), (proc.pid, pc.SIGKILL)]
+    assert proc.wait_calls == 1  # the grace wait only — never the reap
+    assert proc.communicate_calls == 1
 
 
 @pytest.mark.asyncio

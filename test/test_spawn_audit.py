@@ -1568,10 +1568,11 @@ def test_bundled_skill_assets_are_not_imported():
 
 _GATEWAY_REL = "slack/gateway.py"
 
-#: Functions that own the kill-the-tree + bounded-reap contract. The module
-#: helper lives in `platform/update_provider.py`; the two `_startup_child`
-#: methods are the boot-path equivalent (kill and reap split in two).
-_TREE_KILL_FUNCS = frozenset({"_kill_and_reap", "_kill_startup_child"})
+#: Functions that own the kill-the-tree + bounded-reap contract. The shared
+#: helper is `platform_compat.kill_and_reap` (`_kill_and_reap` is its delegate
+#: in `platform/update_provider.py`); the two `_startup_child` methods are the
+#: boot-path equivalent (kill and reap split in two).
+_TREE_KILL_FUNCS = frozenset({"kill_and_reap", "_kill_and_reap", "_kill_startup_child"})
 
 
 @functools.cache

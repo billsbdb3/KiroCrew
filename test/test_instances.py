@@ -26,6 +26,8 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew import platform_compat
+
 # ── config flag + constants ────────────────────────────────────────────────
 
 
@@ -2894,6 +2896,82 @@ class TestTokenMintGeneric:
         assert rc == 255
         assert "AKIAIOSFODNN7EXAMPLE" not in err
         assert "[REDACTED: credential]" in err
+
+    class _HangProc:
+        """First ``communicate`` times out; the reap (a SECOND communicate)
+        records itself and returns. ``wait`` must never be touched: on a
+        killed child blocked writing into a full stderr pipe it hangs the
+        caller forever (#5989)."""
+
+        def __init__(self) -> None:
+            self.pid = 4242
+            self.returncode: int | None = None
+            self.kill_calls = 0
+            self.wait_calls = 0
+            self.communicate_calls = 0
+
+        async def communicate(self):
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                raise asyncio.TimeoutError
+            self.returncode = -9
+            return b"", b""
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        async def wait(self) -> int:
+            self.wait_calls += 1
+            return -9
+
+    def test_mint_timeout_reaps_child_via_communicate_not_wait(self, monkeypatch):
+        from kiro_crew.instances import token_mint as tm
+
+        proc = self._HangProc()
+
+        async def fake_exec(*a, **k):
+            return proc
+
+        killed: list[tuple[int, int]] = []
+
+        async def _tree(pid, sig):
+            killed.append((pid, sig))
+            return True
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(platform_compat, "kill_process_tree_async", _tree)
+        with pytest.raises(tm.TokenMintError, match="timed out minting"):
+            asyncio.run(tm.mint_remote_token("cd-1", ttl="20h"))
+        assert killed == [(proc.pid, platform_compat.SIGKILL)]
+        assert proc.kill_calls == 1
+        assert proc.communicate_calls == 2
+        assert proc.wait_calls == 0
+
+    def test_run_remote_kirocrew_timeout_reaps_child_via_communicate_not_wait(
+        self, monkeypatch
+    ):
+        from kiro_crew.instances import token_mint as tm
+
+        proc = self._HangProc()
+
+        async def fake_exec(*a, **k):
+            return proc
+
+        killed: list[tuple[int, int]] = []
+
+        async def _tree(pid, sig):
+            killed.append((pid, sig))
+            return True
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(platform_compat, "kill_process_tree_async", _tree)
+        rc, err = asyncio.run(tm.run_remote_kirocrew("cd-1", "restart"))
+        assert rc == -1
+        assert "timed out after" in err
+        assert killed == [(proc.pid, platform_compat.SIGKILL)]
+        assert proc.kill_calls == 1
+        assert proc.communicate_calls == 2
+        assert proc.wait_calls == 0
 
 
 class TestDiagnostics:
