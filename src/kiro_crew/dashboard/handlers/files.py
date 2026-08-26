@@ -29,13 +29,18 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 from aiohttp.multipart import BodyPartReader
 
 from kiro_crew import platform_compat
+from kiro_crew.config import loader as config_loader
 from kiro_crew.config.loader import KiroCrewConfig, WorkspaceConfig, config_dir, data_home
 from kiro_crew.dashboard import part_stream
 from kiro_crew.dashboard.chat_utils import dashboard_slot_key
 from kiro_crew.dashboard.file_index import _SKIP_DIRS as _WALK_SKIP_DIRS
+from kiro_crew.dashboard.handlers._shared import _probe_persisted_session
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.hooks import safe_read_prefix
+from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes, safe_read_prefix
+from kiro_crew.messaging import upload_gate
+from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.link import is_channel_session_key
+from kiro_crew.messaging.outbound_files import OutboundFile
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
@@ -415,10 +420,168 @@ async def api_outbox_list(request: web.Request) -> web.Response:
     return web.json_response({"files": entries[:50]})
 
 
+def _gate_upload_file(
+    file_path: str, filename: str, *, tool_kind: str
+) -> tuple[web.Response | None, Path | None, bytes | None]:
+    """The shared admission gate for shipping a local file to a channel.
+
+    One site computes the judgment for every channel-upload endpoint —
+    containment (outbox or workspace root), the descriptor-safe read, the
+    binary MIME allowlist, and the content credential scans — so the Slack
+    and channel legs cannot drift apart gate by gate. Returns
+    ``(error_response, None, None)`` on refusal, ``(None, resolved, bytes)``
+    when the file may ship. *tool_kind* keys the SEL records so each caller
+    keeps its own audit lane.
+
+    Blocking by design (a full read of up to ``MAX_FILE_BYTES`` plus content
+    regex scans): async handlers MUST run it off the event loop via
+    ``asyncio.to_thread`` — SEL appends are internally locked, so the audit
+    calls are thread-safe. The loader is called through its module so tests
+    (and config reloads) resolve at call time, not import time.
+    """
+
+    def _audit_denial(error: str, *, outcome: str = "denied") -> None:
+        _sel().log_tool_invocation(
+            session_key="api",
+            source="api",
+            tool_name="file_send",
+            tool_kind=tool_kind,
+            outcome=outcome,
+            downstream_service=tool_kind,
+            error=error,
+        )
+
+    if not file_path or not filename:
+        _audit_denial("missing_required_fields")
+        return (
+            web.json_response(
+                {"error": "file_path, filename required", "code": "missing_required_fields"},
+                status=400,
+            ),
+            None,
+            None,
+        )
+    # The name is DELIVERED (Slack upload title, Telegram document name,
+    # Discord message text fallback), so a credential embedded in it leaves
+    # with the file. Checked in the shared gate so no leg can drift from the
+    # others, and before path resolution so a sensitive name never even
+    # selects a file. Mirrors the MCP-side file_send refusal.
+    if redact(filename) != filename:
+        _audit_denial("sensitive_filename_rejected")
+        return (
+            web.json_response(
+                {
+                    "error": "filename contains sensitive content",
+                    "code": "sensitive_filename",
+                },
+                status=400,
+            ),
+            None,
+            None,
+        )
+    resolved = Path(file_path).resolve()
+    allowed_outbox = config_loader.outbox_dir().resolve()
+    allowed_workspace = config_loader.workspace_root().resolve()
+    if not (resolved.is_relative_to(allowed_outbox) or resolved.is_relative_to(allowed_workspace)):
+        _audit_denial(f"path_not_allowed: {file_path}")
+        return (
+            web.json_response(
+                {
+                    "error": "file_path must be under the outbox directory or the workspace root",
+                    "code": "path_not_allowed",
+                },
+                status=403,
+            ),
+            None,
+            None,
+        )
+    try:
+        raw = safe_read_file_bytes(str(resolved))
+    except FileTooLargeError as e:
+        _audit_denial(f"file_too_large: {e}")
+        return (
+            web.json_response({"error": str(e), "code": "file_too_large"}, status=413),
+            None,
+            None,
+        )
+    if raw is None:
+        _audit_denial(f"safe_read_file_bytes rejected: {file_path}")
+        return (
+            web.json_response(
+                {
+                    "error": f"File not found or access denied: {file_path}",
+                    "code": "file_not_found",
+                },
+                status=404,
+            ),
+            None,
+            None,
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        # Binary file — only allow known-safe media types
+        guessed_type = mimetypes.guess_type(filename)[0] or ""
+        if guessed_type not in BINARY_MIME_ALLOWLIST:
+            _audit_denial(f"binary_mime_not_allowed: {guessed_type}")
+            return (
+                web.json_response(
+                    {
+                        "error": f"Binary file type not allowed: {guessed_type or 'unknown'}",
+                        "code": "binary_mime_not_allowed",
+                    },
+                    status=400,
+                ),
+                None,
+                None,
+            )
+        text = None  # signal: skip text redaction path
+        # Scan binary content for embedded credentials (e.g. base64-encoded keys in PDFs)
+        binary_text = raw.decode("latin-1")
+        if redact(binary_text) != binary_text:
+            _audit_denial("binary_credential_detected")
+            return (
+                web.json_response(
+                    {
+                        "error": "binary file contains embedded credentials",
+                        "code": "binary_credential_detected",
+                    },
+                    status=400,
+                ),
+                None,
+                None,
+            )
+    if text is not None:
+        try:
+            redacted = redact(text)
+            if redacted != text:
+                _audit_denial("content_redacted")
+                return (
+                    web.json_response(
+                        {
+                            "error": "file content was redacted; upload aborted",
+                            "code": "content_redacted",
+                        },
+                        status=400,
+                    ),
+                    None,
+                    None,
+                )
+        except Exception as redact_err:
+            _audit_denial(f"redaction_failed: {redact_err}", outcome="error")
+            return (
+                web.json_response(
+                    {"error": f"Redaction failed: {redact_err}", "code": "redaction_failed"},
+                    status=500,
+                ),
+                None,
+                None,
+            )
+    return None, resolved, raw
+
+
 async def api_slack_upload_file(request: web.Request) -> web.Response:
     """POST /api/slack/upload-file — upload a file to Slack (internal, called by file_send)."""
-    from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes  # noqa: F811
-
     state: DashboardState = request.app["state"]
     slack = state.slack_client
     if not slack:
@@ -446,126 +609,15 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
     file_path_raw = body.get("file_path", "")
     filename = body.get("filename", "")
     thread_ts = body.get("thread_ts")
-    if not file_path_raw or not filename:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            error="missing_required_fields",
-        )
-        return web.json_response({"error": "file_path, filename required"}, status=400)
+    # Off-loop: the gate reads up to MAX_FILE_BYTES and regex-scans the content
+    # (no-blocking-call-on-event-loop).
+    error_resp, resolved, raw = await asyncio.to_thread(
+        _gate_upload_file, file_path_raw, filename, tool_kind="slack"
+    )
+    if error_resp is not None:
+        return error_resp
+    assert resolved is not None and raw is not None  # narrowed by the gate
     file_path = file_path_raw
-    resolved = Path(file_path).resolve()
-    from kiro_crew.config.loader import outbox_dir, workspace_root  # noqa: F811
-
-    allowed_outbox = outbox_dir().resolve()
-    allowed_workspace = workspace_root().resolve()
-    if not (resolved.is_relative_to(allowed_outbox) or resolved.is_relative_to(allowed_workspace)):
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            downstream_service="slack",
-            error=f"path_not_allowed: {file_path}",
-        )
-        return web.json_response(
-            {
-                "error": "file_path must be under the outbox directory or the workspace root",
-                "code": "path_not_allowed",
-            },
-            status=403,
-        )
-    try:
-        raw = safe_read_file_bytes(str(resolved))
-    except FileTooLargeError as e:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            downstream_service="slack",
-            error=f"file_too_large: {e}",
-        )
-        return web.json_response({"error": str(e)}, status=413)
-    if raw is None:
-        _sel().log_tool_invocation(
-            session_key="api",
-            source="api",
-            tool_name="file_send",
-            tool_kind="slack",
-            outcome="denied",
-            downstream_service="slack",
-            error=f"safe_read_file_bytes rejected: {file_path}",
-        )
-        return web.json_response(
-            {"error": f"File not found or access denied: {file_path}"}, status=404
-        )
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        # Binary file — only allow known-safe media types
-        guessed_type = mimetypes.guess_type(filename)[0] or ""
-        if guessed_type not in BINARY_MIME_ALLOWLIST:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="denied",
-                downstream_service="slack",
-                error=f"binary_mime_not_allowed: {guessed_type}",
-            )
-            return web.json_response(
-                {"error": f"Binary file type not allowed: {guessed_type or 'unknown'}"}, status=400
-            )
-        text = None  # signal: skip text redaction path
-        # Scan binary content for embedded credentials (e.g. base64-encoded keys in PDFs)
-        binary_text = raw.decode("latin-1")
-        if redact(binary_text) != binary_text:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="denied",
-                downstream_service="slack",
-                error="binary_credential_detected",
-            )
-            return web.json_response(
-                {"error": "binary file contains embedded credentials"}, status=400
-            )
-    if text is not None:
-        try:
-            redacted = redact(text)
-            if redacted != text:
-                _sel().log_tool_invocation(
-                    session_key="api",
-                    source="api",
-                    tool_name="file_send",
-                    tool_kind="slack",
-                    outcome="denied",
-                    downstream_service="slack",
-                    error="content_redacted",
-                )
-                return web.json_response(
-                    {"error": "file content was redacted; upload aborted"}, status=400
-                )
-        except Exception as redact_err:
-            _sel().log_tool_invocation(
-                session_key="api",
-                source="api",
-                tool_name="file_send",
-                tool_kind="slack",
-                outcome="error",
-                downstream_service="slack",
-                error=f"redaction_failed: {redact_err}",
-            )
-            return web.json_response({"error": f"Redaction failed: {redact_err}"}, status=500)
     # Resolve thread_ts and channel from linked slot when not explicitly provided
     target_channel = body.get("channel", "")
     channel_from_session_map = False
@@ -707,6 +759,169 @@ async def api_slack_upload_file(request: web.Request) -> web.Response:
             error=safe_error,
         )
         return web.json_response({"error": safe_error}, status=500)
+
+
+async def api_channel_upload_file(request: web.Request) -> web.Response:
+    """POST /api/channel/upload-file — deliver a file to the caller's own
+    conversation on a non-Slack channel (internal, called by file_send).
+
+    The Slack counterpart above has its own identity ladder; this one serves
+    every transport-registry channel through the SAME send ladder the
+    cross-surface reply mirror uses (``_resolve_mirror_target``): channel-scope
+    governance, transport registration, proactive-send capability, and
+    ``may_send_to`` recipient re-authorization, all fail-closed and
+    SEL-audited in one place — plus the restricted-session ceiling the
+    renderers' extraction path enforces, on the same shared predicate. The
+    destination comes exclusively from the caller's session map entry — a
+    request cannot name an arbitrary conversation, which is what keeps this
+    endpoint from being a broadcast primitive. Delivery today: Telegram via
+    the purpose-built ``send_document`` (name-preserving); Discord is an
+    explicit skip until its transport grows a document verb that preserves an
+    admitted filename (see the delivery-branch comment below).
+
+    "Cannot deliver here" is a SKIP (``delivered: false``), not an error: most
+    sessions mirror nowhere, and the caller falls back to the dashboard card
+    and the Slack leg exactly as before this endpoint existed.
+    """
+    state: DashboardState = request.app["state"]
+    try:
+        body = await request.json()
+    except ValueError:
+        _sel().log_tool_invocation(
+            session_key="api",
+            source="api",
+            tool_name="file_send",
+            tool_kind="channel",
+            outcome="denied",
+            error="invalid_json_body",
+        )
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+    def _skip(reason: str) -> web.Response:
+        _sel().log_tool_invocation(
+            session_key="api",
+            source="api",
+            tool_name="file_send",
+            tool_kind="channel",
+            outcome="skipped",
+            error=reason,
+        )
+        return web.json_response({"ok": True, "delivered": False, "skipped": reason})
+
+    session_key = request.headers.get("X-Session-Key", "").strip()
+    if not session_key or not getattr(state, "sessions", None):
+        return _skip("no_session")
+    from kiro_crew.dashboard.chat_runner import _resolve_mirror_target
+
+    # Off-loop like the admission gate below: the ladder reloads governance
+    # profiles and reads the persisted session map — synchronous filesystem
+    # work (no-blocking-call-on-event-loop). The session map's reads are
+    # lock-guarded, so the call is thread-safe.
+    target = await asyncio.to_thread(_resolve_mirror_target, state, session_key)
+    if target is None:
+        # No mirror link, a Slack link (the Slack leg owns those), a missing or
+        # capability-less transport, a governance denial, or a may_send_to
+        # refusal — the ladder audited the ones that matter; all mean the same
+        # thing here: this caller has no non-Slack conversation to deliver to.
+        return _skip("no_channel_destination")
+    link, transport = target
+    # The restricted ceiling the renderers' extraction path already enforces:
+    # an incognito/temporary session ships no local file bytes to a channel,
+    # and an explicit file_send must not be the bypass. Same shared predicate
+    # (which SEL-audits the denial), same skip shape as every other "cannot
+    # deliver here" answer. Checked before capability probing: a restricted
+    # caller learns nothing about which channels could upload.
+    if await upload_gate.uploads_restricted(
+        state,
+        session_key,
+        channel_type=link.channel_type,
+        persisted_probe=_probe_persisted_session,
+    ):
+        return _skip("restricted_session")
+    deliver = None
+    if link.channel_type == "telegram":
+        deliver = getattr(transport, "send_document", None)
+    # Discord is deliberately NOT wired: its transport upload verb serves the
+    # image-extraction pipeline, whose filename sanitizer maps any non-raster
+    # mime to `.bin` (`upload_filename`) — correct for LLM-authored reference
+    # paths, but it would deliver `report.pdf` as `report.bin` here. Until the
+    # transport grows a document verb that preserves an ADMITTED name (the
+    # gate already scanned it), Discord callers keep the dashboard-link
+    # fallback rather than a corrupted attachment.
+    if deliver is None:
+        return _skip(f"channel_upload_unsupported:{link.channel_type}")
+    # Off-loop: the gate reads up to MAX_FILE_BYTES and regex-scans the content
+    # (no-blocking-call-on-event-loop).
+    error_resp, resolved, raw = await asyncio.to_thread(
+        _gate_upload_file,
+        body.get("file_path", ""),
+        body.get("filename", ""),
+        tool_kind="channel",
+    )
+    if error_resp is not None:
+        return error_resp
+    assert resolved is not None and raw is not None  # narrowed by the gate
+    filename = body.get("filename", "")
+    # Display-form redaction, not just literal: redact() scans bytes, and the
+    # channel's renderer strips markup at display time — ``AKIA**…**`` passes
+    # a literal scan and displays as an intact key. Same boundary rule every
+    # renderer sink applies (``redact_for_display``) before text reaches a
+    # transport.
+    description, _ = redact_for_display(body.get("description", "") or "", redact)
+    outbound = OutboundFile(
+        path=str(resolved),
+        data=raw,
+        alt=description,
+        mime=mimetypes.guess_type(filename)[0] or "application/octet-stream",
+    )
+    try:
+        mid = await deliver(
+            link.channel_id,
+            outbound,
+            caption=description,
+            thread_id=link.thread_id,
+        )
+    except Exception as e:
+        # A transport / network exception can carry file paths, host and URL
+        # fragments, or credentials embedded in a URL. Sanitize before it
+        # reaches the client or the audit record (see api_slack_upload_file).
+        safe_error, _ = redact_credentials(str(e))
+        safe_error, _ = redact_exfiltration_urls(safe_error)
+        _sel().log_tool_invocation(
+            session_key="api",
+            source="api",
+            tool_name="file_send",
+            tool_kind="channel",
+            outcome="error",
+            downstream_service=link.channel_type,
+            error=safe_error,
+        )
+        return web.json_response({"error": safe_error}, status=502)
+    if not mid:
+        # The transport reported failure without raising (the clients return
+        # an empty id on an API-level refusal).
+        _sel().log_tool_invocation(
+            session_key="api",
+            source="api",
+            tool_name="file_send",
+            tool_kind="channel",
+            outcome="error",
+            downstream_service=link.channel_type,
+            error="delivery_reported_no_message_id",
+        )
+        return web.json_response({"error": "channel delivery failed"}, status=502)
+    _sel().log_tool_invocation(
+        session_key="api",
+        source="api",
+        tool_name="file_send",
+        tool_kind="channel",
+        outcome="completed",
+        downstream_service=link.channel_type,
+        resources=f"channel_type={link.channel_type} file={body.get('file_path', '')}",
+    )
+    return web.json_response(
+        {"ok": True, "delivered": True, "channel_type": link.channel_type}
+    )
 
 
 async def api_upload(request: web.Request) -> web.Response:

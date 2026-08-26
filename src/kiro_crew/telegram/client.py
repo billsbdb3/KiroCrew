@@ -1031,6 +1031,44 @@ class TelegramClient:
         result = await self._api_multipart("sendPhoto", params, [photo], field_names=["photo"])
         return result.get("message_id") if isinstance(result, dict) else None
 
+    async def send_document(
+        self,
+        chat_id: int,
+        document: "OutboundFile",
+        *,
+        caption: str | None = None,
+        message_thread_id: int | None = None,
+        disable_notification: bool = True,
+    ) -> int | None:
+        """Upload ONE file via ``sendDocument``. Returns the message_id or None.
+
+        The generic-file counterpart of :meth:`send_photo`, for attachments that
+        are not raster images (PDF, CSV, archives — whatever the caller's own
+        gates admitted). Sent silently by default: every current caller has
+        already landed a text bubble for the same turn, and a second ping for
+        the same action is the pattern the other media sends avoid.
+
+        ``filenames`` pins the document's real name: the multipart sanitizer is
+        aimed at LLM-authored reference paths, and this caller's name has
+        already passed the file_send gates — letting the sanitizer rewrite the
+        extension would break the receiver's file-type association.
+        """
+        params: dict[str, Any] = {"chat_id": chat_id}
+        if message_thread_id is not None:
+            params["message_thread_id"] = message_thread_id
+        if caption:
+            params["caption"] = caption[:TELEGRAM_MAX_CAPTION]
+        if disable_notification:
+            params["disable_notification"] = True
+        result = await self._api_multipart(
+            "sendDocument",
+            params,
+            [document],
+            field_names=["document"],
+            filenames=[Path(document.path).name],
+        )
+        return result.get("message_id") if isinstance(result, dict) else None
+
     async def send_voice(
         self,
         chat_id: int,

@@ -372,6 +372,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/outbox/notify",
         "/api/notifications/agent",  # MCP-only (send_notification tool); no browser caller
         "/api/slack/upload-file",
+        "/api/channel/upload-file",
         "/api/slack/pins",
         "/api/slack/reactions",
         "/api/slack-profile",  # MCP-only (slack_profile tool); no browser caller
