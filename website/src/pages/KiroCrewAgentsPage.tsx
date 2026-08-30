@@ -8,6 +8,7 @@ import { createSlot } from '../store/chatSlice'
 import { api, type WebhookTokenEntry } from '../api/client'
 import { useProvider } from '../providers'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { FOLDER_COLOR_PALETTE } from '../components/folderColorCatalog'
 import { Btn, SendBtn, Input, Badge, SearchInput, PageHeader, EmptyState } from '../components/ui'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import {
@@ -387,6 +388,54 @@ export function SessionColorField({ value, onChange }: { value: string; onChange
   }
   return (
     <Field label={i18nT('pages.kiroCrewAgentsPage.session_color')} hint={i18nT('pages.kiroCrewAgentsPage.session_color_hint')}>
+      {/* Quick picks first, exact entry below — the order the session
+       *  right-click menu uses, so the two surfaces read the same way.
+       *
+       *  These are FOLDER_COLOR_PALETTE, the repo's existing fixed-hex identity
+       *  catalog, NOT the sidebar's generated palette. The sidebar's swatches
+       *  are a `color_index` into a palette derived from the theme accent, so
+       *  they re-derive when the theme changes; a crew's `session_color` is a
+       *  stored hex, so a swatch here has to commit exactly the literal it
+       *  shows and must not drift. That is the same job the folder catalog
+       *  already does, and reusing it keeps one visual language across folders,
+       *  tags and crews — as that file's own comment argues — instead of a
+       *  second preset list that would silently diverge from it. Read-only:
+       *  the catalog's KEEP IN SYNC contract with chat_folders.py governs
+       *  changes to its entries, and consuming it adds no such coupling.
+       *
+       *  The active ring is matched by hex, so a custom colour outside the
+       *  catalog correctly rings nothing.
+       *
+       *  No "no color" cell here: Clear already owns that, and two controls for
+       *  one action is worse than one. */}
+      <div className="mb-2 flex flex-wrap items-center gap-1.5">
+        {FOLDER_COLOR_PALETTE.map(({ value: c, label }) => {
+          const active = HEX_RE.test(value) && value.toLowerCase() === c
+          return (
+            <Btn
+              type="button"
+              key={c}
+              aria-label={label()}
+              aria-pressed={active}
+              title={label()}
+              // Btn, not a raw <button>, so the swatches inherit the standard
+              // press and disabled treatment. `p-0` and the sizing below win
+              // over Btn's own padding/radius/border because Btn twMerges
+              // `className` last; the inline background beats its
+              // `bg-transparent` (and its hover background) on specificity, so
+              // the dot keeps its colour in every state.
+              //
+              // `border-text-strong`, not `border-accent`: the accent is itself a
+              // purple in most themes, so an accent ring on the indigo and violet
+              // entries reads as no ring at all. The near-white ring is what
+              // SessionColorSwatches uses, and it separates from every hue here.
+              className={`h-5 w-5 p-0 cursor-pointer rounded-full border-2 transition-transform hover:scale-110 ${active ? 'border-text-strong scale-110' : 'border-border'}`}
+              style={{ background: c }}
+              onClick={() => onChange(c)}
+            />
+          )
+        })}
+      </div>
       <div className="flex items-center gap-2">
         <Input
           type="color"
